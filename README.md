@@ -31,6 +31,38 @@ indexed at startup. Parse results are cached at two levels:
 | `CODE_SCOPE_NO_CACHE`  | Set to `1` to keep the cache in memory only                             |
 | `CODE_SCOPE_LOG`       | Log filter, e.g. `debug` (stderr only)                                  |
 
+## Install
+
+Prebuilt binaries for Linux (x86_64, aarch64, static musl), macOS (Apple Silicon, Intel) and Windows (x86_64) are attached to each [GitHub release](https://github.com/aeron2k4/code-scope-mcp/releases), with a `SHA256SUMS` file and a build provenance attestation.
+
+Quick install on Linux/macOS (read the script before running it):
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/aeron2k4/code-scope-mcp/main/install.sh
+less install.sh
+sh install.sh            # VERSION=v0.1.0 and INSTALL_DIR=... are optional
+```
+
+The script checks the archive against `SHA256SUMS`, verifies the attestation when `gh` is installed, and installs to `~/.local/bin` without sudo. It never edits Claude's configuration.
+
+Manual install:
+
+```sh
+gh release download --repo aeron2k4/code-scope-mcp -p '*x86_64-unknown-linux-musl.tar.gz' -p SHA256SUMS
+sha256sum --ignore-missing -c SHA256SUMS
+gh attestation verify code-scope-mcp-*.tar.gz --repo aeron2k4/code-scope-mcp
+tar xzf code-scope-mcp-*.tar.gz
+install -m 755 code-scope-mcp-*/code-scope-mcp ~/.local/bin/
+```
+
+From source: `cargo install --git https://github.com/aeron2k4/code-scope-mcp --locked`.
+
+Register it with Claude Code for every project (the root defaults to the cwd Claude Code starts it in):
+
+```sh
+claude mcp add --scope user code-scope -- ~/.local/bin/code-scope-mcp
+```
+
 ## Usage
 
 ```sh
@@ -38,7 +70,7 @@ cargo build --release
 ./target/release/code-scope-mcp /path/to/project   # or $CODE_SCOPE_ROOT, or the cwd
 ```
 
-Register it with Claude Code:
+Register it with Claude Code, pinned to one project:
 
 ```sh
 claude mcp add code-scope -- /abs/path/to/code-scope-mcp /path/to/project
