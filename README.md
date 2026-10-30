@@ -52,4 +52,6 @@ cargo fmt
 cargo clippy --all-targets -- -D warnings
 ```
 
+Benchmarks on the Go, CPython and tokio codebases are in [`BENCHMARKS.md`](BENCHMARKS.md); regenerate them with `cargo bench --bench report` (see the header of `benches/report.rs`).
+
 See `CLAUDE.md` for architecture and contribution rules.
