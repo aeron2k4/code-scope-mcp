@@ -34,6 +34,14 @@ pub fn list_files(root: &Path, limit: usize) -> Vec<PathBuf> {
     files
 }
 
+/// Git blob object id of `content`, identical to `git hash-object`.
+pub fn blob_hash(content: &[u8]) -> String {
+    let mut hasher = sha1_smol::Sha1::new();
+    hasher.update(format!("blob {}\0", content.len()).as_bytes());
+    hasher.update(content);
+    hasher.digest().to_string()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FileStatus {
     pub path: String,
@@ -108,6 +116,15 @@ mod tests {
             vec![PathBuf::from("README.md"), PathBuf::from("src/main.rs")]
         );
         assert_eq!(list_files(root, 1).len(), 1);
+    }
+
+    #[test]
+    fn blob_hash_matches_git() {
+        assert_eq!(blob_hash(b""), "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391");
+        assert_eq!(
+            blob_hash(b"hello\n"),
+            "ce013625030ba8dba906f756967f9e9ca394464a"
+        );
     }
 
     #[test]

@@ -24,7 +24,7 @@ pub enum ParseError {
     NoTree,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Lang {
     Rust,
@@ -227,7 +227,7 @@ impl SymbolKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Symbol {
     pub name: String,
     pub kind: SymbolKind,
@@ -239,14 +239,10 @@ pub struct Symbol {
     /// 1-based inclusive line range.
     pub start_line: usize,
     pub end_line: usize,
-    #[serde(skip)]
     pub start_byte: usize,
-    #[serde(skip)]
     pub end_byte: usize,
     /// Byte range of the body block, if the definition has one.
-    #[serde(skip)]
     pub body: Option<(usize, usize)>,
-    #[serde(skip)]
     pub depth: usize,
 }
 
@@ -259,7 +255,7 @@ impl Symbol {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParsedFile {
     pub lang: Lang,
     pub symbols: Vec<Symbol>,
