@@ -392,9 +392,9 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
 name = "heed"
-version = "0.22.1"
+version = "0.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad82d6598ccf1dac15c8b758a1bd282b755b6776be600429176757190a1b0202"
+checksum = "25dcdefc0856f2c0bfd7b4ede3784f4f458ec32e85df16abdf32ded00e16886e"
 dependencies = [
  "bitflags",
  "byteorder",
