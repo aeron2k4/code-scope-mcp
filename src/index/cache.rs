@@ -1,13 +1,34 @@
-//! Lazy parse cache. Files are parsed on first request and re-parsed only
-//! when their modification time or size changes.
+//! Two-level parse cache.
+//!
+//! 1. In memory: files are parsed on first request and served from memory
+//!    while their modification time and size are unchanged.
+//! 2. On disk (optional): a [`PersistentStore`] backed by LMDB (memory-mapped
+//!    via `heed`) keeps parse results across restarts, keyed by absolute path
+//!    and validated by the file's git blob hash, so an unchanged file is never
+//!    re-parsed even after the server restarts or the mtime is touched.
+//!
+//! Writes to the store are buffered and committed in one transaction by
+//! [`ParseCache::flush`], so a project-wide search costs a single fsync.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
 
+use heed::types::Bytes;
+use heed::{Database, Env, EnvOpenOptions};
+use serde::{Deserialize, Serialize};
+
 use crate::ast::parser::{self, ParseError, ParsedFile};
+use crate::git;
+
+/// Bumped with the crate version so stale formats or grammar changes never
+/// leak into results.
+const DB_NAME: &str = concat!("parsed-v", env!("CARGO_PKG_VERSION"));
+const MAP_SIZE: usize = 1 << 30;
+/// Pending writes that trigger an automatic flush.
+const FLUSH_THRESHOLD: usize = 512;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CacheError {
@@ -22,6 +43,110 @@ pub enum CacheError {
     NotUtf8(PathBuf),
     #[error(transparent)]
     Parse(#[from] ParseError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum StoreError {
+    #[error("cannot create cache directory {path}: {source}")]
+    Dir {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error(transparent)]
+    Lmdb(#[from] heed::Error),
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredFile {
+    blob: String,
+    parsed: ParsedFile,
+}
+
+/// Persistent, memory-mapped store of parse results.
+pub struct PersistentStore {
+    env: Env,
+    db: Database<Bytes, Bytes>,
+}
+
+impl PersistentStore {
+    pub fn open(dir: &Path) -> Result<Self, StoreError> {
+        std::fs::create_dir_all(dir).map_err(|source| StoreError::Dir {
+            path: dir.to_path_buf(),
+            source,
+        })?;
+        // SAFETY: the map is only accessed through heed transactions and the
+        // files are never modified other than through LMDB, which handles
+        // multi-process locking itself. Opening the same path more than once
+        // per process is supported by heed.
+        let env = unsafe {
+            EnvOpenOptions::new()
+                .map_size(MAP_SIZE)
+                .max_dbs(4)
+                .open(dir)?
+        };
+        let mut wtxn = env.write_txn()?;
+        let db = env.create_database(&mut wtxn, Some(DB_NAME))?;
+        wtxn.commit()?;
+        Ok(PersistentStore { env, db })
+    }
+
+    fn key(path: &Path) -> &[u8] {
+        path.as_os_str().as_encoded_bytes()
+    }
+
+    /// Stored parse for `path` if its blob hash still matches. Any storage
+    /// or decoding problem is treated as a miss.
+    fn load(&self, path: &Path, blob: &str) -> Option<ParsedFile> {
+        let read = || -> Result<Option<StoredFile>, StoreError> {
+            let rtxn = self.env.read_txn()?;
+            Ok(self
+                .db
+                .get(&rtxn, Self::key(path))?
+                .and_then(|raw| serde_json::from_slice(raw).ok()))
+        };
+        match read() {
+            Ok(Some(stored)) if stored.blob == blob => Some(stored.parsed),
+            Ok(_) => None,
+            Err(err) => {
+                tracing::warn!(%err, "parse store read failed");
+                None
+            }
+        }
+    }
+
+    fn save(&self, items: &[(PathBuf, String, Arc<CachedFile>)]) -> Result<(), StoreError> {
+        let mut wtxn = self.env.write_txn()?;
+        for (path, blob, file) in items {
+            #[derive(Serialize)]
+            struct StoredRef<'a> {
+                blob: &'a str,
+                parsed: &'a ParsedFile,
+            }
+            let Ok(raw) = serde_json::to_vec(&StoredRef {
+                blob,
+                parsed: &file.parsed,
+            }) else {
+                continue;
+            };
+            self.db.put(&mut wtxn, Self::key(path), &raw)?;
+        }
+        wtxn.commit()?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CacheStats {
+    pub memory_hits: u64,
+    pub store_hits: u64,
+    pub parses: u64,
+}
+
+#[derive(Default)]
+struct Counters {
+    memory_hits: AtomicU64,
+    store_hits: AtomicU64,
+    parses: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -42,6 +167,9 @@ pub struct ParseCache {
     clock: AtomicU64,
     max_entries: usize,
     max_file_bytes: u64,
+    store: Option<PersistentStore>,
+    pending: Mutex<Vec<(PathBuf, String, Arc<CachedFile>)>>,
+    counters: Counters,
 }
 
 impl Default for ParseCache {
@@ -57,6 +185,54 @@ impl ParseCache {
             clock: AtomicU64::new(0),
             max_entries: max_entries.max(1),
             max_file_bytes,
+            store: None,
+            pending: Mutex::new(Vec::new()),
+            counters: Counters::default(),
+        }
+    }
+
+    /// Back this cache with a persistent store.
+    pub fn with_store(mut self, store: PersistentStore) -> Self {
+        self.store = Some(store);
+        self
+    }
+
+    pub fn stats(&self) -> CacheStats {
+        let c = &self.counters;
+        CacheStats {
+            memory_hits: c.memory_hits.load(Ordering::Relaxed),
+            store_hits: c.store_hits.load(Ordering::Relaxed),
+            parses: c.parses.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Commit buffered parse results to the persistent store, if any.
+    pub fn flush(&self) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        let items = match self.pending.lock() {
+            Ok(mut pending) => std::mem::take(&mut *pending),
+            Err(_) => return,
+        };
+        if items.is_empty() {
+            return;
+        }
+        if let Err(err) = store.save(&items) {
+            tracing::warn!(%err, count = items.len(), "failed to persist parse results");
+        }
+    }
+
+    fn queue_write(&self, path: &Path, blob: String, file: &Arc<CachedFile>) {
+        let full = match self.pending.lock() {
+            Ok(mut pending) => {
+                pending.push((path.to_path_buf(), blob, Arc::clone(file)));
+                pending.len() >= FLUSH_THRESHOLD
+            }
+            Err(_) => false,
+        };
+        if full {
+            self.flush();
         }
     }
 
@@ -88,6 +264,7 @@ impl ParseCache {
             && entry.len == len
         {
             entry.last_used.store(self.tick(), Ordering::Relaxed);
+            self.counters.memory_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(Arc::clone(&entry.file));
         }
 
@@ -99,12 +276,31 @@ impl ParseCache {
             });
         }
         let bytes = std::fs::read(path).map_err(io_err)?;
+        let blob = self.store.as_ref().map(|_| git::blob_hash(&bytes));
         let source = String::from_utf8(bytes).map_err(|_| CacheError::NotUtf8(path.into()))?;
-        let parsed = parser::parse_path(path, &source)?;
-        if parsed.has_errors {
-            tracing::debug!(path = %path.display(), "parsed with syntax errors");
-        }
-        let file = Arc::new(CachedFile { source, parsed });
+
+        let stored = match (&self.store, &blob) {
+            (Some(store), Some(blob)) => store.load(path, blob),
+            _ => None,
+        };
+        let file = match stored {
+            Some(parsed) => {
+                self.counters.store_hits.fetch_add(1, Ordering::Relaxed);
+                Arc::new(CachedFile { source, parsed })
+            }
+            None => {
+                let parsed = parser::parse_path(path, &source)?;
+                self.counters.parses.fetch_add(1, Ordering::Relaxed);
+                if parsed.has_errors {
+                    tracing::debug!(path = %path.display(), "parsed with syntax errors");
+                }
+                let file = Arc::new(CachedFile { source, parsed });
+                if let Some(blob) = blob {
+                    self.queue_write(path, blob, &file);
+                }
+                file
+            }
+        };
 
         if let Ok(mut entries) = self.entries.write() {
             if entries.len() >= self.max_entries && !entries.contains_key(path) {
@@ -121,6 +317,12 @@ impl ParseCache {
             );
         }
         Ok(file)
+    }
+}
+
+impl Drop for ParseCache {
+    fn drop(&mut self) {
+        self.flush();
     }
 }
 
@@ -177,6 +379,52 @@ mod tests {
         cache.get(&paths[2]).unwrap();
         assert_eq!(cache.len(), 2);
         assert!(Arc::ptr_eq(&f0, &cache.get(&paths[0]).unwrap()));
+    }
+
+    #[test]
+    fn persistent_store_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("store");
+        let path = dir.path().join("lib.rs");
+        fs::write(&path, "struct S;\nfn f() {}\n").unwrap();
+
+        let first = ParseCache::default().with_store(PersistentStore::open(&store_dir).unwrap());
+        let parsed = first.get(&path).unwrap().parsed.symbols.clone();
+        assert_eq!(first.stats().parses, 1);
+        drop(first); // flushes pending writes
+
+        let second = ParseCache::default().with_store(PersistentStore::open(&store_dir).unwrap());
+        let file = second.get(&path).unwrap();
+        assert_eq!(
+            second.stats(),
+            CacheStats {
+                memory_hits: 0,
+                store_hits: 1,
+                parses: 0
+            }
+        );
+        assert_eq!(file.parsed.symbols, parsed);
+        second.get(&path).unwrap();
+        assert_eq!(second.stats().memory_hits, 1);
+    }
+
+    #[test]
+    fn persistent_store_detects_content_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("store");
+        let path = dir.path().join("a.py");
+        fs::write(&path, "def old(): pass\n").unwrap();
+        let cache = ParseCache::default().with_store(PersistentStore::open(&store_dir).unwrap());
+        cache.get(&path).unwrap();
+        cache.flush();
+        drop(cache);
+
+        fs::write(&path, "def new(): pass\n").unwrap();
+        let cache = ParseCache::default().with_store(PersistentStore::open(&store_dir).unwrap());
+        let file = cache.get(&path).unwrap();
+        assert_eq!(file.parsed.symbols[0].name, "new");
+        assert_eq!(cache.stats().parses, 1);
+        assert_eq!(cache.stats().store_hits, 0);
     }
 
     #[test]

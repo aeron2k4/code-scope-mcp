@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+heed = { version = "0.22", default-features = false }
 ignore = "0.4.34"
 rmcp = { version = "3.8.0", features = ["server", "transport-io", "macros"] }
 schemars = "1.2.3"
