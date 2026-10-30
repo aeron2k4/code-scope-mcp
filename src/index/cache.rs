@@ -70,6 +70,10 @@ pub struct PersistentStore {
 
 impl PersistentStore {
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
+        Self::open_sized(dir, MAP_SIZE)
+    }
+
+    fn open_sized(dir: &Path, map_size: usize) -> Result<Self, StoreError> {
         std::fs::create_dir_all(dir).map_err(|source| StoreError::Dir {
             path: dir.to_path_buf(),
             source,
@@ -80,7 +84,7 @@ impl PersistentStore {
         // per process is supported by heed.
         let env = unsafe {
             EnvOpenOptions::new()
-                .map_size(MAP_SIZE)
+                .map_size(map_size)
                 .max_dbs(4)
                 .open(dir)?
         };
@@ -114,7 +118,33 @@ impl PersistentStore {
         }
     }
 
+    /// Persist a batch. The store is only a cache, so once real usage passes
+    /// 3/4 of the map it is wiped (which also drops entries of deleted
+    /// files). Clearing early matters: LMDB cannot reuse the pages freed by
+    /// the clear until a later transaction, so the next write needs headroom.
     fn save(&self, items: &[(PathBuf, String, Arc<CachedFile>)]) -> Result<(), StoreError> {
+        let map_size = self.env.info().map_size as u64;
+        if self.env.non_free_pages_size()? > map_size / 4 * 3 {
+            self.clear()?;
+        }
+        match self.write_batch(items) {
+            Err(StoreError::Lmdb(heed::Error::Mdb(heed::MdbError::MapFull))) => {
+                self.clear()?;
+                self.write_batch(items)
+            }
+            other => other,
+        }
+    }
+
+    fn clear(&self) -> Result<(), StoreError> {
+        tracing::info!("parse store nearly full, clearing it");
+        let mut wtxn = self.env.write_txn()?;
+        self.db.clear(&mut wtxn)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    fn write_batch(&self, items: &[(PathBuf, String, Arc<CachedFile>)]) -> Result<(), StoreError> {
         let mut wtxn = self.env.write_txn()?;
         for (path, blob, file) in items {
             #[derive(Serialize)]
@@ -425,6 +455,32 @@ mod tests {
         assert_eq!(file.parsed.symbols[0].name, "new");
         assert_eq!(cache.stats().parses, 1);
         assert_eq!(cache.stats().store_hits, 0);
+    }
+
+    #[test]
+    fn full_store_is_cleared_and_keeps_working() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PersistentStore::open_sized(&dir.path().join("store"), 1024 * 1024).unwrap();
+        // ~8 KB per entry, so the 1 MiB map fills several times over.
+        let source: String = (0..50)
+            .map(|i| format!("fn function_{i}() {{}}\n"))
+            .collect();
+        let parsed = parser::parse_source(parser::Lang::Rust, &source).unwrap();
+        let file = Arc::new(CachedFile { source, parsed });
+
+        for i in 0..300 {
+            let path = PathBuf::from(format!("/virtual/f{i}.rs"));
+            store
+                .save(&[(path, format!("blob{i}"), Arc::clone(&file))])
+                .unwrap_or_else(|e| panic!("batch {i}: {e}"));
+        }
+        // The latest entry survives; the oldest was dropped by the wipe.
+        assert!(
+            store
+                .load(Path::new("/virtual/f299.rs"), "blob299")
+                .is_some()
+        );
+        assert!(store.load(Path::new("/virtual/f0.rs"), "blob0").is_none());
     }
 
     #[test]
