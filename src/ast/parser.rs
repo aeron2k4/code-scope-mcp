@@ -554,6 +554,46 @@ macro_rules! m { () => {} }
     }
 
     #[test]
+    fn every_language_survives_broken_input() {
+        let cases = [
+            (Lang::Rust, "fn good() {}\nimpl X { fn half(&self", "good"),
+            (
+                Lang::Python,
+                "def good():\n    pass\nclass Broken(:\n",
+                "good",
+            ),
+            (Lang::JavaScript, "function good() {}\nclass { (\n", "good"),
+            (
+                Lang::TypeScript,
+                "function good(): void {}\ninterface <\n",
+                "good",
+            ),
+            (
+                Lang::Tsx,
+                "function good() { return <div />; }\nconst x = <span (\n",
+                "good",
+            ),
+            (Lang::Go, "package p\nfunc good() {}\nfunc (\n", "good"),
+        ];
+        for (lang, src, expected) in cases {
+            let parsed = parse_source(lang, src).unwrap_or_else(|e| panic!("{}: {e}", lang.name()));
+            assert!(parsed.has_errors, "{}: error not flagged", lang.name());
+            assert!(
+                parsed.symbols.iter().any(|s| s.name == expected),
+                "{}: lost `{expected}` in {:?}",
+                lang.name(),
+                parsed.symbols
+            );
+        }
+        // Degenerate inputs must not panic either.
+        for lang in Lang::ALL {
+            for src in ["", "\0\0\0", "{{{{{{", "\u{feff}é漢字"] {
+                parse_source(lang, src).unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn unsupported_extension_is_an_error() {
         let err = parse_path(Path::new("notes.txt"), "hi").unwrap_err();
         assert!(matches!(err, ParseError::UnsupportedLanguage(_)));
