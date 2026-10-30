@@ -18,7 +18,7 @@ use serde::Deserialize;
 use crate::ast::parser::SymbolKind;
 use crate::ast::pruner::{self, PruneOptions};
 use crate::git;
-use crate::index::cache::ParseCache;
+use crate::index::cache::{ParseCache, PersistentStore};
 use crate::index::{self, SearchOptions};
 
 const DEFAULT_MAX_TOKENS: usize = 4000;
@@ -41,6 +41,12 @@ impl Workspace {
             root,
             cache: ParseCache::default(),
         })
+    }
+
+    /// Persist parse results across restarts in `store`.
+    pub fn with_store(mut self, store: PersistentStore) -> Self {
+        self.cache = ParseCache::default().with_store(store);
+        self
     }
 
     pub fn root(&self) -> &Path {
@@ -287,15 +293,25 @@ pub struct CodeScope {
     tool_router: ToolRouter<Self>,
 }
 
-/// Run `f` on the blocking pool and flatten errors into tool error text.
-async fn blocking<F>(f: F) -> Result<String, String>
-where
-    F: FnOnce() -> Result<String> + Send + 'static,
-{
-    match tokio::task::spawn_blocking(f).await {
-        Ok(Ok(text)) => Ok(text),
-        Ok(Err(err)) => Err(format!("{err:#}")),
-        Err(join) => Err(format!("internal error: {join}")),
+impl CodeScope {
+    /// Run `f` on the blocking pool, persist any new parse results, and
+    /// flatten errors into tool error text.
+    async fn run<F>(&self, f: F) -> Result<String, String>
+    where
+        F: FnOnce(&Workspace) -> Result<String> + Send + 'static,
+    {
+        let ws = Arc::clone(&self.workspace);
+        let task = tokio::task::spawn_blocking(move || {
+            let result = f(&ws);
+            ws.cache.flush();
+            tracing::debug!(stats = ?ws.cache.stats(), "tool call finished");
+            result
+        });
+        match task.await {
+            Ok(Ok(text)) => Ok(text),
+            Ok(Err(err)) => Err(format!("{err:#}")),
+            Err(join) => Err(format!("internal error: {join}")),
+        }
     }
 }
 
@@ -315,8 +331,7 @@ impl CodeScope {
         &self,
         Parameters(p): Parameters<OutlineParams>,
     ) -> Result<String, String> {
-        let ws = Arc::clone(&self.workspace);
-        blocking(move || ws.outline(&p.path, p.max_depth)).await
+        self.run(move |ws| ws.outline(&p.path, p.max_depth)).await
     }
 
     #[tool(
@@ -326,8 +341,7 @@ impl CodeScope {
         &self,
         Parameters(p): Parameters<SearchParams>,
     ) -> Result<String, String> {
-        let ws = Arc::clone(&self.workspace);
-        blocking(move || Ok(ws.search(&p.query, p.kind, p.limit.unwrap_or(DEFAULT_SEARCH_LIMIT))))
+        self.run(move |ws| Ok(ws.search(&p.query, p.kind, p.limit.unwrap_or(DEFAULT_SEARCH_LIMIT))))
             .await
     }
 
@@ -338,8 +352,7 @@ impl CodeScope {
         &self,
         Parameters(p): Parameters<ReadSymbolParams>,
     ) -> Result<String, String> {
-        let ws = Arc::clone(&self.workspace);
-        blocking(move || ws.read_symbol(&p.path, &p.name)).await
+        self.run(move |ws| ws.read_symbol(&p.path, &p.name)).await
     }
 
     #[tool(
@@ -349,8 +362,7 @@ impl CodeScope {
         &self,
         Parameters(p): Parameters<ReadPrunedParams>,
     ) -> Result<String, String> {
-        let ws = Arc::clone(&self.workspace);
-        blocking(move || {
+        self.run(move |ws| {
             ws.read_pruned(&p.path, p.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS), p.keep)
         })
         .await
@@ -361,15 +373,13 @@ impl CodeScope {
         &self,
         Parameters(p): Parameters<ListFilesParams>,
     ) -> Result<String, String> {
-        let ws = Arc::clone(&self.workspace);
-        blocking(move || ws.list_files(p.dir.as_deref(), p.limit.unwrap_or(DEFAULT_LIST_LIMIT)))
+        self.run(move |ws| ws.list_files(p.dir.as_deref(), p.limit.unwrap_or(DEFAULT_LIST_LIMIT)))
             .await
     }
 
     #[tool(description = "Show git working-tree status (modified, staged, untracked files).")]
     async fn git_status(&self) -> Result<String, String> {
-        let ws = Arc::clone(&self.workspace);
-        blocking(move || ws.git_status()).await
+        self.run(move |ws| ws.git_status()).await
     }
 }
 

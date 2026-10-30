@@ -4,10 +4,15 @@
 //!
 //! Usage: `code-scope-mcp [ROOT]`. The workspace root defaults to
 //! `$CODE_SCOPE_ROOT`, then the current directory.
+//!
+//! Parse results persist in `$CODE_SCOPE_CACHE_DIR`, defaulting to
+//! `$XDG_CACHE_HOME/code-scope-mcp` or `~/.cache/code-scope-mcp`. Set
+//! `CODE_SCOPE_NO_CACHE=1` to keep the cache in memory only.
 
 use std::path::PathBuf;
 
 use anyhow::Result;
+use code_scope_mcp::index::cache::PersistentStore;
 use code_scope_mcp::mcp::{CodeScope, Workspace};
 use rmcp::ServiceExt;
 use tracing_subscriber::EnvFilter;
@@ -32,10 +37,42 @@ fn workspace_root() -> Result<PathBuf> {
     Ok(std::env::current_dir()?)
 }
 
+fn cache_dir() -> Option<PathBuf> {
+    if std::env::var_os("CODE_SCOPE_NO_CACHE").is_some_and(|v| !v.is_empty() && v != "0") {
+        return None;
+    }
+    if let Some(dir) = std::env::var_os("CODE_SCOPE_CACHE_DIR") {
+        return Some(dir.into());
+    }
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
+    Some(base.join("code-scope-mcp"))
+}
+
+/// Attach the persistent store when available; a broken or unwritable cache
+/// directory only costs re-parsing, so it is never fatal.
+fn with_persistence(workspace: Workspace) -> Workspace {
+    let Some(dir) = cache_dir() else {
+        tracing::info!("persistent cache disabled");
+        return workspace;
+    };
+    match PersistentStore::open(&dir) {
+        Ok(store) => {
+            tracing::info!(dir = %dir.display(), "persistent cache enabled");
+            workspace.with_store(store)
+        }
+        Err(err) => {
+            tracing::warn!(%err, "persistent cache unavailable, using memory only");
+            workspace
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
-    let workspace = Workspace::new(workspace_root()?)?;
+    let workspace = with_persistence(Workspace::new(workspace_root()?)?);
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         root = %workspace.root().display(),
