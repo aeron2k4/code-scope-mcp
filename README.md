@@ -44,7 +44,6 @@ Register it with Claude Code:
 claude mcp add code-scope -- /abs/path/to/code-scope-mcp /path/to/project
 ```
 
-
 ## Development
 
 ```sh
