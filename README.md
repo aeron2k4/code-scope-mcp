@@ -17,9 +17,19 @@ Supported languages: Rust, Python, JavaScript, TypeScript/TSX, Go.
 | `list_files`       | Files under a directory, honouring `.gitignore`                             |
 | `git_status`       | Working-tree status                                                         |
 
-Files are parsed lazily the first time they are requested. The cache is
-checked against each file's modification time and size, so nothing is
-indexed at startup.
+Files are parsed lazily the first time they are requested, so nothing is
+indexed at startup. Parse results are cached at two levels:
+
+- **in memory**, reused while a file's modification time and size are unchanged;
+- **on disk**, in an LMDB (memory-mapped) store keyed by the file's git blob
+  hash, so unchanged files are not re-parsed after a restart.
+
+| Variable               | Effect                                                                  |
+| ---------------------- | ----------------------------------------------------------------------- |
+| `CODE_SCOPE_ROOT`      | Workspace root when no argument is given                                |
+| `CODE_SCOPE_CACHE_DIR` | Store location (default `$XDG_CACHE_HOME/code-scope-mcp` or `~/.cache/code-scope-mcp`) |
+| `CODE_SCOPE_NO_CACHE`  | Set to `1` to keep the cache in memory only                             |
+| `CODE_SCOPE_LOG`       | Log filter, e.g. `debug` (stderr only)                                  |
 
 ## Usage
 
@@ -34,7 +44,6 @@ Register it with Claude Code:
 claude mcp add code-scope -- /abs/path/to/code-scope-mcp /path/to/project
 ```
 
-Logs go to stderr only. Set the level with `CODE_SCOPE_LOG`, e.g. `CODE_SCOPE_LOG=debug`.
 
 ## Development
 
