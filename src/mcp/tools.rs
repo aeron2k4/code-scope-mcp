@@ -468,7 +468,8 @@ pub struct ListFilesParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct FindReferencesParams {
-    /// Symbol name, plain (`load`) or qualified (`Config::load`; only the last segment is matched).
+    /// Symbol name, plain (`load`) or qualified (`Config::load`): the last segment is
+    /// matched, and uses provably on another owner (`Other::load`) are dropped.
     pub name: String,
     /// Sub-directory relative to the workspace root to search in. Default: the root.
     #[serde(default)]

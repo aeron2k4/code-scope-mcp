@@ -37,9 +37,54 @@ impl Default for RefOptions {
     }
 }
 
+/// What the text right before an occurrence says about its owner.
+#[derive(Debug, PartialEq, Eq)]
+enum Owner<'a> {
+    /// `Y::name`: a path, so `Y` is the owning type or module.
+    Path(&'a str),
+    /// `y.name` or `y->name`: a member of whatever `y` is.
+    Member(&'a str),
+    /// No usable prefix: a bare name or a complex receiver like `f().name`.
+    Unknown,
+}
+
+fn owner_of(source: &str, start: usize) -> Owner<'_> {
+    let before = source[..start].trim_end_matches([' ', '\t']);
+    let (rest, is_path) = if let Some(r) = before.strip_suffix("::") {
+        (r, true)
+    } else if let Some(r) = before
+        .strip_suffix('.')
+        .or_else(|| before.strip_suffix("->"))
+    {
+        (r, false)
+    } else {
+        return Owner::Unknown;
+    };
+    let rest = rest.trim_end_matches([' ', '\t']);
+    let ident_start = rest
+        .char_indices()
+        .rev()
+        .take_while(|&(_, c)| c.is_alphanumeric() || c == '_' || c == '$')
+        .last()
+        .map_or(rest.len(), |(i, _)| i);
+    let ident = &rest[ident_start..];
+    match (ident.is_empty(), is_path) {
+        (true, _) => Owner::Unknown,
+        (false, true) => Owner::Path(ident),
+        (false, false) => Owner::Member(ident),
+    }
+}
+
+/// Whether qualified name `scope` (`a::Foo::bar`) contains segment `owner`.
+fn in_scope(scope: Option<&str>, owner: &str) -> bool {
+    scope.is_some_and(|s| s.split("::").any(|seg| seg == owner))
+}
+
 /// Every identifier spelled `name` in source files under `dir`, sorted by
-/// path and position. `name` may be qualified (`Parser::new`); only the last
-/// segment is matched.
+/// path and position. `name` may be qualified (`Parser::new`): the last
+/// segment is matched, and occurrences that provably belong to another owner
+/// are dropped, i.e. paths like `Other::new` and definitions inside another
+/// type. Member accesses on receivers of unknown type (`x.new()`) are kept.
 pub fn find_references(
     root: &Path,
     dir: &Path,
@@ -47,8 +92,9 @@ pub fn find_references(
     name: &str,
     opts: &RefOptions,
 ) -> Vec<RefHit> {
-    let name = name.trim();
-    let name = name.rsplit(['.', ':']).next().unwrap_or(name);
+    let mut segments = name.trim().rsplit(['.', ':']).filter(|s| !s.is_empty());
+    let name = segments.next().unwrap_or_default();
+    let owner = segments.next();
     if name.is_empty() {
         return Vec::new();
     }
@@ -98,6 +144,20 @@ pub fn find_references(
                     Some(s) if is_definition && s.name == name => s.parent.clone(),
                     other => other.map(|s| s.qualified_name()),
                 };
+                if let Some(owner) = owner {
+                    let foreign = if is_definition {
+                        enclosing.is_some() && !in_scope(enclosing.as_deref(), owner)
+                    } else {
+                        matches!(
+                            owner_of(&file.source, o.start_byte),
+                            Owner::Path(p)
+                                if p != owner && !matches!(p, "Self" | "self" | "super" | "crate")
+                        )
+                    };
+                    if foreign {
+                        return None;
+                    }
+                }
                 Some(RefHit {
                     path: rel.to_string_lossy().into_owned(),
                     line: o.line,
@@ -153,6 +213,43 @@ mod tests {
             ]
         );
         assert_eq!(hits[2].text, "load();");
+    }
+
+    #[test]
+    fn reads_the_owner_before_an_occurrence() {
+        let src = "Foo::new(); x.new(); p->new; f().new; new; Foo :: bar::new";
+        let at = |needle: &str| owner_of(src, src.find(needle).unwrap() + needle.len() - 3);
+        assert_eq!(at("Foo::new"), Owner::Path("Foo"));
+        assert_eq!(at("x.new"), Owner::Member("x"));
+        assert_eq!(at("p->new"), Owner::Member("p"));
+        assert_eq!(at("().new"), Owner::Unknown);
+        assert_eq!(at("; new"), Owner::Unknown);
+        assert_eq!(at("bar::new"), Owner::Path("bar"));
+    }
+
+    #[test]
+    fn qualified_name_drops_other_owners() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("lib.rs"),
+            "struct A;\nstruct B;\nimpl A {\n    fn new() -> Self { A }\n    fn make() -> Self { Self::new() }\n}\nimpl B {\n    fn new() -> Self { B }\n}\nfn f(x: A) {\n    A::new();\n    B::new();\n    x.new();\n}\n",
+        )
+        .unwrap();
+        let cache = ParseCache::default();
+        let opts = RefOptions {
+            include_definitions: true,
+            ..Default::default()
+        };
+        let lines = |name: &str| -> Vec<usize> {
+            find_references(root, root, &cache, name, &opts)
+                .iter()
+                .map(|h| h.line)
+                .collect()
+        };
+        assert_eq!(lines("new"), [4, 5, 8, 11, 12, 13]);
+        assert_eq!(lines("A::new"), [4, 5, 11, 13]);
+        assert_eq!(lines("B::new"), [5, 8, 12, 13]);
     }
 
     #[test]
