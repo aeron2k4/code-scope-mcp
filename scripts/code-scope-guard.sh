@@ -276,7 +276,7 @@ case "$tool" in
     if [[ "$limit" =~ ^[0-9]+$ ]] && ((limit <= max)); then
       exit 0
     fi
-    deny "Whole-file Read of source code (or a Read without a limit of at most $max lines) is blocked. Use code-scope MCP tools instead (load with ToolSearch \"select:mcp__code-scope__get_file_outline,mcp__code-scope__read_symbol,mcp__code-scope__search_symbols,mcp__code-scope__read_file_pruned\"): get_file_outline / read_symbol / read_file_pruned for $f. To rewrite a whole function or class use replace_symbol; for a smaller Edit, Read only the needed lines with offset and a limit of at most $max."
+    deny "Whole-file Read of source code (or a Read without a limit of at most $max lines) is blocked. Use code-scope MCP tools instead (load with ToolSearch \"select:mcp__code-scope__get_file_outline,mcp__code-scope__read_symbol,mcp__code-scope__search_symbols,mcp__code-scope__read_file_pruned\"): get_file_outline / read_symbol / read_file_pruned for $f. To rewrite a whole function or class use replace_symbol, to add one use insert_symbol; for a smaller Edit, Read only the needed lines with offset and a limit of at most $max."
     ;;
   Grep)
     path=$(jq -r '.tool_input.path // empty' <<<"$input")

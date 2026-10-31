@@ -103,6 +103,7 @@ async fn mcp_session_over_jsonrpc() {
             "find_references",
             "get_file_outline",
             "git_status",
+            "insert_symbol",
             "list_files",
             "read_file_pruned",
             "read_symbol",

@@ -15,7 +15,7 @@ use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
 use rmcp::{ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::Deserialize;
 
-use crate::ast::parser::{self, SymbolKind};
+use crate::ast::parser::{self, Lang, ParsedFile, Symbol, SymbolKind};
 use crate::ast::pruner::{self, PruneOptions};
 use crate::git;
 use crate::index::cache::{ParseCache, PersistentStore};
@@ -214,54 +214,19 @@ impl Workspace {
         new_source: &str,
     ) -> Result<String> {
         let path = self.resolve(rel)?;
-        let source = std::fs::read_to_string(&path)
-            .with_context(|| format!("cannot read {}", self.display(&path)))?;
-        let parsed = parser::parse_path(&path, &source)?;
-        let name = name.trim();
-        let matches: Vec<_> = parsed
-            .symbols
-            .iter()
-            .filter(|s| s.name == name || s.qualified_name() == name)
-            .filter(|s| line.is_none_or(|l| s.start_line == l))
-            .collect();
-        let sym = match matches.as_slice() {
-            [one] => *one,
-            [] => bail!(
-                "symbol {name:?}{} not found in {rel}",
-                line.map(|l| format!(" starting at line {l}"))
-                    .unwrap_or_default()
-            ),
-            many => {
-                let at: Vec<_> = many
-                    .iter()
-                    .map(|s| format!("{} (line {})", s.qualified_name(), s.start_line))
-                    .collect();
-                bail!(
-                    "{name:?} matches {} symbols: {}; pass `line` or a qualified name",
-                    many.len(),
-                    at.join(", ")
-                )
-            }
-        };
+        let (source, parsed) = self.read_fresh(&path)?;
+        let sym = unique_symbol(&parsed, rel, name, line)?;
 
-        let line_start = source[..sym.start_byte].rfind('\n').map_or(0, |i| i + 1);
-        let replacement = new_source.strip_suffix('\n').unwrap_or(new_source);
-        let replacement = replacement.strip_suffix('\r').unwrap_or(replacement);
+        let line_start = line_start(&source, sym.start_byte);
+        let replacement = new_source.trim_end_matches(['\n', '\r']);
         let updated = format!(
             "{}{replacement}{}",
             &source[..line_start],
             &source[sym.end_byte..]
         );
-        let reparsed = parser::parse_path(&path, &updated)?;
-        if reparsed.has_errors && !parsed.has_errors {
-            bail!(
-                "not written: the new source of {} has syntax errors",
-                sym.qualified_name()
-            );
-        }
-        std::fs::write(&path, &updated)
-            .with_context(|| format!("cannot write {}", self.display(&path)))?;
-        self.cache.invalidate(&path);
+        self.write_checked(&path, &parsed, &updated, || {
+            format!("the new source of {}", sym.qualified_name())
+        })?;
 
         let new_lines = if replacement.is_empty() {
             0
@@ -278,6 +243,99 @@ impl Workspace {
             new_lines,
             sym.start_line
         ))
+    }
+
+    /// Insert `new_source` as a new definition after or before an existing
+    /// symbol, separated by a blank line, or at the end of the file when no
+    /// anchor is given. Inserting before a symbol keeps its doc comments,
+    /// attributes and decorators attached to it. Like `replace_symbol`, the
+    /// write is refused if it would introduce syntax errors.
+    pub fn insert_symbol(
+        &self,
+        rel: &str,
+        new_source: &str,
+        anchor: Option<Anchor<'_>>,
+        line: Option<usize>,
+    ) -> Result<String> {
+        let path = self.resolve(rel)?;
+        let (source, parsed) = self.read_fresh(&path)?;
+        let body = new_source
+            .trim_start_matches(['\n', '\r'])
+            .trim_end_matches(['\n', '\r']);
+        if body.trim().is_empty() {
+            bail!("new_source must not be empty");
+        }
+
+        let (pos, text, place) = match anchor {
+            Some(Anchor::After(name)) => {
+                let sym = unique_symbol(&parsed, rel, name, line)?;
+                let (pos, text) = match source[sym.end_byte..].find('\n') {
+                    Some(i) => (sym.end_byte + i + 1, format!("\n{body}\n")),
+                    None => (source.len(), format!("\n\n{body}\n")),
+                };
+                (pos, text, format!("after {}", sym.qualified_name()))
+            }
+            Some(Anchor::Before(name)) => {
+                let sym = unique_symbol(&parsed, rel, name, line)?;
+                let pos = attached_start(parsed.lang, &source, line_start(&source, sym.start_byte));
+                (
+                    pos,
+                    format!("{body}\n\n"),
+                    format!("before {}", sym.qualified_name()),
+                )
+            }
+            None => {
+                let sep = match source.as_str() {
+                    "" => "",
+                    s if s.ends_with('\n') => "\n",
+                    _ => "\n\n",
+                };
+                (
+                    source.len(),
+                    format!("{sep}{body}\n"),
+                    "at the end".to_string(),
+                )
+            }
+        };
+        let updated = format!("{}{text}{}", &source[..pos], &source[pos..]);
+        self.write_checked(&path, &parsed, &updated, || {
+            "the inserted source".to_string()
+        })?;
+
+        // Leading newlines of `text` are separators, not inserted code.
+        let blank = text.len() - text.trim_start_matches('\n').len();
+        let first_line = source[..pos].matches('\n').count() + 1 + blank;
+        Ok(format!(
+            "inserted {} lines {place} in {}, starting at line {first_line}\n",
+            body.lines().count(),
+            self.display(&path),
+        ))
+    }
+
+    /// Read and parse a file from disk, bypassing the cache, before a write.
+    fn read_fresh(&self, path: &Path) -> Result<(String, ParsedFile)> {
+        let source = std::fs::read_to_string(path)
+            .with_context(|| format!("cannot read {}", self.display(path)))?;
+        let parsed = parser::parse_path(path, &source)?;
+        Ok((source, parsed))
+    }
+
+    /// Write `updated` unless it has syntax errors the original did not.
+    fn write_checked(
+        &self,
+        path: &Path,
+        original: &ParsedFile,
+        updated: &str,
+        what: impl FnOnce() -> String,
+    ) -> Result<()> {
+        let reparsed = parser::parse_path(path, updated)?;
+        if reparsed.has_errors && !original.has_errors {
+            bail!("not written: {} has syntax errors", what());
+        }
+        std::fs::write(path, updated)
+            .with_context(|| format!("cannot write {}", self.display(path)))?;
+        self.cache.invalidate(path);
+        Ok(())
     }
 
     pub fn read_pruned(&self, rel: &str, max_tokens: usize, keep: Vec<String>) -> Result<String> {
@@ -431,6 +489,75 @@ impl Workspace {
     }
 }
 
+/// Where `insert_symbol` puts new code, relative to a named symbol.
+#[derive(Debug, Clone, Copy)]
+pub enum Anchor<'a> {
+    After(&'a str),
+    Before(&'a str),
+}
+
+/// The one symbol called `name` (plain or qualified), optionally starting at
+/// `line`; errors name the candidates when there are several.
+fn unique_symbol<'p>(
+    parsed: &'p ParsedFile,
+    rel: &str,
+    name: &str,
+    line: Option<usize>,
+) -> Result<&'p Symbol> {
+    let name = name.trim();
+    let matches: Vec<_> = parsed
+        .symbols
+        .iter()
+        .filter(|s| s.name == name || s.qualified_name() == name)
+        .filter(|s| line.is_none_or(|l| s.start_line == l))
+        .collect();
+    match matches.as_slice() {
+        [one] => Ok(one),
+        [] => bail!(
+            "symbol {name:?}{} not found in {rel}",
+            line.map(|l| format!(" starting at line {l}"))
+                .unwrap_or_default()
+        ),
+        many => {
+            let at: Vec<_> = many
+                .iter()
+                .map(|s| format!("{} (line {})", s.qualified_name(), s.start_line))
+                .collect();
+            bail!(
+                "{name:?} matches {} symbols: {}; pass `line` or a qualified name",
+                many.len(),
+                at.join(", ")
+            )
+        }
+    }
+}
+
+/// Byte offset of the start of the line holding `byte`.
+fn line_start(source: &str, byte: usize) -> usize {
+    source[..byte].rfind('\n').map_or(0, |i| i + 1)
+}
+
+/// Move `start` (a line start) up over the comment, attribute and decorator
+/// lines directly above it, so code inserted there does not split them from
+/// the definition they belong to.
+fn attached_start(lang: Lang, source: &str, mut start: usize) -> usize {
+    while start > 0 {
+        let prev = line_start(source, start - 1);
+        let text = source[prev..start].trim();
+        let attached = match lang {
+            Lang::Python => text.starts_with('#') || text.starts_with('@'),
+            _ => ["//", "/*", "*", "#[", "#![", "@", "["]
+                .iter()
+                .any(|p| text.starts_with(p)),
+        };
+        if text.is_empty() || !attached {
+            break;
+        }
+        start = prev;
+    }
+    start
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct OutlineParams {
     /// File path relative to the workspace root.
@@ -470,6 +597,23 @@ pub struct ReplaceSymbolParams {
     /// numbers and with indentation. Empty deletes the symbol.
     pub new_source: String,
     /// Start line of the symbol, to choose among several with the same name.
+    #[serde(default)]
+    pub line: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct InsertSymbolParams {
+    /// File path relative to the workspace root.
+    pub path: String,
+    /// Source of the new definition(s), with indentation, without line numbers.
+    pub new_source: String,
+    /// Insert after this symbol (plain or qualified name).
+    #[serde(default)]
+    pub after: Option<String>,
+    /// Insert before this symbol, above its doc comments and attributes.
+    #[serde(default)]
+    pub before: Option<String>,
+    /// Start line of the anchor symbol, to choose among several with the same name.
     #[serde(default)]
     pub line: Option<usize>,
 }
@@ -610,6 +754,25 @@ impl CodeScope {
     }
 
     #[tool(
+        description = "Insert a new function, class, method, ... into a file without reading it first: after or before a named symbol (a blank line apart), or at the end of the file when neither is given. Indent new_source for its place, e.g. inside a class. Refused if the result has syntax errors."
+    )]
+    async fn insert_symbol(
+        &self,
+        Parameters(p): Parameters<InsertSymbolParams>,
+    ) -> Result<String, String> {
+        self.run(move |ws| {
+            let anchor = match (p.after.as_deref(), p.before.as_deref()) {
+                (Some(_), Some(_)) => bail!("pass `after` or `before`, not both"),
+                (Some(a), None) => Some(Anchor::After(a)),
+                (None, Some(b)) => Some(Anchor::Before(b)),
+                (None, None) => None,
+            };
+            ws.insert_symbol(&p.path, &p.new_source, anchor, p.line)
+        })
+        .await
+    }
+
+    #[tool(
         description = "Read a file shrunk to a token budget: the full text if it fits, otherwise function bodies are elided (largest first), falling back to an outline."
     )]
     async fn read_file_pruned(
@@ -687,7 +850,8 @@ impl ServerHandler for CodeScope {
                  code, read_symbol to read exactly one definition, and read_file_pruned to read \
                  a whole file within a token budget. Use find_references to see where a symbol \
                  is used and search_text instead of grep. To rewrite a whole function or class, \
-                 use replace_symbol instead of reading and editing the file.",
+                 use replace_symbol, and insert_symbol to add one, instead of reading and \
+                 editing the file.",
             )
     }
 }
@@ -847,6 +1011,74 @@ mod tests {
         assert_eq!(
             fs::read_to_string(dir.path().join("src/two.py")).unwrap(),
             "class A:\n    def h(self):\n        pass\n\nclass B:\n    def g(self):\n        return 1\n"
+        );
+    }
+
+    #[test]
+    fn insert_symbol_after_before_and_at_end() {
+        let (dir, ws) = workspace();
+        let file = dir.path().join("src/lib.rs");
+        let out = ws
+            .insert_symbol(
+                "src/lib.rs",
+                "    pub fn save(&self) {}\n",
+                Some(Anchor::After("Cfg::load")),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            out,
+            "inserted 1 lines after Cfg::load in src/lib.rs, starting at line 8\n"
+        );
+        ws.insert_symbol(
+            "src/lib.rs",
+            "/// Marker.\npub struct Before;",
+            Some(Anchor::Before("Cfg")),
+            Some(1), // `impl Cfg` shares the name
+        )
+        .unwrap();
+        ws.insert_symbol("src/lib.rs", "fn tail() {}", None, None)
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "/// Marker.\npub struct Before;\n\npub struct Cfg;\n\nimpl Cfg {\n    pub fn load() -> Self {\n        Cfg\n    }\n\n    pub fn save(&self) {}\n}\n\nfn tail() {}\n"
+        );
+        assert!(
+            ws.outline("src/lib.rs", None)
+                .unwrap()
+                .contains("pub fn save(&self) [method] L11-11")
+        );
+
+        let err = ws
+            .insert_symbol("src/lib.rs", "fn broken( {", None, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("syntax errors"), "{err}");
+        assert!(ws.insert_symbol("src/lib.rs", "\n", None, None).is_err());
+        assert!(
+            ws.insert_symbol("src/lib.rs", "fn x() {}", Some(Anchor::After("nope")), None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn insert_before_keeps_comments_and_decorators_attached() {
+        let (dir, ws) = workspace();
+        let path = dir.path().join("src/m.py");
+        fs::write(
+            &path,
+            "import os\n\n# Loads things.\n@cache\ndef load():\n    pass\n",
+        )
+        .unwrap();
+        ws.insert_symbol(
+            "src/m.py",
+            "def first():\n    pass\n",
+            Some(Anchor::Before("load")),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "import os\n\ndef first():\n    pass\n\n# Loads things.\n@cache\ndef load():\n    pass\n"
         );
     }
 
