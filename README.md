@@ -55,9 +55,12 @@ It does three things, all at user scope so they apply to every project:
    with `claude mcp add --scope user code-scope`. With no root argument the
    server uses the session's working directory.
 2. Add a `PreToolUse` hook (`~/.claude/hooks/code-scope-guard.sh`, wired in
-   `~/.claude/settings.json`) that denies whole-file `Read` of `.rs .py .js
-   .jsx .ts .tsx .go` files and points Claude to the code-scope tools. `Read`
-   with `offset`/`limit` is still allowed, because `Edit` needs a prior `Read`.
+   `~/.claude/settings.json`) that points Claude to the code-scope tools:
+   - denies whole-file `Read` of `.rs .py .js .jsx .ts .tsx .go` files; `Read`
+     with `offset`/`limit` is still allowed, because `Edit` needs a prior `Read`;
+   - denies `Grep` that may cover those files inside the session's workspace
+     (use `search_text` / `find_references`). `Grep` on a non-code path, with a
+     non-code `glob`/`type` such as `*.md`, or outside the workspace is allowed.
 3. Add a short instruction block to `~/.claude/CLAUDE.md`.
 
 Restart Claude Code afterwards. Re-running the script is safe and updates the

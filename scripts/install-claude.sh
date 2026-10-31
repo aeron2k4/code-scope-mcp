@@ -6,8 +6,9 @@
 #   scripts/install-claude.sh --uninstall  undo everything this script did
 #
 # Enforcement = a PreToolUse hook that denies whole-file Read of source files
-# (Read with offset/limit stays allowed, since Edit needs a prior Read), plus a
-# short instruction block in ~/.claude/CLAUDE.md.
+# (Read with offset/limit stays allowed, since Edit needs a prior Read) and Grep
+# over source files in the workspace, plus a short instruction block in
+# ~/.claude/CLAUDE.md.
 set -euo pipefail
 
 REPO_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -87,26 +88,55 @@ if [ "$enforce" = 1 ]; then
   log "Writing hook $HOOK"
   cat >"$HOOK" <<'EOF'
 #!/usr/bin/env bash
-# PreToolUse guard installed by code-scope-mcp: deny whole-file Read of source
-# code so Claude uses the code-scope MCP tools. A Read with offset/limit is still
-# allowed (needed before Edit).
+# PreToolUse guard installed by code-scope-mcp, so Claude uses the code-scope
+# MCP tools for source code:
+# - Read: deny whole-file reads of source files. A Read with offset/limit is
+#   still allowed (needed before Edit).
+# - Grep: deny searches that may cover source files inside the session's
+#   workspace. Grep over non-code files (a non-code path, or a glob/type that
+#   names no source extension) and outside the workspace stays allowed.
 input=$(cat)
-f=$(jq -r '.tool_input.file_path // empty' <<<"$input")
-has_range=$(jq -r '(.tool_input.offset != null) or (.tool_input.limit != null)' <<<"$input")
+tool=$(jq -r '.tool_name // empty' <<<"$input")
+cwd=$(jq -r '.cwd // empty' <<<"$input")
+CODE_EXT='\.(rs|py|js|jsx|ts|tsx|go)$'
+CODE_GLOB='(rs|py|js|jsx|ts|tsx|go)([,}]|$)'
+CODE_TYPES='^(rust|py|python|js|jsx|ts|tsx|typescript|go)$'
 
-case "$f" in
-  *.rs|*.py|*.js|*.jsx|*.ts|*.tsx|*.go) ;;
-  *) exit 0 ;;
+deny() {
+  jq -n --arg r "$1" '{hookSpecificOutput: {hookEventName: "PreToolUse",
+    permissionDecision: "deny", permissionDecisionReason: $r}}'
+  exit 0
+}
+
+case "$tool" in
+  Read)
+    f=$(jq -r '.tool_input.file_path // empty' <<<"$input")
+    ranged=$(jq -r '(.tool_input.offset != null) or (.tool_input.limit != null)' <<<"$input")
+    [[ "$f" =~ $CODE_EXT ]] || exit 0
+    [ "$ranged" = "true" ] && exit 0
+    deny "Whole-file Read of source code is blocked. Use code-scope MCP tools instead (load with ToolSearch \"select:mcp__code-scope__get_file_outline,mcp__code-scope__read_symbol,mcp__code-scope__search_symbols,mcp__code-scope__read_file_pruned\"): get_file_outline / read_symbol / read_file_pruned for $f. If you must Edit, Read only the needed lines with offset+limit."
+    ;;
+  Grep)
+    path=$(jq -r '.tool_input.path // empty' <<<"$input")
+    glob=$(jq -r '.tool_input.glob // empty' <<<"$input")
+    type=$(jq -r '.tool_input.type // empty' <<<"$input")
+    case "$path" in
+      "") abs=$cwd ;;
+      /*) abs=$path ;;
+      *) abs=$cwd/$path ;;
+    esac
+    # Outside the workspace code-scope cannot help.
+    [ -n "$cwd" ] && case "$abs/" in "$cwd"/*) ;; *) exit 0 ;; esac
+    if [ -f "$abs" ]; then
+      [[ "$abs" =~ $CODE_EXT ]] || exit 0
+    elif [ -n "$type" ]; then
+      [[ "$type" =~ $CODE_TYPES ]] || exit 0
+    elif [ -n "$glob" ]; then
+      [[ "$glob" =~ $CODE_GLOB ]] || exit 0
+    fi
+    deny "Grep over source code is blocked. Use code-scope MCP tools instead (load with ToolSearch \"select:mcp__code-scope__search_text,mcp__code-scope__find_references\"): search_text for a literal or regex (.gitignore-aware, shows the enclosing symbol; takes dir), find_references for uses of a symbol. Grep stays allowed for non-code files: pass a non-code path, or a glob/type such as \"*.md\"."
+    ;;
 esac
-[ "$has_range" = "true" ] && exit 0
-
-jq -n --arg f "$f" '{
-  hookSpecificOutput: {
-    hookEventName: "PreToolUse",
-    permissionDecision: "deny",
-    permissionDecisionReason: ("Whole-file Read of source code is blocked. Use code-scope MCP tools instead (load with ToolSearch \"select:mcp__code-scope__get_file_outline,mcp__code-scope__read_symbol,mcp__code-scope__search_symbols,mcp__code-scope__read_file_pruned\"): get_file_outline / read_symbol / read_file_pruned for " + $f + ". If you must Edit, Read only the needed lines with offset+limit.")
-  }
-}'
 EOF
   chmod +x "$HOOK"
 
@@ -117,7 +147,7 @@ EOF
   tmp=$(mktemp)
   jq --arg cmd "$HOOK" '
     .hooks.PreToolUse = ((.hooks.PreToolUse // []) +
-      [{matcher: "Read", hooks: [{type: "command", command: $cmd}]}])' "$SETTINGS" >"$tmp"
+      [{matcher: "Read|Grep", hooks: [{type: "command", command: $cmd}]}])' "$SETTINGS" >"$tmp"
   mv "$tmp" "$SETTINGS"
 
   log "Adding instructions to $MEMORY"
