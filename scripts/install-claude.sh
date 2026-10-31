@@ -130,7 +130,8 @@ When exploring or reading source code, prefer the code-scope MCP tools over Read
 - \`get_file_outline\` before opening a file; \`search_symbols\` to find a definition.
 - \`read_symbol\` to read one function/class instead of the whole file.
 - \`read_file_pruned\` when a whole file is needed but may be large.
-Use Read/Grep for non-code files, exact text search, or when code-scope fails.
+- \`find_references\` to see where a symbol is used; \`search_text\` instead of Grep.
+Use Read/Grep for non-code files or when code-scope fails.
 Load the tools with ToolSearch ("select:mcp__code-scope__...") if they are deferred.
 $END
 EOF

@@ -14,6 +14,8 @@ Supported languages: Rust, Python, JavaScript, TypeScript/TSX, Go.
 | `search_symbols`   | Ranked name search across the workspace (exact > prefix > substring)        |
 | `read_symbol`      | Exact source of one definition, line-numbered                               |
 | `read_file_pruned` | File text within `max_tokens`: full → bodies elided → outline → truncated   |
+| `find_references`  | Uses of a symbol (identifier tokens, so comments/strings are skipped), with the enclosing symbol |
+| `search_text`      | Literal or regex search over files, honouring `.gitignore`, with the enclosing symbol |
 | `list_files`       | Files under a directory, honouring `.gitignore`                             |
 | `git_status`       | Working-tree status                                                         |
 

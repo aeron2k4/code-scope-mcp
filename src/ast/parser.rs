@@ -261,6 +261,35 @@ pub struct ParsedFile {
     pub symbols: Vec<Symbol>,
     /// True when tree-sitter had to recover from syntax errors.
     pub has_errors: bool,
+    /// Start bytes of every identifier token, ascending. Kept so reference
+    /// search needs no re-parse; stored as deltas to keep the store compact.
+    #[serde(with = "deltas")]
+    pub idents: Vec<u32>,
+}
+
+/// Serde adapter writing an ascending `Vec<u32>` as successive differences.
+mod deltas {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(values: &[u32], s: S) -> Result<S::Ok, S::Error> {
+        let mut prev = 0;
+        s.collect_seq(values.iter().map(|&v| {
+            let d = v.saturating_sub(prev);
+            prev = v;
+            d
+        }))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u32>, D::Error> {
+        let mut acc = 0u32;
+        Ok(Vec::<u32>::deserialize(d)?
+            .into_iter()
+            .map(|delta| {
+                acc = acc.saturating_add(delta);
+                acc
+            })
+            .collect())
+    }
 }
 
 pub fn parse_path(path: &Path, source: &str) -> Result<ParsedFile, ParseError> {
@@ -279,7 +308,87 @@ pub fn parse_source(lang: Lang, source: &str) -> Result<ParsedFile, ParseError> 
         lang,
         symbols,
         has_errors: root.has_error(),
+        idents: collect_idents(root),
     })
+}
+
+/// Start bytes of identifier leaves (identifier, type_identifier,
+/// field_identifier, property_identifier, ...), in source order. Comments
+/// and string literals are not identifiers, so they never appear here.
+fn collect_idents(root: Node<'_>) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut cursor = root.walk();
+    'walk: loop {
+        let node = cursor.node();
+        if node.child_count() == 0
+            && node.kind().ends_with("identifier")
+            && let Ok(start) = u32::try_from(node.start_byte())
+        {
+            out.push(start);
+        }
+        if cursor.goto_first_child() || cursor.goto_next_sibling() {
+            continue;
+        }
+        loop {
+            if !cursor.goto_parent() {
+                break 'walk;
+            }
+            if cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// One identifier token in a source file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Occurrence {
+    /// 1-based line.
+    pub line: usize,
+    /// 0-based byte column.
+    pub column: usize,
+    pub start_byte: usize,
+}
+
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '$'
+}
+
+/// Identifier tokens spelled exactly `name`, in source order, looked up in
+/// the identifiers recorded at parse time (no re-parse).
+pub fn identifier_occurrences(parsed: &ParsedFile, source: &str, name: &str) -> Vec<Occurrence> {
+    if name.is_empty() || !source.contains(name) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let (mut line, mut line_start, mut counted) = (1, 0, 0);
+    for &start in &parsed.idents {
+        let start = start as usize;
+        let Some(rest) = source.get(start..) else {
+            continue;
+        };
+        let whole_token = rest
+            .strip_prefix(name)
+            .is_some_and(|after| !after.starts_with(is_ident_char));
+        if !whole_token {
+            continue;
+        }
+        // Idents are ascending, so line numbers are counted incrementally.
+        for (i, b) in source.as_bytes()[counted..start].iter().enumerate() {
+            if *b == b'\n' {
+                line += 1;
+                line_start = counted + i + 1;
+            }
+        }
+        counted = start;
+        out.push(Occurrence {
+            line,
+            column: start - line_start,
+            start_byte: start,
+        });
+    }
+    out
 }
 
 fn extract_symbols(lang: Lang, root: Node<'_>, source: &str) -> Result<Vec<Symbol>, ParseError> {
@@ -587,6 +696,67 @@ macro_rules! m { () => {} }
                 parse_source(lang, src).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn identifier_occurrences_skip_comments_and_strings() {
+        let cases = [
+            (
+                Lang::Rust,
+                "// load here\nfn load() {}\nfn main() { let s = \"load\"; load(); x.load; }\n",
+                vec![2, 3, 3],
+            ),
+            (
+                Lang::Python,
+                "# load\ndef load():\n    pass\nload()\nobj.load()\ns = 'load'\n",
+                vec![2, 4, 5],
+            ),
+            (
+                Lang::JavaScript,
+                "// load\nfunction load() {}\nload();\nobj.load();\nconst s = 'load';\n",
+                vec![2, 3, 4],
+            ),
+            (
+                Lang::TypeScript,
+                "type load = number;\nlet x: load = 1; // load\n",
+                vec![1, 2],
+            ),
+            (
+                Lang::Go,
+                "package p\n// load\nfunc load() {}\nfunc m() { load(); s := \"load\" }\n",
+                vec![3, 4],
+            ),
+        ];
+        for (lang, src, expected) in cases {
+            let parsed = parse_source(lang, src).unwrap();
+            let lines: Vec<usize> = identifier_occurrences(&parsed, src, "load")
+                .iter()
+                .map(|o| o.line)
+                .collect();
+            assert_eq!(lines, expected, "{}", lang.name());
+        }
+        let src = "fn loader() {}";
+        let parsed = parse_source(Lang::Rust, src).unwrap();
+        assert!(identifier_occurrences(&parsed, src, "load").is_empty());
+
+        let src = "fn f() {\n    x.load(load);\n}\n";
+        let parsed = parse_source(Lang::Rust, src).unwrap();
+        let cols: Vec<_> = identifier_occurrences(&parsed, src, "load")
+            .iter()
+            .map(|o| (o.line, o.column))
+            .collect();
+        assert_eq!(cols, [(2, 6), (2, 11)]);
+    }
+
+    #[test]
+    fn idents_round_trip_through_json_as_deltas() {
+        let src = "fn a() { b(c) }\n";
+        let parsed = parse_source(Lang::Rust, src).unwrap();
+        assert_eq!(parsed.idents, [3, 9, 11]);
+        let json = serde_json::to_string(&parsed).unwrap();
+        assert!(json.contains("\"idents\":[3,6,2]"), "{json}");
+        let back: ParsedFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.idents, parsed.idents);
     }
 
     #[test]

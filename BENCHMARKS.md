@@ -7,9 +7,9 @@ Tokens are estimated at ~4 bytes/token for both the full text and the reduced ou
 
 | Corpus | Files | Size | Symbols | Cold parse (1 thread) | Search: cold | Search: warm (median) | Search: after restart |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Go 1.27.3 stdlib | 8090 | 82.2 MB | 115239 | 10493 ms (771 files/s, 7.8 MB/s) | 2250.5 ms | 21.0 ms | 72.0 ms (8088 from store, 0 re-parsed) |
-| CPython 3.14 stdlib | 951 | 14.6 MB | 24586 | 1370 ms (693 files/s, 10.6 MB/s) | 270.8 ms | 5.9 ms | 12.5 ms (950 from store, 0 re-parsed) |
-| tokio 1.54.1 (Rust) | 573 | 4.5 MB | 9100 | 504 ms (1137 files/s, 9.0 MB/s) | 100.4 ms | 1.7 ms | 4.4 ms (573 from store, 0 re-parsed) |
+| Go 1.27.3 stdlib | 8090 | 82.2 MB | 115239 | 12106 ms (668 files/s, 6.8 MB/s) | 2854.6 ms | 23.9 ms | 90.6 ms (8088 from store, 0 re-parsed) |
+| CPython 3.14 stdlib | 951 | 14.6 MB | 24586 | 1627 ms (584 files/s, 8.9 MB/s) | 366.3 ms | 6.5 ms | 15.6 ms (950 from store, 0 re-parsed) |
+| tokio 1.54.1 (Rust) | 573 | 4.5 MB | 9100 | 568 ms (1009 files/s, 8.0 MB/s) | 111.4 ms | 1.9 ms | 5.1 ms (573 from store, 0 re-parsed) |
 
 ## Token savings
 
@@ -18,6 +18,16 @@ Tokens are estimated at ~4 bytes/token for both the full text and the reduced ou
 | Go 1.27.3 stdlib | 91.7% fewer (21541310 → 1787865 tokens) | 2182 | 85.4% fewer | 0.9% |
 | CPython 3.14 stdlib | 90.3% fewer (3816218 → 370287 tokens) | 451 | 83.5% fewer | 0.8% |
 | tokio 1.54.1 (Rust) | 88.0% fewer (1187255 → 142851 tokens) | 173 | 76.8% fewer | 2.0% |
+
+## References & text search
+
+Queries: `new`, `parse`, `read`, `error`, `close`, `test`. `search_text` runs the whole-word regex `\bQUERY\b`, like `grep -w`.
+
+| Corpus | `find_references` (median) | Lines with a reference | Lines with a word match | Word matches dropped | `search_text` word (median) | `search_text` regex |
+|---|---:|---:|---:|---:|---:|---:|
+| Go 1.27.3 stdlib | 24.7 ms | 37665 | 74077 | 49.2% | 34.8 ms | 36.0 ms |
+| CPython 3.14 stdlib | 5.8 ms | 2727 | 7205 | 62.2% | 10.4 ms | 12.2 ms |
+| tokio 1.54.1 (Rust) | 1.8 ms | 4892 | 7978 | 38.7% | 2.2 ms | 1.7 ms |
 
 ## Startup
 
@@ -31,3 +41,6 @@ Spawn → `initialize` response: **1.7 ms** (median of 10; no indexing at startu
 - **Search: after restart**: new process state with the LMDB store; files are validated by git blob hash instead of re-parsed.
 - **Pruned to budget**: `read_file_pruned` output for files that exceed the budget.
 - **`read_symbol` / whole file**: tokens for one function/method versus reading its entire file.
+- **`find_references`**: identifier tokens named QUERY, definitions included; looked up in the identifier offsets recorded at parse time (warm cache).
+- **Word matches dropped**: whole-word text matches that are not references (comments, strings, docs, non-source files).
+- **`search_text` regex**: one run of `TODO|FIXME|XXX` over every text file.

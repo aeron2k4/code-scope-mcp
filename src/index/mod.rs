@@ -1,14 +1,73 @@
 //! Project-wide symbol search on top of the lazy parse cache.
 
 pub mod cache;
+pub mod refs;
+pub mod text;
 
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::ast::parser::{Lang, SymbolKind};
+use crate::ast::parser::{Lang, Symbol, SymbolKind};
 use crate::git;
 use cache::ParseCache;
+
+/// Longest line excerpt returned by reference and text search.
+const MAX_EXCERPT_CHARS: usize = 200;
+
+/// Apply `f` to every file on all cores; results keep the order of `files`.
+fn par_flat_map<T, F>(files: &[PathBuf], f: F) -> Vec<T>
+where
+    T: Send,
+    F: Fn(&Path) -> Vec<T> + Sync,
+{
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(files.len().max(1));
+    let chunk = files.len().div_ceil(workers).max(1);
+    std::thread::scope(|s| {
+        let handles: Vec<_> = files
+            .chunks(chunk)
+            .map(|chunk| {
+                let f = &f;
+                s.spawn(move || chunk.iter().flat_map(|p| f(p)).collect::<Vec<T>>())
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap_or_default())
+            .collect()
+    })
+}
+
+/// Innermost symbol whose byte range contains `byte`.
+fn enclosing_symbol(symbols: &[Symbol], byte: usize) -> Option<&Symbol> {
+    symbols
+        .iter()
+        .filter(|s| s.start_byte <= byte && byte < s.end_byte)
+        .max_by_key(|s| s.depth)
+}
+
+/// The trimmed line containing `byte`, cut to [`MAX_EXCERPT_CHARS`].
+fn line_excerpt(source: &str, byte: usize) -> String {
+    let start = source[..byte].rfind('\n').map_or(0, |i| i + 1);
+    let end = source[byte..].find('\n').map_or(source.len(), |i| byte + i);
+    let line = source[start..end].trim();
+    match line.char_indices().nth(MAX_EXCERPT_CHARS) {
+        Some((cut, _)) => format!("{}…", &line[..cut]),
+        None => line.to_string(),
+    }
+}
+
+/// Files under `dir` (inside `root`), as paths relative to `root`.
+fn files_under(root: &Path, dir: &Path, max_files: usize) -> Vec<PathBuf> {
+    let prefix = dir.strip_prefix(root).unwrap_or(Path::new(""));
+    git::list_files(dir, max_files)
+        .into_iter()
+        .map(|p| prefix.join(p))
+        .collect()
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SymbolHit {
@@ -78,54 +137,34 @@ pub fn search_symbols(
         .filter(|p| Lang::from_path(p).is_some())
         .collect();
 
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .min(files.len().max(1));
-    let chunk = files.len().div_ceil(workers).max(1);
-
-    let mut hits: Vec<SymbolHit> = std::thread::scope(|s| {
-        let handles: Vec<_> = files
-            .chunks(chunk)
-            .map(|chunk| {
-                let query_lower = &query_lower;
-                s.spawn(move || {
-                    let mut local = Vec::new();
-                    for rel in chunk {
-                        let file = match cache.get(&root.join(rel)) {
-                            Ok(f) => f,
-                            Err(err) => {
-                                tracing::debug!(%err, "skipping file in search");
-                                continue;
-                            }
-                        };
-                        for sym in &file.parsed.symbols {
-                            if opts.kind.is_some_and(|k| k != sym.kind) {
-                                continue;
-                            }
-                            let qualified = sym.qualified_name();
-                            if let Some(score) = score(query, query_lower, &sym.name, &qualified) {
-                                local.push(SymbolHit {
-                                    path: rel.to_string_lossy().into_owned(),
-                                    name: sym.name.clone(),
-                                    qualified_name: qualified,
-                                    kind: sym.kind,
-                                    signature: sym.signature.clone(),
-                                    start_line: sym.start_line,
-                                    end_line: sym.end_line,
-                                    score,
-                                });
-                            }
-                        }
-                    }
-                    local
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .flat_map(|h| h.join().unwrap_or_default())
-            .collect()
+    let mut hits: Vec<SymbolHit> = par_flat_map(&files, |rel| {
+        let file = match cache.get(&root.join(rel)) {
+            Ok(f) => f,
+            Err(err) => {
+                tracing::debug!(%err, "skipping file in search");
+                return Vec::new();
+            }
+        };
+        let mut local = Vec::new();
+        for sym in &file.parsed.symbols {
+            if opts.kind.is_some_and(|k| k != sym.kind) {
+                continue;
+            }
+            let qualified = sym.qualified_name();
+            if let Some(score) = score(query, &query_lower, &sym.name, &qualified) {
+                local.push(SymbolHit {
+                    path: rel.to_string_lossy().into_owned(),
+                    name: sym.name.clone(),
+                    qualified_name: qualified,
+                    kind: sym.kind,
+                    signature: sym.signature.clone(),
+                    start_line: sym.start_line,
+                    end_line: sym.end_line,
+                    score,
+                });
+            }
+        }
+        local
     });
 
     hits.sort_by(|a, b| {

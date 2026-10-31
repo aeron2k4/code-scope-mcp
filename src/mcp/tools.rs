@@ -19,11 +19,16 @@ use crate::ast::parser::SymbolKind;
 use crate::ast::pruner::{self, PruneOptions};
 use crate::git;
 use crate::index::cache::{ParseCache, PersistentStore};
+use crate::index::refs::{self, RefOptions};
+use crate::index::text::{self, TextOptions};
 use crate::index::{self, SearchOptions};
 
 const DEFAULT_MAX_TOKENS: usize = 4000;
 const DEFAULT_SEARCH_LIMIT: usize = 50;
 const DEFAULT_LIST_LIMIT: usize = 500;
+const DEFAULT_HIT_LIMIT: usize = 100;
+/// Compiled-regex size cap, so a pathological pattern fails fast.
+const MAX_REGEX_BYTES: usize = 1 << 20;
 const MAX_SYMBOL_MATCHES: usize = 5;
 
 pub struct Workspace {
@@ -194,7 +199,8 @@ impl Workspace {
         Ok(out)
     }
 
-    pub fn list_files(&self, dir: Option<&str>, limit: usize) -> Result<String> {
+    /// Resolve an optional sub-directory, defaulting to the root.
+    fn resolve_dir(&self, dir: Option<&str>) -> Result<PathBuf> {
         let base = match dir {
             Some(d) if !d.trim().is_empty() => self.resolve(d)?,
             _ => self.root.clone(),
@@ -202,6 +208,85 @@ impl Workspace {
         if !base.is_dir() {
             bail!("not a directory: {}", self.display(&base));
         }
+        Ok(base)
+    }
+
+    pub fn find_references(
+        &self,
+        name: &str,
+        dir: Option<&str>,
+        include_definitions: bool,
+        limit: usize,
+    ) -> Result<String> {
+        let base = self.resolve_dir(dir)?;
+        let opts = RefOptions {
+            include_definitions,
+            ..Default::default()
+        };
+        let hits = refs::find_references(&self.root, &base, &self.cache, name, &opts);
+        if hits.is_empty() {
+            return Ok(format!("no references to {name:?}\n"));
+        }
+        let mut out = String::new();
+        for h in hits.iter().take(limit) {
+            let _ = write!(out, "{}:{}:{}: {}", h.path, h.line, h.column + 1, h.text);
+            if h.is_definition {
+                out.push_str("  [definition]");
+            }
+            if let Some(sym) = &h.enclosing {
+                let _ = write!(out, "  [in {sym}]");
+            }
+            out.push('\n');
+        }
+        if hits.len() > limit {
+            let _ = writeln!(out, "… {} more references", hits.len() - limit);
+        }
+        Ok(out)
+    }
+
+    pub fn search_text(
+        &self,
+        pattern: &str,
+        regex: bool,
+        case_insensitive: bool,
+        dir: Option<&str>,
+        limit: usize,
+    ) -> Result<String> {
+        if pattern.is_empty() {
+            bail!("pattern must not be empty");
+        }
+        let base = self.resolve_dir(dir)?;
+        let source = if regex {
+            pattern.to_string()
+        } else {
+            regex::escape(pattern)
+        };
+        let re = regex::RegexBuilder::new(&source)
+            .case_insensitive(case_insensitive)
+            .multi_line(true)
+            .size_limit(MAX_REGEX_BYTES)
+            .build()
+            .with_context(|| format!("invalid pattern {pattern:?}"))?;
+        let hits = text::search_text(&self.root, &base, &self.cache, &re, &TextOptions::default());
+        if hits.is_empty() {
+            return Ok(format!("no matches for {pattern:?}\n"));
+        }
+        let mut out = String::new();
+        for h in hits.iter().take(limit) {
+            let _ = write!(out, "{}:{}: {}", h.path, h.line, h.text);
+            if let Some(sym) = &h.enclosing {
+                let _ = write!(out, "  [in {sym}]");
+            }
+            out.push('\n');
+        }
+        if hits.len() > limit {
+            let _ = writeln!(out, "… {} more matching lines", hits.len() - limit);
+        }
+        Ok(out)
+    }
+
+    pub fn list_files(&self, dir: Option<&str>, limit: usize) -> Result<String> {
+        let base = self.resolve_dir(dir)?;
         let files = git::list_files(&base, limit);
         let mut out = String::new();
         for f in &files {
@@ -287,6 +372,39 @@ pub struct ListFilesParams {
     pub limit: Option<usize>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FindReferencesParams {
+    /// Symbol name, plain (`load`) or qualified (`Config::load`; only the last segment is matched).
+    pub name: String,
+    /// Sub-directory relative to the workspace root to search in. Default: the root.
+    #[serde(default)]
+    pub dir: Option<String>,
+    /// Also list the definitions themselves (default false).
+    #[serde(default)]
+    pub include_definitions: Option<bool>,
+    /// Maximum number of results (default 100).
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SearchTextParams {
+    /// Text to find; a literal string unless `regex` is true.
+    pub pattern: String,
+    /// Treat `pattern` as a regular expression (Rust regex syntax). Default false.
+    #[serde(default)]
+    pub regex: Option<bool>,
+    /// Ignore case (default false).
+    #[serde(default)]
+    pub case_insensitive: Option<bool>,
+    /// Sub-directory relative to the workspace root to search in. Default: the root.
+    #[serde(default)]
+    pub dir: Option<String>,
+    /// Maximum number of matching lines (default 100).
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
 #[derive(Clone)]
 pub struct CodeScope {
     workspace: Arc<Workspace>,
@@ -368,6 +486,43 @@ impl CodeScope {
         .await
     }
 
+    #[tool(
+        description = "Find where a symbol is used across the workspace: identifier tokens in the syntax tree, so mentions in comments and strings are skipped. Returns path:line:col, the line and the enclosing symbol."
+    )]
+    async fn find_references(
+        &self,
+        Parameters(p): Parameters<FindReferencesParams>,
+    ) -> Result<String, String> {
+        self.run(move |ws| {
+            ws.find_references(
+                &p.name,
+                p.dir.as_deref(),
+                p.include_definitions.unwrap_or(false),
+                p.limit.unwrap_or(DEFAULT_HIT_LIMIT),
+            )
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Search file contents for a literal string or regex, respecting .gitignore. Returns path:line, the line and the enclosing symbol. Use instead of grep."
+    )]
+    async fn search_text(
+        &self,
+        Parameters(p): Parameters<SearchTextParams>,
+    ) -> Result<String, String> {
+        self.run(move |ws| {
+            ws.search_text(
+                &p.pattern,
+                p.regex.unwrap_or(false),
+                p.case_insensitive.unwrap_or(false),
+                p.dir.as_deref(),
+                p.limit.unwrap_or(DEFAULT_HIT_LIMIT),
+            )
+        })
+        .await
+    }
+
     #[tool(description = "List files in the workspace, respecting .gitignore.")]
     async fn list_files(
         &self,
@@ -394,7 +549,8 @@ impl ServerHandler for CodeScope {
             .with_instructions(
                 "AST-aware code navigation. Prefer get_file_outline and search_symbols to locate \
                  code, read_symbol to read exactly one definition, and read_file_pruned to read \
-                 a whole file within a token budget.",
+                 a whole file within a token budget. Use find_references to see where a symbol \
+                 is used and search_text instead of grep.",
             )
     }
 }
@@ -447,6 +603,44 @@ mod tests {
         let (_dir, ws) = workspace();
         let out = ws.read_pruned("src/lib.rs", 1000, vec![]).unwrap();
         assert!(out.starts_with("// src/lib.rs | strategy=full |"));
+    }
+
+    #[test]
+    fn find_references_reports_uses() {
+        let (dir, ws) = workspace();
+        fs::write(
+            dir.path().join("src/main.rs"),
+            "fn main() {\n    Cfg::load();\n}\n",
+        )
+        .unwrap();
+        let out = ws.find_references("Cfg::load", None, false, 10).unwrap();
+        assert_eq!(out, "src/main.rs:2:10: Cfg::load();  [in main]\n");
+        let out = ws.find_references("load", Some("src"), true, 1).unwrap();
+        assert!(
+            out.starts_with("src/lib.rs:4:12: pub fn load() -> Self {  [definition]  [in Cfg]\n")
+        );
+        assert!(out.ends_with("… 1 more references\n"));
+        assert!(
+            ws.find_references("nope", None, false, 10)
+                .unwrap()
+                .starts_with("no references")
+        );
+    }
+
+    #[test]
+    fn search_text_literal_and_regex() {
+        let (_dir, ws) = workspace();
+        let out = ws.search_text("Cfg", false, false, None, 10).unwrap();
+        assert!(out.contains("src/lib.rs:5: Cfg  [in Cfg::load]\n"));
+        let out = ws.search_text(r"fn \w+\(", true, false, None, 10).unwrap();
+        assert_eq!(
+            out,
+            "src/lib.rs:4: pub fn load() -> Self {  [in Cfg::load]\n"
+        );
+        let out = ws.search_text("CFG;", false, true, None, 10).unwrap();
+        assert_eq!(out, "src/lib.rs:1: pub struct Cfg;  [in Cfg]\n");
+        assert!(ws.search_text("(", true, false, None, 10).is_err());
+        assert!(ws.search_text("(", false, false, Some("nope"), 10).is_err());
     }
 
     #[test]

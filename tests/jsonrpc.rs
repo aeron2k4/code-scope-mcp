@@ -100,12 +100,14 @@ async fn mcp_session_over_jsonrpc() {
     assert_eq!(
         names,
         [
+            "find_references",
             "get_file_outline",
             "git_status",
             "list_files",
             "read_file_pruned",
             "read_symbol",
-            "search_symbols"
+            "search_symbols",
+            "search_text"
         ]
     );
     let search_tool = list["result"]["tools"]
@@ -134,6 +136,27 @@ async fn mcp_session_over_jsonrpc() {
         )
         .await;
     assert!(tool_text(&symbol).contains("3\t        return 1"));
+
+    let refs = client
+        .call(
+            7,
+            "tools/call",
+            json!({"name": "find_references", "arguments": {"name": "run", "include_definitions": true}}),
+        )
+        .await;
+    assert_eq!(
+        tool_text(&refs),
+        "app.py:2:9: def run(self):  [definition]  [in App]\n"
+    );
+
+    let text = client
+        .call(
+            8,
+            "tools/call",
+            json!({"name": "search_text", "arguments": {"pattern": "return"}}),
+        )
+        .await;
+    assert_eq!(tool_text(&text), "app.py:3: return 1  [in App::run]\n");
 
     // Tool failures surface as isError results, not protocol errors.
     let missing = client

@@ -18,12 +18,17 @@ use code_scope_mcp::ast::parser::Lang;
 use code_scope_mcp::ast::pruner::{self, PruneOptions, estimate_tokens};
 use code_scope_mcp::git;
 use code_scope_mcp::index::cache::{ParseCache, PersistentStore};
+use code_scope_mcp::index::refs::{self, RefOptions};
+use code_scope_mcp::index::text::{self, TextOptions};
 use code_scope_mcp::index::{self, SearchOptions};
+use regex::Regex;
 
 const MAX_FILES: usize = 50_000;
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const PRUNE_BUDGET: usize = 2_000;
 const QUERIES: [&str; 6] = ["new", "parse", "read", "error", "close", "test"];
+/// Regex for `search_text` besides the per-query literals.
+const TEXT_REGEX: &str = r"TODO|FIXME|XXX";
 const WARM_ROUNDS: usize = 5;
 const STARTUP_ROUNDS: usize = 10;
 
@@ -65,6 +70,13 @@ struct CorpusReport {
     large_full_tokens: usize,
     large_pruned_tokens: usize,
     symbol_ratio_median: f64,
+    refs_ms_median: f64,
+    /// Distinct lines holding a reference, summed over `QUERIES`.
+    refs_lines: usize,
+    /// Lines with a whole-word text match, summed over `QUERIES`.
+    word_lines: usize,
+    text_ms_median: f64,
+    text_regex_ms: f64,
 }
 
 fn bench_corpus(name: &str, root: &Path) -> CorpusReport {
@@ -147,6 +159,34 @@ fn bench_corpus(name: &str, root: &Path) -> CorpusReport {
     let search_restart = start.elapsed();
     let stats = cache.stats();
 
+    // 4. find_references vs whole-word text search, on the warm cache.
+    let ref_opts = RefOptions {
+        include_definitions: true,
+        max_files: MAX_FILES,
+    };
+    let text_opts = TextOptions {
+        max_files: MAX_FILES,
+    };
+    let (mut refs_times, mut text_times) = (Vec::new(), Vec::new());
+    let (mut refs_lines, mut word_lines) = (0, 0);
+    for q in QUERIES {
+        let start = Instant::now();
+        let hits = refs::find_references(root, root, &cache, q, &ref_opts);
+        refs_times.push(ms(start.elapsed()));
+        let mut lines: Vec<_> = hits.iter().map(|h| (&h.path, h.line)).collect();
+        lines.dedup();
+        refs_lines += lines.len();
+
+        let re = Regex::new(&format!(r"\b{q}\b")).expect("word regex");
+        let start = Instant::now();
+        word_lines += text::search_text(root, root, &cache, &re, &text_opts).len();
+        text_times.push(ms(start.elapsed()));
+    }
+    let re = Regex::new(TEXT_REGEX).expect("text regex");
+    let start = Instant::now();
+    text::search_text(root, root, &cache, &re, &text_opts);
+    let text_regex_ms = ms(start.elapsed());
+
     CorpusReport {
         name: name.to_string(),
         files: files.len(),
@@ -165,6 +205,11 @@ fn bench_corpus(name: &str, root: &Path) -> CorpusReport {
         large_full_tokens: large_full,
         large_pruned_tokens: large_pruned,
         symbol_ratio_median: median(symbol_ratios),
+        refs_ms_median: median(refs_times),
+        refs_lines,
+        word_lines,
+        text_ms_median: median(text_times),
+        text_regex_ms,
     }
 }
 
@@ -277,18 +322,41 @@ fn render(reports: &[CorpusReport], startup: f64) -> String {
         ));
     }
 
+    out.push_str("\n## References & text search\n\n");
+    out.push_str(&format!(
+        "Queries: {}. `search_text` runs the whole-word regex `\\bQUERY\\b`, like `grep -w`.\n\n",
+        QUERIES.map(|q| format!("`{q}`")).join(", ")
+    ));
+    out.push_str("| Corpus | `find_references` (median) | Lines with a reference | Lines with a word match | Word matches dropped | `search_text` word (median) | `search_text` regex |\n");
+    out.push_str("|---|---:|---:|---:|---:|---:|---:|\n");
+    for r in reports {
+        out.push_str(&format!(
+            "| {} | {:.1} ms | {} | {} | {:.1}% | {:.1} ms | {:.1} ms |\n",
+            r.name,
+            r.refs_ms_median,
+            r.refs_lines,
+            r.word_lines,
+            pct_saved(r.word_lines, r.refs_lines),
+            r.text_ms_median,
+            r.text_regex_ms,
+        ));
+    }
+
     out.push_str(&format!(
         "\n## Startup\n\nSpawn → `initialize` response: **{startup:.1} ms** (median of {STARTUP_ROUNDS}; no indexing at startup).\n"
     ));
-    out.push_str(
+    out.push_str(&format!(
         "\n### Columns\n\n\
          - **Cold parse**: read and tree-sitter-parse every supported file on one thread.\n\
          - **Search: cold**: first `search_symbols` on an empty cache (walks the tree, parses in parallel, persists results).\n\
          - **Search: warm**: later searches served from the in-memory cache (still walks and `stat`s every file).\n\
          - **Search: after restart**: new process state with the LMDB store; files are validated by git blob hash instead of re-parsed.\n\
          - **Pruned to budget**: `read_file_pruned` output for files that exceed the budget.\n\
-         - **`read_symbol` / whole file**: tokens for one function/method versus reading its entire file.\n",
-    );
+         - **`read_symbol` / whole file**: tokens for one function/method versus reading its entire file.\n\
+         - **`find_references`**: identifier tokens named QUERY, definitions included; looked up in the identifier offsets recorded at parse time (warm cache).\n\
+         - **Word matches dropped**: whole-word text matches that are not references (comments, strings, docs, non-source files).\n\
+         - **`search_text` regex**: one run of `{TEXT_REGEX}` over every text file.\n",
+    ));
     out
 }
 

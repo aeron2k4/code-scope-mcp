@@ -110,6 +110,7 @@ dependencies = [
  "anyhow",
  "heed",
  "ignore",
+ "regex",
  "rmcp",
  "schemars",
  "serde",
