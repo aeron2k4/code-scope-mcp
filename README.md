@@ -8,19 +8,23 @@ Supported languages: Rust, Python, JavaScript, TypeScript/TSX, Go.
 
 ## Tools
 
-| Tool               | Purpose                                                                     |
-| ------------------ | --------------------------------------------------------------------------- |
-| `get_file_outline` | Symbols in a file with signatures and line ranges                           |
-| `search_symbols`   | Ranked name search across the workspace (exact > prefix > substring)        |
-| `read_symbol`      | Exact source of one definition, line-numbered                               |
-| `read_file_pruned` | File text within `max_tokens`: full → bodies elided → outline → truncated   |
-| `find_references`  | Uses of a symbol (identifier tokens, so comments/strings are skipped), with the enclosing symbol |
-| `search_text`      | Literal or regex search over files, honouring `.gitignore`, with the enclosing symbol |
-| `list_files`       | Files under a directory, honouring `.gitignore`                             |
-| `git_status`       | Working-tree status                                                         |
+| Tool               | Purpose                                                                          |
+| ------------------ | -------------------------------------------------------------------------------- |
+| `get_file_outline` | Symbols in a file with signatures and line ranges                                |
+| `search_symbols`   | Ranked name search across the workspace (exact > prefix > substring)             |
+| `read_symbol`      | Exact source of one definition, line-numbered                                    |
+| `read_file_pruned` | File text within `max_tokens`: full → bodies elided → outline → truncated        |
+| `find_references`  | Uses of a symbol from identifier tokens (comments and strings skipped)           |
+| `search_text`      | Literal or regex search over files, honouring `.gitignore`                       |
+| `list_files`       | Files under a directory, honouring `.gitignore`                                  |
+| `git_status`       | Working-tree status                                                              |
+
+`find_references` and `search_text` annotate every hit with its enclosing
+symbol, e.g. `src/lib.rs:42:9: load();  [in Config::reload]`.
 
 Files are parsed lazily the first time they are requested, so nothing is
-indexed at startup. Parse results are cached at two levels:
+indexed at startup. A parse records a file's symbols and the offsets of its
+identifier tokens, and is cached at two levels:
 
 - **in memory**, reused while a file's modification time and size are unchanged;
 - **on disk**, in an LMDB (memory-mapped) store keyed by the file's git blob
@@ -32,6 +36,21 @@ indexed at startup. Parse results are cached at two levels:
 | `CODE_SCOPE_CACHE_DIR` | Store location (default `$XDG_CACHE_HOME/code-scope-mcp` or `~/.cache/code-scope-mcp`) |
 | `CODE_SCOPE_NO_CACHE`  | Set to `1` to keep the cache in memory only                             |
 | `CODE_SCOPE_LOG`       | Log filter, e.g. `debug` (stderr only)                                  |
+
+## Performance
+
+On the Go 1.27.3 standard library (8,090 files, 82 MB), with a warm cache:
+
+- `search_symbols`: 24 ms; after a restart, 86 ms from the on-disk store
+  versus 2.6 s cold.
+- `find_references`: 24 ms. Half of `grep -w` matches are not references
+  (comments, strings, docs, non-source files) and are left out.
+- `search_text`: 33 ms over every text file.
+- Outlines use ~92% fewer tokens than full source; reading one function costs
+  a median 0.9% of its file.
+- The server answers `initialize` in ~2 ms.
+
+Full results for Go, CPython and tokio are in [`BENCHMARKS.md`](BENCHMARKS.md).
 
 ## Usage
 
@@ -91,5 +110,11 @@ cargo fmt
 cargo clippy --all-targets -- -D warnings
 ```
 
-Benchmarks on the Go, CPython and tokio codebases are in [`BENCHMARKS.md`](BENCHMARKS.md); regenerate them with `cargo bench --bench report` (see the header of `benches/report.rs`).
+`cargo bench --bench report` measures this crate's own `src/`. To regenerate
+[`BENCHMARKS.md`](BENCHMARKS.md), point it at the corpora:
+
+```sh
+BENCH_CORPORA="Go 1.27.3 stdlib=/usr/lib/go/src,CPython 3.14 stdlib=/usr/lib/python3.14,tokio 1.54.1 (Rust)=$HOME/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.54.1" \
+BENCH_OUT=BENCHMARKS.md cargo bench --bench report
+```
 

@@ -7,9 +7,9 @@ Tokens are estimated at ~4 bytes/token for both the full text and the reduced ou
 
 | Corpus | Files | Size | Symbols | Cold parse (1 thread) | Search: cold | Search: warm (median) | Search: after restart |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Go 1.27.3 stdlib | 8090 | 82.2 MB | 115239 | 12106 ms (668 files/s, 6.8 MB/s) | 2854.6 ms | 23.9 ms | 90.6 ms (8088 from store, 0 re-parsed) |
-| CPython 3.14 stdlib | 951 | 14.6 MB | 24586 | 1627 ms (584 files/s, 8.9 MB/s) | 366.3 ms | 6.5 ms | 15.6 ms (950 from store, 0 re-parsed) |
-| tokio 1.54.1 (Rust) | 573 | 4.5 MB | 9100 | 568 ms (1009 files/s, 8.0 MB/s) | 111.4 ms | 1.9 ms | 5.1 ms (573 from store, 0 re-parsed) |
+| Go 1.27.3 stdlib | 8090 | 82.2 MB | 115239 | 12040 ms (672 files/s, 6.8 MB/s) | 2581.7 ms | 23.5 ms | 85.9 ms (8088 from store, 0 re-parsed) |
+| CPython 3.14 stdlib | 951 | 14.6 MB | 24586 | 1613 ms (589 files/s, 9.0 MB/s) | 324.8 ms | 6.6 ms | 15.3 ms (950 from store, 0 re-parsed) |
+| tokio 1.54.1 (Rust) | 573 | 4.5 MB | 9100 | 581 ms (986 files/s, 7.8 MB/s) | 114.4 ms | 1.8 ms | 5.4 ms (573 from store, 0 re-parsed) |
 
 ## Token savings
 
@@ -25,13 +25,13 @@ Queries: `new`, `parse`, `read`, `error`, `close`, `test`. `search_text` runs th
 
 | Corpus | `find_references` (median) | Lines with a reference | Lines with a word match | Word matches dropped | `search_text` word (median) | `search_text` regex |
 |---|---:|---:|---:|---:|---:|---:|
-| Go 1.27.3 stdlib | 24.7 ms | 37665 | 74077 | 49.2% | 34.8 ms | 36.0 ms |
-| CPython 3.14 stdlib | 5.8 ms | 2727 | 7205 | 62.2% | 10.4 ms | 12.2 ms |
-| tokio 1.54.1 (Rust) | 1.8 ms | 4892 | 7978 | 38.7% | 2.2 ms | 1.7 ms |
+| Go 1.27.3 stdlib | 23.7 ms | 37665 | 74077 | 49.2% | 33.1 ms | 30.7 ms |
+| CPython 3.14 stdlib | 5.8 ms | 2727 | 7205 | 62.2% | 9.9 ms | 9.6 ms |
+| tokio 1.54.1 (Rust) | 1.7 ms | 4892 | 7978 | 38.7% | 2.5 ms | 2.7 ms |
 
 ## Startup
 
-Spawn → `initialize` response: **1.7 ms** (median of 10; no indexing at startup).
+Spawn → `initialize` response: **1.9 ms** (median of 10; no indexing at startup).
 
 ### Columns
 
