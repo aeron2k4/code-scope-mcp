@@ -58,9 +58,15 @@ It does three things, all at user scope so they apply to every project:
    `~/.claude/settings.json`) that points Claude to the code-scope tools:
    - denies whole-file `Read` of `.rs .py .js .jsx .ts .tsx .go` files; `Read`
      with `offset`/`limit` is still allowed, because `Edit` needs a prior `Read`;
-   - denies `Grep` that may cover those files inside the session's workspace
-     (use `search_text` / `find_references`). `Grep` on a non-code path, with a
-     non-code `glob`/`type` such as `*.md`, or outside the workspace is allowed.
+   - denies searches that may cover those files inside the session's
+     workspace, both the `Grep` tool and `grep`/`egrep`/`fgrep`/`ugrep`/`rg`/`git
+     grep` in Bash (use `search_text` / `find_references`). Searching a non-code
+     path, with a non-code filter such as `--include='*.md'` / `-g '*.md'`,
+     piped input (`cargo test | grep FAILED`) or outside the workspace is
+     allowed. Bash parsing is best effort: `eval`, scripts, `find -exec` and
+     `xargs` are not inspected.
+
+   The hook is [`scripts/code-scope-guard.sh`](scripts/code-scope-guard.sh).
 3. Add a short instruction block to `~/.claude/CLAUDE.md`.
 
 Restart Claude Code afterwards. Re-running the script is safe and updates the
