@@ -52,6 +52,16 @@ fn cache_dir() -> Option<PathBuf> {
 
 /// Attach the persistent store when available; a broken or unwritable cache
 /// directory only costs re-parsing, so it is never fatal.
+/// Drop stored results of deleted files on a background thread, so the
+/// server answers `initialize` without waiting for the sweep.
+fn prune_in_background(store: PersistentStore, root: PathBuf) {
+    std::thread::spawn(move || match store.prune_missing(&root) {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(removed = n, "pruned parse results of deleted files"),
+        Err(err) => tracing::warn!(%err, "failed to prune the parse store"),
+    });
+}
+
 fn with_persistence(workspace: Workspace) -> Workspace {
     let Some(dir) = cache_dir() else {
         tracing::info!("persistent cache disabled");
@@ -60,6 +70,7 @@ fn with_persistence(workspace: Workspace) -> Workspace {
     match PersistentStore::open(&dir) {
         Ok(store) => {
             tracing::info!(dir = %dir.display(), "persistent cache enabled");
+            prune_in_background(store.clone(), workspace.root().to_path_buf());
             workspace.with_store(store)
         }
         Err(err) => {

@@ -38,7 +38,8 @@ identifier tokens, and is cached at two levels:
 
 - **in memory**, reused while a file's modification time and size are unchanged;
 - **on disk**, in an LMDB (memory-mapped) store keyed by the file's git blob
-  hash, so unchanged files are not re-parsed after a restart.
+  hash, so unchanged files are not re-parsed after a restart. Entries of files
+  deleted from the workspace are dropped in the background at startup.
 
 | Variable               | Effect                                                                  |
 | ---------------------- | ----------------------------------------------------------------------- |

@@ -65,7 +65,9 @@ struct StoredFile {
     parsed: ParsedFile,
 }
 
-/// Persistent, memory-mapped store of parse results.
+/// Persistent, memory-mapped store of parse results. Clones share the same
+/// environment.
+#[derive(Clone)]
 pub struct PersistentStore {
     env: Env,
     db: Database<Bytes, Bytes>,
@@ -160,6 +162,33 @@ impl PersistentStore {
             }
             other => other,
         }
+    }
+
+    /// Delete entries for files under `root` that no longer exist, so
+    /// deleted and renamed files do not keep their results until the store
+    /// fills up. Returns the number of entries removed. Paths that are not
+    /// valid UTF-8 are left alone.
+    pub fn prune_missing(&self, root: &Path) -> Result<usize, StoreError> {
+        let mut prefix = Self::key(root).to_vec();
+        prefix.push(std::path::MAIN_SEPARATOR as u8);
+        let missing: Vec<Vec<u8>> = {
+            let rtxn = self.env.read_txn()?;
+            self.db
+                .prefix_iter(&rtxn, &prefix)?
+                .filter_map(|item| item.ok().map(|(key, _)| key))
+                .filter(|key| std::str::from_utf8(key).is_ok_and(|p| !Path::new(p).exists()))
+                .map(<[u8]>::to_vec)
+                .collect()
+        };
+        if missing.is_empty() {
+            return Ok(0);
+        }
+        let mut wtxn = self.env.write_txn()?;
+        for key in &missing {
+            self.db.delete(&mut wtxn, key)?;
+        }
+        wtxn.commit()?;
+        Ok(missing.len())
     }
 
     fn clear(&self) -> Result<(), StoreError> {
@@ -496,6 +525,41 @@ mod tests {
             .collect();
         left.sort();
         assert_eq!(left, [DB_NAME, "unrelated"]);
+    }
+
+    #[test]
+    fn prune_removes_only_missing_files_under_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PersistentStore::open(&dir.path().join("store")).unwrap();
+        let root = dir.path().join("ws");
+        let other = dir.path().join("ws-other");
+        for d in [&root, &other] {
+            fs::create_dir_all(d).unwrap();
+        }
+        let (kept, gone, outside) = (root.join("a.rs"), root.join("b.rs"), other.join("c.rs"));
+        let cache = ParseCache::default().with_store(store.clone());
+        for p in [&kept, &gone, &outside] {
+            fs::write(p, "fn f() {}\n").unwrap();
+            cache.get(p).unwrap();
+        }
+        cache.flush();
+        fs::remove_file(&gone).unwrap();
+        fs::remove_file(&outside).unwrap();
+
+        assert_eq!(store.prune_missing(&root).unwrap(), 1);
+        assert_eq!(store.prune_missing(&root).unwrap(), 0);
+        let rtxn = store.env.read_txn().unwrap();
+        let key = |p: &Path| {
+            store
+                .db
+                .get(&rtxn, PersistentStore::key(p))
+                .unwrap()
+                .is_some()
+        };
+        assert!(key(&kept));
+        assert!(!key(&gone));
+        // Outside the root, even though `ws` is a prefix of `ws-other`.
+        assert!(key(&outside));
     }
 
     #[test]
