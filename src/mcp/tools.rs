@@ -15,7 +15,7 @@ use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
 use rmcp::{ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::Deserialize;
 
-use crate::ast::parser::SymbolKind;
+use crate::ast::parser::{self, SymbolKind};
 use crate::ast::pruner::{self, PruneOptions};
 use crate::git;
 use crate::index::cache::{ParseCache, PersistentStore};
@@ -175,6 +175,86 @@ impl Workspace {
             );
         }
         Ok(out)
+    }
+
+    /// Replace the source of one symbol with `new_source`, which covers the
+    /// same lines `read_symbol` shows (from the start of the first line,
+    /// indentation included; empty deletes the symbol). `line` picks one of
+    /// several symbols sharing the name. The file is re-read rather than
+    /// taken from the cache, and the write is refused if it would introduce
+    /// syntax errors.
+    pub fn replace_symbol(
+        &self,
+        rel: &str,
+        name: &str,
+        line: Option<usize>,
+        new_source: &str,
+    ) -> Result<String> {
+        let path = self.resolve(rel)?;
+        let source = std::fs::read_to_string(&path)
+            .with_context(|| format!("cannot read {}", self.display(&path)))?;
+        let parsed = parser::parse_path(&path, &source)?;
+        let name = name.trim();
+        let matches: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.name == name || s.qualified_name() == name)
+            .filter(|s| line.is_none_or(|l| s.start_line == l))
+            .collect();
+        let sym = match matches.as_slice() {
+            [one] => *one,
+            [] => bail!(
+                "symbol {name:?}{} not found in {rel}",
+                line.map(|l| format!(" starting at line {l}"))
+                    .unwrap_or_default()
+            ),
+            many => {
+                let at: Vec<_> = many
+                    .iter()
+                    .map(|s| format!("{} (line {})", s.qualified_name(), s.start_line))
+                    .collect();
+                bail!(
+                    "{name:?} matches {} symbols: {}; pass `line` or a qualified name",
+                    many.len(),
+                    at.join(", ")
+                )
+            }
+        };
+
+        let line_start = source[..sym.start_byte].rfind('\n').map_or(0, |i| i + 1);
+        let replacement = new_source.strip_suffix('\n').unwrap_or(new_source);
+        let replacement = replacement.strip_suffix('\r').unwrap_or(replacement);
+        let updated = format!(
+            "{}{replacement}{}",
+            &source[..line_start],
+            &source[sym.end_byte..]
+        );
+        let reparsed = parser::parse_path(&path, &updated)?;
+        if reparsed.has_errors && !parsed.has_errors {
+            bail!(
+                "not written: the new source of {} has syntax errors",
+                sym.qualified_name()
+            );
+        }
+        std::fs::write(&path, &updated)
+            .with_context(|| format!("cannot write {}", self.display(&path)))?;
+        self.cache.invalidate(&path);
+
+        let new_lines = if replacement.is_empty() {
+            0
+        } else {
+            replacement.lines().count()
+        };
+        Ok(format!(
+            "replaced {} [{}] in {}: lines {}-{} are now {} lines starting at line {}\n",
+            sym.qualified_name(),
+            sym.kind.as_str(),
+            self.display(&path),
+            sym.start_line,
+            sym.end_line,
+            new_lines,
+            sym.start_line
+        ))
     }
 
     pub fn read_pruned(&self, rel: &str, max_tokens: usize, keep: Vec<String>) -> Result<String> {
@@ -351,6 +431,20 @@ pub struct ReadSymbolParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReplaceSymbolParams {
+    /// File path relative to the workspace root.
+    pub path: String,
+    /// Symbol name, plain (`new`) or qualified (`Parser::new`).
+    pub name: String,
+    /// Complete new source for the lines `read_symbol` shows, without line
+    /// numbers and with indentation. Empty deletes the symbol.
+    pub new_source: String,
+    /// Start line of the symbol, to choose among several with the same name.
+    #[serde(default)]
+    pub line: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ReadPrunedParams {
     /// File path relative to the workspace root.
     pub path: String,
@@ -474,6 +568,17 @@ impl CodeScope {
     }
 
     #[tool(
+        description = "Replace the whole source of one symbol (function, class, ...) in a file, without reading the file first. new_source covers exactly the lines read_symbol shows; empty deletes the symbol. Refused if the result has syntax errors."
+    )]
+    async fn replace_symbol(
+        &self,
+        Parameters(p): Parameters<ReplaceSymbolParams>,
+    ) -> Result<String, String> {
+        self.run(move |ws| ws.replace_symbol(&p.path, &p.name, p.line, &p.new_source))
+            .await
+    }
+
+    #[tool(
         description = "Read a file shrunk to a token budget: the full text if it fits, otherwise function bodies are elided (largest first), falling back to an outline."
     )]
     async fn read_file_pruned(
@@ -550,7 +655,8 @@ impl ServerHandler for CodeScope {
                 "AST-aware code navigation. Prefer get_file_outline and search_symbols to locate \
                  code, read_symbol to read exactly one definition, and read_file_pruned to read \
                  a whole file within a token budget. Use find_references to see where a symbol \
-                 is used and search_text instead of grep.",
+                 is used and search_text instead of grep. To rewrite a whole function or class, \
+                 use replace_symbol instead of reading and editing the file.",
             )
     }
 }
@@ -641,6 +747,76 @@ mod tests {
         assert_eq!(out, "src/lib.rs:1: pub struct Cfg;  [in Cfg]\n");
         assert!(ws.search_text("(", true, false, None, 10).is_err());
         assert!(ws.search_text("(", false, false, Some("nope"), 10).is_err());
+    }
+
+    #[test]
+    fn replace_symbol_rewrites_one_definition() {
+        let (dir, ws) = workspace();
+        let file = dir.path().join("src/lib.rs");
+        // Warm the cache so the rewrite must invalidate it.
+        ws.outline("src/lib.rs", None).unwrap();
+        let out = ws
+            .replace_symbol(
+                "src/lib.rs",
+                "Cfg::load",
+                None,
+                "    pub fn load() -> Self {\n        let c = Cfg;\n        c\n    }\n",
+            )
+            .unwrap();
+        assert_eq!(
+            out,
+            "replaced Cfg::load [method] in src/lib.rs: lines 4-6 are now 4 lines starting at line 4\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "pub struct Cfg;\n\nimpl Cfg {\n    pub fn load() -> Self {\n        let c = Cfg;\n        c\n    }\n}\n"
+        );
+        assert!(ws.outline("src/lib.rs", None).unwrap().contains("L4-7"));
+
+        let err = ws
+            .replace_symbol("src/lib.rs", "load", None, "    pub fn load( {\n")
+            .unwrap_err();
+        assert!(err.to_string().contains("syntax errors"), "{err}");
+        let err = ws
+            .replace_symbol("src/lib.rs", "load", Some(1), "")
+            .unwrap_err();
+        assert!(err.to_string().contains("starting at line 1"), "{err}");
+
+        ws.replace_symbol("src/lib.rs", "load", None, "").unwrap();
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "pub struct Cfg;\n\nimpl Cfg {\n\n}\n"
+        );
+    }
+
+    #[test]
+    fn replace_symbol_needs_a_unique_match() {
+        let (dir, ws) = workspace();
+        fs::write(
+            dir.path().join("src/two.py"),
+            "class A:\n    def f(self):\n        pass\n\nclass B:\n    def f(self):\n        pass\n",
+        )
+        .unwrap();
+        let err = ws.replace_symbol("src/two.py", "f", None, "").unwrap_err();
+        assert!(err.to_string().contains("matches 2 symbols"), "{err}");
+        ws.replace_symbol(
+            "src/two.py",
+            "f",
+            Some(6),
+            "    def g(self):\n        return 1\n",
+        )
+        .unwrap();
+        ws.replace_symbol(
+            "src/two.py",
+            "A::f",
+            None,
+            "    def h(self):\n        pass\n",
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("src/two.py")).unwrap(),
+            "class A:\n    def h(self):\n        pass\n\nclass B:\n    def g(self):\n        return 1\n"
+        );
     }
 
     #[test]

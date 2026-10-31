@@ -261,7 +261,7 @@ case "$tool" in
     ranged=$(jq -r '(.tool_input.offset != null) or (.tool_input.limit != null)' <<<"$input")
     [[ "$f" =~ $CODE_EXT ]] || exit 0
     [ "$ranged" = "true" ] && exit 0
-    deny "Whole-file Read of source code is blocked. Use code-scope MCP tools instead (load with ToolSearch \"select:mcp__code-scope__get_file_outline,mcp__code-scope__read_symbol,mcp__code-scope__search_symbols,mcp__code-scope__read_file_pruned\"): get_file_outline / read_symbol / read_file_pruned for $f. If you must Edit, Read only the needed lines with offset+limit."
+    deny "Whole-file Read of source code is blocked. Use code-scope MCP tools instead (load with ToolSearch \"select:mcp__code-scope__get_file_outline,mcp__code-scope__read_symbol,mcp__code-scope__search_symbols,mcp__code-scope__read_file_pruned\"): get_file_outline / read_symbol / read_file_pruned for $f. To rewrite a whole function or class use replace_symbol; for a smaller Edit, Read only the needed lines with offset+limit."
     ;;
   Grep)
     path=$(jq -r '.tool_input.path // empty' <<<"$input")

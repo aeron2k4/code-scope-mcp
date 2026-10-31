@@ -13,6 +13,7 @@ Supported languages: Rust, Python, JavaScript, TypeScript/TSX, Go.
 | `get_file_outline` | Symbols in a file with signatures and line ranges                                |
 | `search_symbols`   | Ranked name search across the workspace (exact > prefix > substring)             |
 | `read_symbol`      | Exact source of one definition, line-numbered                                    |
+| `replace_symbol`   | Rewrite or delete one definition without reading the file; rejects syntax errors |
 | `read_file_pruned` | File text within `max_tokens`: full → bodies elided → outline → truncated        |
 | `find_references`  | Uses of a symbol from identifier tokens (comments and strings skipped)           |
 | `search_text`      | Literal or regex search over files, honouring `.gitignore`                       |

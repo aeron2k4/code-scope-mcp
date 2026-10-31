@@ -274,6 +274,14 @@ impl ParseCache {
         self.len() == 0
     }
 
+    /// Forget the in-memory entry for `path`, e.g. after writing to it, so a
+    /// rewrite that keeps the same size and mtime is never served stale.
+    pub fn invalidate(&self, path: &Path) {
+        if let Ok(mut entries) = self.entries.write() {
+            entries.remove(path);
+        }
+    }
+
     fn tick(&self) -> u64 {
         self.clock.fetch_add(1, Ordering::Relaxed)
     }
