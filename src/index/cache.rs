@@ -16,16 +16,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
 
-use heed::types::Bytes;
+use heed::types::{Bytes, DecodeIgnore, Str};
 use heed::{Database, Env, EnvOpenOptions};
 use serde::{Deserialize, Serialize};
 
 use crate::ast::parser::{self, ParseError, ParsedFile};
 use crate::git;
 
-/// Bumped with the crate version so stale formats or grammar changes never
-/// leak into results.
-const DB_NAME: &str = concat!("parsed-v", env!("CARGO_PKG_VERSION"));
+/// Changes with the crate version so stale formats or grammar changes never
+/// leak into results. Bump the `-s` suffix whenever [`ParsedFile`]'s stored
+/// format or a symbol query changes between releases.
+const DB_NAME: &str = concat!("parsed-v", env!("CARGO_PKG_VERSION"), "-s2");
+/// Every database this store has ever created starts with this prefix.
+const DB_PREFIX: &str = "parsed-v";
 const MAP_SIZE: usize = 1 << 30;
 /// Pending writes that trigger an automatic flush.
 const FLUSH_THRESHOLD: usize = 512;
@@ -90,8 +93,31 @@ impl PersistentStore {
         };
         let mut wtxn = env.write_txn()?;
         let db = env.create_database(&mut wtxn, Some(DB_NAME))?;
+        Self::drop_stale(&env, &mut wtxn)?;
         wtxn.commit()?;
         Ok(PersistentStore { env, db })
+    }
+
+    /// Remove databases written by other versions, so they neither use up
+    /// `max_dbs` slots nor space in the map.
+    fn drop_stale(env: &Env, wtxn: &mut heed::RwTxn) -> Result<(), StoreError> {
+        let names: Database<Str, DecodeIgnore> = env
+            .open_database(wtxn, None)?
+            .ok_or(heed::Error::Mdb(heed::MdbError::NotFound))?;
+        let stale: Vec<String> = names
+            .iter(wtxn)?
+            .filter_map(|item| item.ok().map(|(name, ())| name.to_owned()))
+            .filter(|name| name.starts_with(DB_PREFIX) && name != DB_NAME)
+            .collect();
+        for name in stale {
+            if let Some(db) = env.open_database::<Bytes, Bytes>(wtxn, Some(&name))? {
+                tracing::info!(%name, "removing parse store from another version");
+                // SAFETY: the database was opened just now in this transaction
+                // and nothing in this process has modified it.
+                unsafe { db.remove(wtxn)? };
+            }
+        }
+        Ok(())
     }
 
     fn key(path: &Path) -> &[u8] {
@@ -444,6 +470,32 @@ mod tests {
         assert_eq!(file.parsed.symbols, parsed);
         second.get(&path).unwrap();
         assert_eq!(second.stats().memory_hits, 1);
+    }
+
+    #[test]
+    fn opening_removes_databases_of_other_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PersistentStore::open(dir.path()).unwrap();
+        let mut wtxn = store.env.write_txn().unwrap();
+        for name in ["parsed-v0.0.1", "parsed-v0.1.0-s1", "unrelated"] {
+            let db: Database<Bytes, Bytes> =
+                store.env.create_database(&mut wtxn, Some(name)).unwrap();
+            db.put(&mut wtxn, b"k", b"v").unwrap();
+        }
+        wtxn.commit().unwrap();
+        drop(store);
+
+        let store = PersistentStore::open(dir.path()).unwrap();
+        let rtxn = store.env.read_txn().unwrap();
+        let names: Database<Str, DecodeIgnore> =
+            store.env.open_database(&rtxn, None).unwrap().unwrap();
+        let mut left: Vec<_> = names
+            .iter(&rtxn)
+            .unwrap()
+            .map(|item| item.unwrap().0.to_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, [DB_NAME, "unrelated"]);
     }
 
     #[test]
