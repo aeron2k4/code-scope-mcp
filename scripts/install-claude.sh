@@ -80,7 +80,10 @@ cargo install --path "$REPO_DIR" --locked --force
 
 log "Registering MCP server 'code-scope' (user scope)"
 claude mcp remove --scope user code-scope >/dev/null 2>&1 || true
-claude mcp add --scope user code-scope -- "$BIN"
+# alwaysLoad keeps the tools in the model's manifest; without it Claude Code
+# defers them behind ToolSearch and the model falls back to Read/Grep.
+claude mcp add-json --scope user code-scope \
+  "$(jq -n --arg cmd "$BIN" '{type: "stdio", command: $cmd, alwaysLoad: true}')"
 
 if [ "$enforce" = 1 ]; then
   mkdir -p "$CLAUDE_DIR/hooks"

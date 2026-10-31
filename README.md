@@ -81,8 +81,9 @@ scripts/install-claude.sh
 It does three things, all at user scope so they apply to every project:
 
 1. `cargo install` the binary to `~/.cargo/bin/code-scope-mcp` and register it
-   with `claude mcp add --scope user code-scope`. With no root argument the
-   server uses the session's working directory.
+   at user scope as `code-scope` with `"alwaysLoad": true`, so its tools are in
+   the model's tool list from the start instead of deferred behind ToolSearch.
+   With no root argument the server uses the session's working directory.
 2. Add a `PreToolUse` hook (`~/.claude/hooks/code-scope-guard.sh`, wired in
    `~/.claude/settings.json`) that points Claude to the code-scope tools:
    - denies whole-file `Read` of `.rs .py .js .jsx .ts .tsx .go` files; `Read`
@@ -109,7 +110,8 @@ scripts/install-claude.sh --uninstall    # undo steps 1–3 (keeps the binary)
 To register manually instead:
 
 ```sh
-claude mcp add code-scope -- /abs/path/to/code-scope-mcp /path/to/project
+claude mcp add-json code-scope \
+  '{"type": "stdio", "command": "/abs/path/to/code-scope-mcp", "args": ["/path/to/project"], "alwaysLoad": true}'
 ```
 
 ## Development
