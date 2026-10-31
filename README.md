@@ -49,15 +49,14 @@ identifier tokens, and is cached at two levels:
 
 ## Performance
 
-On the Go 1.27.3 standard library (8,090 files, 82 MB), with a warm cache:
+On the Go 1.27.3 standard library (8,236 source files, 82 MB), with a warm cache:
 
-- `search_symbols`: 24 ms; after a restart, 86 ms from the on-disk store
-  versus 2.6 s cold.
+- `search_symbols`: 23 ms; after a restart, 86 ms from the on-disk store
+  versus 2.8 s cold.
 - `find_references`: 24 ms. It skips 49% of the lines a whole-word
   `grep -w` matches: comments, strings, docs, and files in languages it does
-  not parse (assembly, ...; C was not yet supported when this was measured),
-  which can hold real uses.
-- `search_text` over every text file: 33 ms median for a whole-word query,
+  not parse (assembly, ...), which can hold real uses.
+- `search_text` over every text file: 35 ms median for a whole-word query,
   31 ms for the regex `TODO|FIXME|XXX`.
 - Outlines use ~92% fewer tokens than full source; reading one function costs
   a median 0.9% of its file.
