@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # PreToolUse guard installed by code-scope-mcp (scripts/install-claude.sh), so
 # Claude uses the code-scope MCP tools for source code:
-# - Read: deny whole-file reads of source files. A Read with offset/limit is
-#   still allowed (needed before Edit).
+# - Read: deny whole-file reads of source files. A Read with a limit of at
+#   most $CODE_SCOPE_MAX_READ_LINES lines (default 300) is still allowed,
+#   since Edit needs a prior Read.
 # - Grep, and grep/egrep/fgrep/ugrep/rg/git grep in Bash: deny searches that may
 #   cover source files inside the session's working directory. Searches over
 #   non-code files (a non-code path, or a glob/type/include naming no source
@@ -267,10 +268,15 @@ check_bash() {
 case "$tool" in
   Read)
     f=$(jq -r '.tool_input.file_path // empty' <<<"$input")
-    ranged=$(jq -r '(.tool_input.offset != null) or (.tool_input.limit != null)' <<<"$input")
+    limit=$(jq -r '.tool_input.limit // empty' <<<"$input")
     [[ "$f" =~ $CODE_EXT ]] || exit 0
-    [ "$ranged" = "true" ] && exit 0
-    deny "Whole-file Read of source code is blocked. Use code-scope MCP tools instead (load with ToolSearch \"select:mcp__code-scope__get_file_outline,mcp__code-scope__read_symbol,mcp__code-scope__search_symbols,mcp__code-scope__read_file_pruned\"): get_file_outline / read_symbol / read_file_pruned for $f. To rewrite a whole function or class use replace_symbol; for a smaller Edit, Read only the needed lines with offset+limit."
+    max=${CODE_SCOPE_MAX_READ_LINES:-300}
+    [[ "$max" =~ ^[0-9]+$ ]] || max=300
+    # Without a limit, Read returns up to 2000 lines even from an offset.
+    if [[ "$limit" =~ ^[0-9]+$ ]] && ((limit <= max)); then
+      exit 0
+    fi
+    deny "Whole-file Read of source code (or a Read without a limit of at most $max lines) is blocked. Use code-scope MCP tools instead (load with ToolSearch \"select:mcp__code-scope__get_file_outline,mcp__code-scope__read_symbol,mcp__code-scope__search_symbols,mcp__code-scope__read_file_pruned\"): get_file_outline / read_symbol / read_file_pruned for $f. To rewrite a whole function or class use replace_symbol; for a smaller Edit, Read only the needed lines with offset and a limit of at most $max."
     ;;
   Grep)
     path=$(jq -r '.tool_input.path // empty' <<<"$input")

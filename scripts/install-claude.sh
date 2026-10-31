@@ -6,7 +6,7 @@
 #   scripts/install-claude.sh --uninstall  undo everything this script did
 #
 # Enforcement = a PreToolUse hook that denies whole-file Read of source files
-# (Read with offset/limit stays allowed, since Edit needs a prior Read) and Grep
+# (a Read limited to 300 lines stays allowed, since Edit needs a prior Read) and Grep
 # over source files in the workspace, plus a short instruction block in
 # ~/.claude/CLAUDE.md.
 set -euo pipefail
