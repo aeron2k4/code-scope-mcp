@@ -19,8 +19,16 @@ Supported languages: Rust, Python, JavaScript, TypeScript/TSX, Go.
 | `list_files`       | Files under a directory, honouring `.gitignore`                                  |
 | `git_status`       | Working-tree status                                                              |
 
-`find_references` and `search_text` annotate every hit with its enclosing
-symbol, e.g. `src/lib.rs:42:9: load();  [in Config::reload]`.
+Hits are one per line. `find_references` prints `path:line:col: text`, with
+`[definition]` on definitions when asked for; `search_text` prints
+`path:line: text`. Either adds `[in Symbol]` when the hit lies inside a symbol
+(top-level code has none):
+
+```text
+src/lib.rs:42:9: load();  [in Config::reload]
+src/lib.rs:7:12: pub fn load() -> Self {  [definition]  [in Config]
+README.md:3: Call load() once at startup.
+```
 
 Files are parsed lazily the first time they are requested, so nothing is
 indexed at startup. A parse records a file's symbols and the offsets of its
@@ -43,9 +51,11 @@ On the Go 1.27.3 standard library (8,090 files, 82 MB), with a warm cache:
 
 - `search_symbols`: 24 ms; after a restart, 86 ms from the on-disk store
   versus 2.6 s cold.
-- `find_references`: 24 ms. Half of `grep -w` matches are not references
-  (comments, strings, docs, non-source files) and are left out.
-- `search_text`: 33 ms over every text file.
+- `find_references`: 24 ms. It skips 49% of the lines a whole-word
+  `grep -w` matches: comments, strings, docs, and files in languages it does
+  not parse (C, assembly, ...), which can hold real uses.
+- `search_text` over every text file: 33 ms median for a whole-word query,
+  31 ms for the regex `TODO|FIXME|XXX`.
 - Outlines use ~92% fewer tokens than full source; reading one function costs
   a median 0.9% of its file.
 - The server answers `initialize` in ~2 ms.
@@ -111,10 +121,14 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 `cargo bench --bench report` measures this crate's own `src/`. To regenerate
-[`BENCHMARKS.md`](BENCHMARKS.md), point it at the corpora:
+[`BENCHMARKS.md`](BENCHMARKS.md), set `BENCH_CORPORA` to comma-separated
+`name=directory` pairs; the bench stops if a directory does not exist. Paths
+vary by system, for example:
 
 ```sh
-BENCH_CORPORA="Go 1.27.3 stdlib=/usr/lib/go/src,CPython 3.14 stdlib=/usr/lib/python3.14,tokio 1.54.1 (Rust)=$HOME/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.54.1" \
+BENCH_CORPORA="Go stdlib=$(go env GOROOT)/src,\
+CPython stdlib=$(python3 -c 'import sysconfig; print(sysconfig.get_path("stdlib"))'),\
+tokio (Rust)=/path/to/tokio" \
 BENCH_OUT=BENCHMARKS.md cargo bench --bench report
 ```
 
