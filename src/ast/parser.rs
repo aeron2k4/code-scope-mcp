@@ -33,16 +33,24 @@ pub enum Lang {
     TypeScript,
     Tsx,
     Go,
+    C,
+    Cpp,
+    Java,
+    CSharp,
 }
 
 impl Lang {
-    pub const ALL: [Lang; 6] = [
+    pub const ALL: [Lang; 10] = [
         Lang::Rust,
         Lang::Python,
         Lang::JavaScript,
         Lang::TypeScript,
         Lang::Tsx,
         Lang::Go,
+        Lang::C,
+        Lang::Cpp,
+        Lang::Java,
+        Lang::CSharp,
     ];
 
     pub fn from_path(path: &Path) -> Option<Lang> {
@@ -54,6 +62,13 @@ impl Lang {
             "ts" | "mts" | "cts" => Lang::TypeScript,
             "tsx" => Lang::Tsx,
             "go" => Lang::Go,
+            // `.h` is read as C; C++ headers still parse, with error recovery.
+            "c" | "h" => Lang::C,
+            "cc" | "cpp" | "cxx" | "c++" | "hh" | "hpp" | "hxx" | "h++" | "ipp" | "tpp" => {
+                Lang::Cpp
+            }
+            "java" => Lang::Java,
+            "cs" => Lang::CSharp,
             _ => return None,
         })
     }
@@ -66,6 +81,10 @@ impl Lang {
             Lang::TypeScript => "typescript",
             Lang::Tsx => "tsx",
             Lang::Go => "go",
+            Lang::C => "c",
+            Lang::Cpp => "cpp",
+            Lang::Java => "java",
+            Lang::CSharp => "csharp",
         }
     }
 
@@ -77,6 +96,10 @@ impl Lang {
             Lang::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             Lang::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
             Lang::Go => tree_sitter_go::LANGUAGE.into(),
+            Lang::C => tree_sitter_c::LANGUAGE.into(),
+            Lang::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+            Lang::Java => tree_sitter_java::LANGUAGE.into(),
+            Lang::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
         }
     }
 
@@ -87,12 +110,17 @@ impl Lang {
             Lang::JavaScript => JS_QUERY.to_string(),
             Lang::TypeScript | Lang::Tsx => format!("{TS_EXTRA_QUERY}\n{JS_QUERY}"),
             Lang::Go => GO_QUERY.to_string(),
+            Lang::C => format!("{C_FUNCTION_QUERY}\n{C_TYPE_QUERY}"),
+            Lang::Cpp => format!("{CPP_QUERY}\n{C_FUNCTION_QUERY}\n{C_TYPE_QUERY}"),
+            Lang::Java => JAVA_QUERY.to_string(),
+            Lang::CSharp => CSHARP_QUERY.to_string(),
         }
     }
 
     /// Compiled symbol query, built once per language.
     fn query(self) -> Result<&'static Query, ParseError> {
-        static QUERIES: [OnceLock<Result<Query, String>>; 6] = [const { OnceLock::new() }; 6];
+        static QUERIES: [OnceLock<Result<Query, String>>; Lang::ALL.len()] =
+            [const { OnceLock::new() }; Lang::ALL.len()];
         let slot = &QUERIES[self as usize];
         slot.get_or_init(|| {
             Query::new(&self.grammar(), &self.query_source()).map_err(|e| e.to_string())
@@ -158,6 +186,78 @@ const GO_QUERY: &str = r#"
 (type_spec name: (_) @name type: (interface_type)) @interface
 (type_spec name: (_) @name) @type
 (type_alias name: (_) @name) @type
+"#;
+
+/// C functions and prototypes, shared with C++. The name sits inside the
+/// declarator, under at most one pointer for pointer-returning functions.
+const C_FUNCTION_QUERY: &str = r#"
+(function_definition
+  declarator: (function_declarator declarator: (identifier) @name)) @function
+(function_definition
+  declarator: (pointer_declarator
+    declarator: (function_declarator declarator: (identifier) @name))) @function
+(declaration
+  declarator: (function_declarator declarator: (identifier) @name)) @function
+"#;
+
+const C_TYPE_QUERY: &str = r#"
+(struct_specifier name: (_) @name body: (_)) @struct
+(union_specifier name: (_) @name body: (_)) @struct
+(enum_specifier name: (_) @name body: (_)) @enum
+(type_definition declarator: (type_identifier) @name) @type
+(preproc_def name: (_) @name) @macro
+(preproc_function_def name: (_) @name) @macro
+"#;
+
+/// C++ additions; `Foo::bar` defined outside its class is named `bar`.
+const CPP_QUERY: &str = r#"
+(function_definition
+  declarator: (function_declarator
+    declarator: [(field_identifier) (destructor_name) (operator_name)] @name)) @function
+(function_definition
+  declarator: (function_declarator
+    declarator: (qualified_identifier name: (_) @name))) @function
+(function_definition
+  declarator: (pointer_declarator
+    declarator: (function_declarator
+      declarator: (qualified_identifier name: (_) @name)))) @function
+(function_definition
+  declarator: (reference_declarator
+    (function_declarator declarator: [(identifier) (field_identifier)] @name))) @function
+(function_definition
+  declarator: (reference_declarator
+    (function_declarator
+      declarator: (qualified_identifier name: (_) @name)))) @function
+(field_declaration
+  declarator: (function_declarator declarator: (_) @name)) @function
+(class_specifier name: (_) @name body: (_)) @class
+(namespace_definition name: (_) @name) @module
+(alias_declaration name: (_) @name) @type
+(concept_definition name: (_) @name) @type
+"#;
+
+const JAVA_QUERY: &str = r#"
+(class_declaration name: (_) @name) @class
+(record_declaration name: (_) @name) @class
+(interface_declaration name: (_) @name) @interface
+(annotation_type_declaration name: (_) @name) @interface
+(enum_declaration name: (_) @name) @enum
+(method_declaration name: (_) @name) @method
+(constructor_declaration name: (_) @name) @method
+"#;
+
+const CSHARP_QUERY: &str = r#"
+(class_declaration name: (_) @name) @class
+(record_declaration name: (_) @name) @class
+(struct_declaration name: (_) @name) @struct
+(interface_declaration name: (_) @name) @interface
+(enum_declaration name: (_) @name) @enum
+(delegate_declaration name: (_) @name) @type
+(namespace_declaration name: (_) @name) @module
+(file_scoped_namespace_declaration name: (_) @name) @module
+(method_declaration name: (_) @name) @method
+(constructor_declaration name: (_) @name) @method
+(local_function_statement name: (_) @name) @function
 "#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -543,6 +643,10 @@ mod tests {
         assert_eq!(Lang::from_path(Path::new("a/b.rs")), Some(Lang::Rust));
         assert_eq!(Lang::from_path(Path::new("x.TSX")), Some(Lang::Tsx));
         assert_eq!(Lang::from_path(Path::new("x.mjs")), Some(Lang::JavaScript));
+        assert_eq!(Lang::from_path(Path::new("x.h")), Some(Lang::C));
+        assert_eq!(Lang::from_path(Path::new("x.hpp")), Some(Lang::Cpp));
+        assert_eq!(Lang::from_path(Path::new("X.java")), Some(Lang::Java));
+        assert_eq!(Lang::from_path(Path::new("X.cs")), Some(Lang::CSharp));
         assert_eq!(Lang::from_path(Path::new("Makefile")), None);
     }
 
@@ -651,6 +755,100 @@ macro_rules! m { () => {} }
     }
 
     #[test]
+    fn c_symbols() {
+        let src = "#define MAX 10\n#define SQ(x) ((x) * (x))\nstruct point { int x; };\nenum color { RED };\ntypedef unsigned long ulong;\nint add(int a, int b);\nint add(int a, int b) { return a + b; }\nchar *name(void) { return 0; }\n";
+        let parsed = parse_source(Lang::C, src).unwrap();
+        assert_eq!(
+            names(&parsed),
+            vec![
+                ("MAX".into(), SymbolKind::Macro),
+                ("SQ".into(), SymbolKind::Macro),
+                ("point".into(), SymbolKind::Struct),
+                ("color".into(), SymbolKind::Enum),
+                ("ulong".into(), SymbolKind::Type),
+                ("add".into(), SymbolKind::Function),
+                ("add".into(), SymbolKind::Function),
+                ("name".into(), SymbolKind::Function),
+            ]
+        );
+        let add = &parsed.symbols[6];
+        assert_eq!(add.signature, "int add(int a, int b)");
+        assert!(add.body.is_some());
+    }
+
+    #[test]
+    fn cpp_symbols() {
+        let src = "namespace ns {\nclass Widget {\n public:\n  Widget();\n  ~Widget() {}\n  int size() const { return 0; }\n};\nWidget::Widget() {}\nint &Widget::ref() { return n; }\nusing Id = int;\n}\n";
+        let parsed = parse_source(Lang::Cpp, src).unwrap();
+        let got: Vec<_> = parsed
+            .symbols
+            .iter()
+            .map(|s| (s.qualified_name(), s.kind))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("ns".into(), SymbolKind::Module),
+                ("ns::Widget".into(), SymbolKind::Class),
+                ("ns::Widget::Widget".into(), SymbolKind::Method),
+                ("ns::Widget::~Widget".into(), SymbolKind::Method),
+                ("ns::Widget::size".into(), SymbolKind::Method),
+                ("ns::Widget".into(), SymbolKind::Function),
+                ("ns::ref".into(), SymbolKind::Function),
+                ("ns::Id".into(), SymbolKind::Type),
+            ]
+        );
+    }
+
+    #[test]
+    fn java_symbols() {
+        let src = "package p;\npublic class Shop {\n  public Shop() {}\n  void buy(int n) {}\n  interface Item { int price(); }\n  enum Size { S, M }\n  record Pair(int a, int b) {}\n}\n";
+        let parsed = parse_source(Lang::Java, src).unwrap();
+        let got: Vec<_> = parsed
+            .symbols
+            .iter()
+            .map(|s| (s.qualified_name(), s.kind))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("Shop".into(), SymbolKind::Class),
+                ("Shop::Shop".into(), SymbolKind::Method),
+                ("Shop::buy".into(), SymbolKind::Method),
+                ("Shop::Item".into(), SymbolKind::Interface),
+                ("Shop::Item::price".into(), SymbolKind::Method),
+                ("Shop::Size".into(), SymbolKind::Enum),
+                ("Shop::Pair".into(), SymbolKind::Class),
+            ]
+        );
+    }
+
+    #[test]
+    fn csharp_symbols() {
+        let src = "namespace App {\n  public struct Point { }\n  interface IShape { double Area(); }\n  public class Circle : IShape {\n    public Circle() { }\n    public double Area() { return 0; }\n  }\n  enum Kind { A }\n  delegate void Handler();\n}\n";
+        let parsed = parse_source(Lang::CSharp, src).unwrap();
+        let got: Vec<_> = parsed
+            .symbols
+            .iter()
+            .map(|s| (s.qualified_name(), s.kind))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("App".into(), SymbolKind::Module),
+                ("App::Point".into(), SymbolKind::Struct),
+                ("App::IShape".into(), SymbolKind::Interface),
+                ("App::IShape::Area".into(), SymbolKind::Method),
+                ("App::Circle".into(), SymbolKind::Class),
+                ("App::Circle::Circle".into(), SymbolKind::Method),
+                ("App::Circle::Area".into(), SymbolKind::Method),
+                ("App::Kind".into(), SymbolKind::Enum),
+                ("App::Handler".into(), SymbolKind::Type),
+            ]
+        );
+    }
+
+    #[test]
     fn broken_source_degrades_gracefully() {
         let src = "fn ok() {}\nfn broken( {\nstruct After;\n";
         let parsed = parse_source(Lang::Rust, src).unwrap();
@@ -679,6 +877,18 @@ macro_rules! m { () => {} }
                 "good",
             ),
             (Lang::Go, "package p\nfunc good() {}\nfunc (\n", "good"),
+            (
+                Lang::C,
+                "int good(void) { return 0; }\nint bad( {\n",
+                "good",
+            ),
+            (Lang::Cpp, "void good() {}\nclass X { void half(\n", "good"),
+            (Lang::Java, "class Good { void m() {} }\nclass {\n", "Good"),
+            (
+                Lang::CSharp,
+                "class Good { void M() {} }\nclass {\n",
+                "Good",
+            ),
         ];
         for (lang, src, expected) in cases {
             let parsed = parse_source(lang, src).unwrap_or_else(|e| panic!("{}: {e}", lang.name()));
@@ -724,6 +934,26 @@ macro_rules! m { () => {} }
             (
                 Lang::Go,
                 "package p\n// load\nfunc load() {}\nfunc m() { load(); s := \"load\" }\n",
+                vec![3, 4],
+            ),
+            (
+                Lang::C,
+                "/* load */\nint load(void);\nint main() { load(); char *s = \"load\"; }\n",
+                vec![2, 3],
+            ),
+            (
+                Lang::Cpp,
+                "// load\nstruct A { void load(); };\nvoid A::load() {}\nvoid f(A a) { a.load(); }\n",
+                vec![2, 3, 4],
+            ),
+            (
+                Lang::Java,
+                "class A {\n  // load\n  void load() {}\n  void f() { load(); String s = \"load\"; }\n}\n",
+                vec![3, 4],
+            ),
+            (
+                Lang::CSharp,
+                "class A {\n  // load\n  void load() {}\n  void F() { load(); var s = \"load\"; }\n}\n",
                 vec![3, 4],
             ),
         ];

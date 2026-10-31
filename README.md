@@ -4,7 +4,8 @@ A small, fast MCP server in Rust for AST-aware code navigation. It uses
 tree-sitter to find symbols and trims file contents to fit a token budget, so
 AI coding agents can explore large codebases without reading whole files.
 
-Supported languages: Rust, Python, JavaScript, TypeScript/TSX, Go.
+Supported languages: Rust, Python, JavaScript, TypeScript/TSX, Go, C, C++, Java,
+C#. `.h` headers are parsed as C.
 
 ## Tools
 
@@ -54,7 +55,8 @@ On the Go 1.27.3 standard library (8,090 files, 82 MB), with a warm cache:
   versus 2.6 s cold.
 - `find_references`: 24 ms. It skips 49% of the lines a whole-word
   `grep -w` matches: comments, strings, docs, and files in languages it does
-  not parse (C, assembly, ...), which can hold real uses.
+  not parse (assembly, ...; C was not yet supported when this was measured),
+  which can hold real uses.
 - `search_text` over every text file: 33 ms median for a whole-word query,
   31 ms for the regex `TODO|FIXME|XXX`.
 - Outlines use ~92% fewer tokens than full source; reading one function costs
@@ -87,7 +89,7 @@ It does three things, all at user scope so they apply to every project:
    With no root argument the server uses the session's working directory.
 2. Add a `PreToolUse` hook (`~/.claude/hooks/code-scope-guard.sh`, wired in
    `~/.claude/settings.json`) that points Claude to the code-scope tools:
-   - denies whole-file `Read` of `.rs .py .js .jsx .ts .tsx .go` files; `Read`
+   - denies whole-file `Read` of source files in the supported languages; `Read`
      with `offset`/`limit` is still allowed, because `Edit` needs a prior `Read`;
    - denies searches that may cover those files inside the session's
      workspace, both the `Grep` tool and `grep`/`egrep`/`fgrep`/`ugrep`/`rg`/`git

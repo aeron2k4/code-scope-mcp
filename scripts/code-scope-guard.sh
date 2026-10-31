@@ -14,10 +14,11 @@ tool=$(jq -r '.tool_name // empty' <<<"$input")
 cwd=$(jq -r '.cwd // empty' <<<"$input")
 [ -n "$cwd" ] || cwd=$PWD
 
-CODE_EXT='\.(rs|py|js|jsx|ts|tsx|go)$'
+EXTS='rs|py|pyi|js|jsx|mjs|cjs|ts|mts|cts|tsx|go|c|h|cc|cpp|cxx|hh|hpp|hxx|java|cs'
+CODE_EXT="\\.($EXTS)\$"
 # A glob or extension list naming a source extension: *.rs, *.{ts,tsx}, rs,py
-CODE_GLOB='(^|[.,{])(rs|py|js|jsx|ts|tsx|go)([,}]|$)'
-CODE_TYPES='^(rust|py|python|js|jsx|ts|tsx|typescript|go)$'
+CODE_GLOB="(^|[.,{])($EXTS)([,}]|\$)"
+CODE_TYPES='^(rust|py|python|js|jsx|ts|tsx|typescript|go|c|cpp|java|cs|csharp)$'
 
 GREP_HINT='Use code-scope MCP tools instead (load with ToolSearch "select:mcp__code-scope__search_text,mcp__code-scope__find_references"): search_text for a literal or regex (.gitignore-aware, shows the enclosing symbol; takes dir), find_references for uses of a symbol. Searching non-code files stays allowed: pass a non-code path, or a filter such as --include="*.md" / -g "*.md" / type md.'
 
