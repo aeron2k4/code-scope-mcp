@@ -179,19 +179,6 @@ check_search() {
     operands+=("$a")
   done
 
-  # Filters decide on their own: any source filter denies, otherwise allow.
-  local f has_filter=0
-  for f in "${filters[@]}"; do
-    [[ "$f" == '!'* ]] && continue # exclusion glob
-    has_filter=1
-    [[ "$f" =~ $CODE_GLOB || "$f" =~ $CODE_EXT ]] && return 0
-  done
-  for f in "${types[@]}"; do
-    has_filter=1
-    [[ "$f" =~ $CODE_TYPES || "$f" =~ $CODE_GLOB ]] && return 0
-  done
-  ((has_filter)) && return 1
-
   local -a paths
   if ((pattern_given)); then
     paths=("${operands[@]}")
@@ -205,6 +192,27 @@ check_search() {
       grep) { ((piped)) || ((!recursive)); } && return 1; paths=(.) ;;
     esac
   fi
+
+  # Searches entirely outside the workspace are never blocked.
+  local f inside=0
+  for f in "${paths[@]}"; do
+    inside_workspace "$(absolute "$f" "$dir")" && inside=1
+  done
+  ((inside)) || return 1
+
+  # Filters decide on their own: any source filter denies, otherwise allow.
+  local has_filter=0
+  for f in "${filters[@]}"; do
+    [[ "$f" == '!'* ]] && continue # exclusion glob
+    has_filter=1
+    [[ "$f" =~ $CODE_GLOB || "$f" =~ $CODE_EXT ]] && return 0
+  done
+  for f in "${types[@]}"; do
+    has_filter=1
+    [[ "$f" =~ $CODE_TYPES || "$f" =~ $CODE_GLOB ]] && return 0
+  done
+  ((has_filter)) && return 1
+
   for f in "${paths[@]}"; do
     path_has_code "$f" "$dir" && return 0
   done
