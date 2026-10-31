@@ -5,7 +5,7 @@ use std::path::Path;
 use serde::Serialize;
 
 use super::cache::ParseCache;
-use super::{enclosing_symbol, files_under, line_excerpt, par_flat_map};
+use super::{DEFAULT_MAX_FILES, Found, enclosing_symbol, files_under, line_excerpt, par_flat_map};
 use crate::ast::parser::{self, Lang, SymbolKind};
 
 #[derive(Debug, Clone, Serialize)]
@@ -32,7 +32,7 @@ impl Default for RefOptions {
     fn default() -> Self {
         RefOptions {
             include_definitions: false,
-            max_files: 20_000,
+            max_files: DEFAULT_MAX_FILES,
         }
     }
 }
@@ -91,19 +91,23 @@ pub fn find_references(
     cache: &ParseCache,
     name: &str,
     opts: &RefOptions,
-) -> Vec<RefHit> {
+) -> Found<RefHit> {
     let mut segments = name.trim().rsplit(['.', ':']).filter(|s| !s.is_empty());
     let name = segments.next().unwrap_or_default();
     let owner = segments.next();
     if name.is_empty() {
-        return Vec::new();
+        return Found {
+            hits: Vec::new(),
+            truncated: false,
+        };
     }
-    let files: Vec<_> = files_under(root, dir, opts.max_files)
+    let (files, truncated) = files_under(root, dir, opts.max_files);
+    let files: Vec<_> = files
         .into_iter()
         .filter(|p| Lang::from_path(p).is_some())
         .collect();
 
-    par_flat_map(&files, |rel| {
+    let hits = par_flat_map(&files, |rel| {
         let abs = root.join(rel);
         let file = match cache.get(&abs) {
             Ok(f) => f,
@@ -168,7 +172,8 @@ pub fn find_references(
                 })
             })
             .collect()
-    })
+    });
+    Found { hits, truncated }
 }
 
 #[cfg(test)]

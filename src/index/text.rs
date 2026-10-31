@@ -6,7 +6,7 @@ use regex::Regex;
 use serde::Serialize;
 
 use super::cache::ParseCache;
-use super::{enclosing_symbol, files_under, line_excerpt, par_flat_map};
+use super::{DEFAULT_MAX_FILES, Found, enclosing_symbol, files_under, line_excerpt, par_flat_map};
 use crate::ast::parser::Lang;
 
 /// Files larger than this are skipped (same bound as the parse cache).
@@ -32,7 +32,9 @@ pub struct TextOptions {
 
 impl Default for TextOptions {
     fn default() -> Self {
-        TextOptions { max_files: 20_000 }
+        TextOptions {
+            max_files: DEFAULT_MAX_FILES,
+        }
     }
 }
 
@@ -44,9 +46,9 @@ pub fn search_text(
     cache: &ParseCache,
     re: &Regex,
     opts: &TextOptions,
-) -> Vec<TextHit> {
-    let files = files_under(root, dir, opts.max_files);
-    par_flat_map(&files, |rel| {
+) -> Found<TextHit> {
+    let (files, truncated) = files_under(root, dir, opts.max_files);
+    let hits = par_flat_map(&files, |rel| {
         let abs = root.join(rel);
         let Some(source) = read_text(&abs) else {
             return Vec::new();
@@ -82,7 +84,8 @@ pub fn search_text(
                     .map(|s| s.qualified_name()),
             })
             .collect()
-    })
+    });
+    Found { hits, truncated }
 }
 
 fn read_text(path: &Path) -> Option<String> {

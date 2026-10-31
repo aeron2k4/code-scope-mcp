@@ -4,6 +4,7 @@ pub mod cache;
 pub mod refs;
 pub mod text;
 
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -14,6 +15,24 @@ use cache::ParseCache;
 
 /// Longest line excerpt returned by reference and text search.
 const MAX_EXCERPT_CHARS: usize = 200;
+/// Default upper bound on files walked, to keep huge repositories responsive.
+pub const DEFAULT_MAX_FILES: usize = 20_000;
+
+/// Hits of a workspace-wide search. `truncated` is set when the walk stopped
+/// at `max_files`, so files past the limit were not searched.
+#[derive(Debug, Clone)]
+pub struct Found<T> {
+    pub hits: Vec<T>,
+    pub truncated: bool,
+}
+
+impl<T> Deref for Found<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        &self.hits
+    }
+}
 
 /// Apply `f` to every file on all cores; results keep the order of `files`.
 fn par_flat_map<T, F>(files: &[PathBuf], f: F) -> Vec<T>
@@ -60,13 +79,15 @@ fn line_excerpt(source: &str, byte: usize) -> String {
     }
 }
 
-/// Files under `dir` (inside `root`), as paths relative to `root`.
-fn files_under(root: &Path, dir: &Path, max_files: usize) -> Vec<PathBuf> {
+/// Up to `max_files` files under `dir` (inside `root`), as paths relative to
+/// `root`, and whether more files were left out.
+fn files_under(root: &Path, dir: &Path, max_files: usize) -> (Vec<PathBuf>, bool) {
     let prefix = dir.strip_prefix(root).unwrap_or(Path::new(""));
-    git::list_files(dir, max_files)
-        .into_iter()
-        .map(|p| prefix.join(p))
-        .collect()
+    let mut files = git::list_files(dir, max_files.saturating_add(1));
+    let truncated = files.len() > max_files;
+    files.truncate(max_files);
+    let files = files.into_iter().map(|p| prefix.join(p)).collect();
+    (files, truncated)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -95,7 +116,7 @@ impl Default for SearchOptions {
         SearchOptions {
             kind: None,
             limit: 50,
-            max_files: 20_000,
+            max_files: DEFAULT_MAX_FILES,
         }
     }
 }
@@ -126,13 +147,17 @@ pub fn search_symbols(
     cache: &ParseCache,
     query: &str,
     opts: &SearchOptions,
-) -> Vec<SymbolHit> {
+) -> Found<SymbolHit> {
     let query = query.trim();
     if query.is_empty() {
-        return Vec::new();
+        return Found {
+            hits: Vec::new(),
+            truncated: false,
+        };
     }
     let query_lower = query.to_lowercase();
-    let files: Vec<PathBuf> = git::list_files(root, opts.max_files)
+    let (files, truncated) = files_under(root, root, opts.max_files);
+    let files: Vec<PathBuf> = files
         .into_iter()
         .filter(|p| Lang::from_path(p).is_some())
         .collect();
@@ -174,7 +199,7 @@ pub fn search_symbols(
             .then(a.start_line.cmp(&b.start_line))
     });
     hits.truncate(opts.limit);
-    hits
+    Found { hits, truncated }
 }
 
 #[cfg(test)]

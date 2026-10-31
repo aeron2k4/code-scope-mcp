@@ -7,7 +7,8 @@
 //!
 //! Parse results persist in `$CODE_SCOPE_CACHE_DIR`, defaulting to
 //! `$XDG_CACHE_HOME/code-scope-mcp` or `~/.cache/code-scope-mcp`. Set
-//! `CODE_SCOPE_NO_CACHE=1` to keep the cache in memory only.
+//! `CODE_SCOPE_NO_CACHE=1` to keep the cache in memory only, and
+//! `CODE_SCOPE_MAX_FILES` to change how many files a search walks (20000).
 
 use std::path::PathBuf;
 
@@ -83,7 +84,13 @@ fn with_persistence(workspace: Workspace) -> Workspace {
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
-    let workspace = with_persistence(Workspace::new(workspace_root()?)?);
+    let mut workspace = with_persistence(Workspace::new(workspace_root()?)?);
+    if let Some(max) = std::env::var("CODE_SCOPE_MAX_FILES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+    {
+        workspace = workspace.with_max_files(max);
+    }
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         root = %workspace.root().display(),

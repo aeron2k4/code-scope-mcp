@@ -46,6 +46,7 @@ identifier tokens, and is cached at two levels:
 | `CODE_SCOPE_ROOT`      | Workspace root when no argument is given                                |
 | `CODE_SCOPE_CACHE_DIR` | Store location (default `$XDG_CACHE_HOME/code-scope-mcp` or `~/.cache/code-scope-mcp`) |
 | `CODE_SCOPE_NO_CACHE`  | Set to `1` to keep the cache in memory only                             |
+| `CODE_SCOPE_MAX_FILES` | Files walked per workspace-wide search (default 20000); output notes when the limit is hit |
 | `CODE_SCOPE_LOG`       | Log filter, e.g. `debug` (stderr only)                                  |
 
 ## Performance

@@ -34,6 +34,7 @@ const MAX_SYMBOL_MATCHES: usize = 5;
 pub struct Workspace {
     root: PathBuf,
     cache: ParseCache,
+    max_files: usize,
 }
 
 impl Workspace {
@@ -45,7 +46,27 @@ impl Workspace {
         Ok(Workspace {
             root,
             cache: ParseCache::default(),
+            max_files: index::DEFAULT_MAX_FILES,
         })
+    }
+
+    /// Walk at most `max_files` files per workspace-wide search.
+    pub fn with_max_files(mut self, max_files: usize) -> Self {
+        self.max_files = max_files.max(1);
+        self
+    }
+
+    /// Note for output when a search stopped at the file limit.
+    fn truncation_note(&self, truncated: bool) -> String {
+        if truncated {
+            format!(
+                "… searched only the first {} files; narrow with `dir` or raise \
+                 CODE_SCOPE_MAX_FILES\n",
+                self.max_files
+            )
+        } else {
+            String::new()
+        }
     }
 
     /// Persist parse results across restarts in `store`.
@@ -103,14 +124,15 @@ impl Workspace {
         let opts = SearchOptions {
             kind,
             limit,
-            ..Default::default()
+            max_files: self.max_files,
         };
         let hits = index::search_symbols(&self.root, &self.cache, query, &opts);
+        let note = self.truncation_note(hits.truncated);
         if hits.is_empty() {
-            return format!("no symbols matching {query:?}");
+            return format!("no symbols matching {query:?}\n{note}");
         }
         let mut out = String::new();
-        for h in &hits {
+        for h in hits.iter() {
             let _ = writeln!(
                 out,
                 "{}:{}-{} [{}] {} — {}",
@@ -122,6 +144,7 @@ impl Workspace {
                 h.signature
             );
         }
+        out.push_str(&note);
         out
     }
 
@@ -301,11 +324,12 @@ impl Workspace {
         let base = self.resolve_dir(dir)?;
         let opts = RefOptions {
             include_definitions,
-            ..Default::default()
+            max_files: self.max_files,
         };
         let hits = refs::find_references(&self.root, &base, &self.cache, name, &opts);
+        let note = self.truncation_note(hits.truncated);
         if hits.is_empty() {
-            return Ok(format!("no references to {name:?}\n"));
+            return Ok(format!("no references to {name:?}\n{note}"));
         }
         let mut out = String::new();
         for h in hits.iter().take(limit) {
@@ -321,6 +345,7 @@ impl Workspace {
         if hits.len() > limit {
             let _ = writeln!(out, "… {} more references", hits.len() - limit);
         }
+        out.push_str(&note);
         Ok(out)
     }
 
@@ -347,9 +372,13 @@ impl Workspace {
             .size_limit(MAX_REGEX_BYTES)
             .build()
             .with_context(|| format!("invalid pattern {pattern:?}"))?;
-        let hits = text::search_text(&self.root, &base, &self.cache, &re, &TextOptions::default());
+        let opts = TextOptions {
+            max_files: self.max_files,
+        };
+        let hits = text::search_text(&self.root, &base, &self.cache, &re, &opts);
+        let note = self.truncation_note(hits.truncated);
         if hits.is_empty() {
-            return Ok(format!("no matches for {pattern:?}\n"));
+            return Ok(format!("no matches for {pattern:?}\n{note}"));
         }
         let mut out = String::new();
         for h in hits.iter().take(limit) {
@@ -362,6 +391,7 @@ impl Workspace {
         if hits.len() > limit {
             let _ = writeln!(out, "… {} more matching lines", hits.len() - limit);
         }
+        out.push_str(&note);
         Ok(out)
     }
 
@@ -817,6 +847,32 @@ mod tests {
         assert_eq!(
             fs::read_to_string(dir.path().join("src/two.py")).unwrap(),
             "class A:\n    def h(self):\n        pass\n\nclass B:\n    def g(self):\n        return 1\n"
+        );
+    }
+
+    #[test]
+    fn searches_report_the_file_limit() {
+        let (dir, ws) = workspace();
+        fs::write(
+            dir.path().join("src/main.rs"),
+            "fn main() { Cfg::load(); }\n",
+        )
+        .unwrap();
+        let note =
+            "… searched only the first 1 files; narrow with `dir` or raise CODE_SCOPE_MAX_FILES\n";
+        assert!(!ws.search("load", None, 10).contains("searched only"));
+
+        let ws = ws.with_max_files(1);
+        assert!(ws.search("load", None, 10).ends_with(note));
+        let refs = ws.find_references("load", None, false, 10).unwrap();
+        assert!(
+            refs.starts_with("no references") && refs.ends_with(note),
+            "{refs}"
+        );
+        assert!(
+            ws.search_text("Cfg", false, false, None, 10)
+                .unwrap()
+                .ends_with(note)
         );
     }
 
