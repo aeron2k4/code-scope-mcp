@@ -7,17 +7,17 @@ Tokens are estimated at ~4 bytes/token for both the full text and the reduced ou
 
 | Corpus | Files | Size | Symbols | Cold parse (1 thread) | Search: cold | Search: warm (median) | Search: after restart |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Go 1.27.3 stdlib | 8236 | 82.4 MB | 116015 | 11663 ms (706 files/s, 7.1 MB/s) | 2837.9 ms | 23.1 ms | 85.5 ms (8234 from store, 0 re-parsed) |
-| CPython 3.14 stdlib | 1011 | 15.7 MB | 25994 | 1999 ms (505 files/s, 7.8 MB/s) | 612.1 ms | 6.3 ms | 17.0 ms (1010 from store, 0 re-parsed) |
-| tokio 1.54.1 (Rust) | 573 | 4.5 MB | 9100 | 553 ms (1036 files/s, 8.2 MB/s) | 102.3 ms | 1.7 ms | 4.6 ms (573 from store, 0 re-parsed) |
+| Go 1.27.3 stdlib | 8236 | 82.4 MB | 116026 | 12561 ms (656 files/s, 6.6 MB/s) | 2924.4 ms | 24.0 ms | 73.1 ms (8234 from store, 0 re-parsed) |
+| CPython 3.14 stdlib | 1017 | 15.8 MB | 27908 | 2471 ms (411 files/s, 6.4 MB/s) | 890.4 ms | 6.8 ms | 13.8 ms (1016 from store, 0 re-parsed) |
+| tokio 1.54.1 (Rust) | 573 | 4.5 MB | 9100 | 599 ms (957 files/s, 7.6 MB/s) | 134.6 ms | 1.7 ms | 4.0 ms (573 from store, 0 re-parsed) |
 
 ## Token savings
 
 | Corpus | Outline vs full source | Files > 2000 tokens | Pruned to budget vs full | Median `read_symbol` / whole file |
 |---|---:|---:|---:|---:|
-| Go 1.27.3 stdlib | 91.7% fewer (21596325 → 1799394 tokens) | 2184 | 85.4% fewer | 0.9% |
-| CPython 3.14 stdlib | 90.4% fewer (4113119 → 395735 tokens) | 479 | 84.1% fewer | 0.8% |
-| tokio 1.54.1 (Rust) | 88.0% fewer (1187255 → 142851 tokens) | 173 | 76.8% fewer | 2.0% |
+| Go 1.27.3 stdlib | 91.7% fewer (21596325 → 1799196 tokens) | 2184 | 83.3% fewer | 0.9% |
+| CPython 3.14 stdlib | 90.1% fewer (4129275 → 409065 tokens) | 481 | 83.4% fewer | 0.8% |
+| tokio 1.54.1 (Rust) | 88.0% fewer (1187255 → 142851 tokens) | 173 | 76.2% fewer | 2.0% |
 
 ## References & text search
 
@@ -25,13 +25,13 @@ Queries: `new`, `parse`, `read`, `error`, `close`, `test`. `search_text` runs th
 
 | Corpus | `find_references` (median) | Lines with a reference | Lines with a word match | Word matches dropped | `search_text` word (median) | `search_text` regex |
 |---|---:|---:|---:|---:|---:|---:|
-| Go 1.27.3 stdlib | 23.6 ms | 37895 | 74077 | 48.8% | 34.5 ms | 31.2 ms |
-| CPython 3.14 stdlib | 6.2 ms | 2824 | 7205 | 60.8% | 9.4 ms | 8.9 ms |
-| tokio 1.54.1 (Rust) | 1.5 ms | 4892 | 7978 | 38.7% | 2.4 ms | 1.7 ms |
+| Go 1.27.3 stdlib | 24.7 ms | 37895 | 74077 | 48.8% | 48.2 ms | 43.6 ms |
+| CPython 3.14 stdlib | 6.4 ms | 2769 | 7226 | 61.7% | 13.1 ms | 12.6 ms |
+| tokio 1.54.1 (Rust) | 1.6 ms | 4892 | 7978 | 38.7% | 3.4 ms | 2.0 ms |
 
 ## Startup
 
-Spawn → `initialize` response: **1.7 ms** (median of 10; no indexing at startup).
+Spawn → `initialize` response: **2.0 ms** (median of 10; no indexing at startup).
 
 ### Columns
 
