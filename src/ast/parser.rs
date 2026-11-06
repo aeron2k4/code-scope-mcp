@@ -76,6 +76,19 @@ impl Lang {
         })
     }
 
+    /// Position in [`Self::ALL`], for compact storage.
+    pub fn index(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|l| *l == self)
+            .expect("every language is in ALL")
+    }
+
+    /// The language at `index` in [`Self::ALL`].
+    pub fn from_index(index: usize) -> Option<Self> {
+        Self::ALL.get(index).copied()
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Lang::Rust => "rust",
@@ -278,6 +291,37 @@ pub enum SymbolKind {
     Constant,
     Type,
     Macro,
+}
+
+impl SymbolKind {
+    /// Every kind, in the order the store writes them.
+    pub const ALL: [Self; 12] = [
+        Self::Function,
+        Self::Method,
+        Self::Class,
+        Self::Struct,
+        Self::Enum,
+        Self::Interface,
+        Self::Trait,
+        Self::Impl,
+        Self::Module,
+        Self::Constant,
+        Self::Type,
+        Self::Macro,
+    ];
+
+    /// Position in [`Self::ALL`], for compact storage.
+    pub fn index(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|k| *k == self)
+            .expect("every kind is in ALL")
+    }
+
+    /// The kind at `index` in [`Self::ALL`].
+    pub fn from_index(index: usize) -> Option<Self> {
+        Self::ALL.get(index).copied()
+    }
 }
 
 impl SymbolKind {

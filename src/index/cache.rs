@@ -18,15 +18,16 @@ use std::time::SystemTime;
 
 use heed::types::{Bytes, DecodeIgnore, Str};
 use heed::{Database, Env, EnvOpenOptions};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
-use crate::ast::parser::{self, ParseError, ParsedFile};
+use crate::ast::parser::{self, Lang, ParseError, ParsedFile};
 use crate::git;
+use crate::index::store_format;
 
 /// Changes with the crate version so stale formats or grammar changes never
 /// leak into results. Bump the `-s` suffix whenever [`ParsedFile`]'s stored
 /// format or a symbol query changes between releases.
-const DB_NAME: &str = concat!("parsed-v", env!("CARGO_PKG_VERSION"), "-s7");
+const DB_NAME: &str = concat!("parsed-v", env!("CARGO_PKG_VERSION"), "-s8");
 /// Every database this store has ever created starts with this prefix.
 const DB_PREFIX: &str = "parsed-v";
 const MAP_SIZE: usize = 1 << 30;
@@ -61,10 +62,68 @@ pub enum StoreError {
     Lmdb(#[from] heed::Error),
 }
 
-#[derive(Serialize, Deserialize)]
-struct StoredFile {
+/// What the store keeps per file: the blob hash that validates it, a header
+/// for the flags JSON would otherwise have to hold, and the compact parse.
+#[derive(Debug, PartialEq, Eq)]
+struct Stored {
     blob: String,
-    parsed: ParsedFile,
+    lang: Lang,
+    has_errors: bool,
+    incomplete: bool,
+    parsed: Vec<u8>,
+}
+
+/// The bytes of the header that come before the blob hash: the language and
+/// a byte of flags.
+const HEADER_BYTES: usize = 2;
+
+impl Stored {
+    /// The header, then the length and bytes of the blob hash, then the bytes
+    /// of [`store_format`].
+    fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(2 * HEADER_BYTES + 40 + self.parsed.len());
+        out.push(self.lang.index() as u8);
+        out.push(u8::from(self.has_errors) | u8::from(self.incomplete) << 1);
+        out.push(u8::try_from(self.blob.len()).expect("a blob hash is 40 bytes"));
+        out.extend_from_slice(self.blob.as_bytes());
+        out.extend_from_slice(&self.parsed);
+        out
+    }
+
+    /// Anything that cannot be read back leaves empty fields, which the
+    /// caller then treats as a miss.
+    fn decode(bytes: &[u8]) -> Self {
+        let mut stored = Stored {
+            blob: String::new(),
+            lang: Lang::C,
+            has_errors: true,
+            incomplete: true,
+            parsed: Vec::new(),
+        };
+        let Some((&lang, rest)) = bytes.split_first() else {
+            return stored;
+        };
+        let Some((&flags, rest)) = rest.split_first() else {
+            return stored;
+        };
+        let Some((&hash_len, rest)) = rest.split_first() else {
+            return stored;
+        };
+        let hash_len = hash_len as usize;
+        if rest.len() < hash_len {
+            return stored;
+        }
+        let (hash, parsed) = rest.split_at(hash_len);
+        let Ok(hash) = std::str::from_utf8(hash) else {
+            return stored;
+        };
+        stored.blob = hash.to_string();
+        stored.lang = Lang::from_index(lang as usize).unwrap_or(Lang::C);
+        stored.has_errors = flags & 1 != 0;
+        stored.incomplete = flags & 2 != 0;
+        stored.parsed = parsed.to_vec();
+        stored
+    }
 }
 
 /// Persistent, memory-mapped store of parse results. Clones share the same
@@ -131,15 +190,25 @@ impl PersistentStore {
     /// Stored parse for `path` if its blob hash still matches. Any storage
     /// or decoding problem is treated as a miss.
     fn load(&self, path: &Path, blob: &str) -> Option<ParsedFile> {
-        let read = || -> Result<Option<StoredFile>, StoreError> {
+        let read = || -> Result<Option<Stored>, StoreError> {
             let rtxn = self.env.read_txn()?;
-            Ok(self
-                .db
-                .get(&rtxn, Self::key(path))?
-                .and_then(|raw| serde_json::from_slice(raw).ok()))
+            Ok(self.db.get(&rtxn, Self::key(path))?.map(Stored::decode))
         };
         match read() {
-            Ok(Some(stored)) if stored.blob == blob => Some(stored.parsed),
+            Ok(Some(stored)) if stored.blob == blob => {
+                match store_format::decode(
+                    &stored.parsed,
+                    stored.lang,
+                    stored.has_errors,
+                    stored.incomplete,
+                ) {
+                    Ok(parsed) => Some(parsed),
+                    Err(err) => {
+                        tracing::debug!(%err, path = %path.display(), "ignoring stored parse");
+                        None
+                    }
+                }
+            }
             Ok(_) => None,
             Err(err) => {
                 tracing::warn!(%err, "parse store read failed");
@@ -204,18 +273,14 @@ impl PersistentStore {
     fn write_batch(&self, items: &[(PathBuf, String, Arc<CachedFile>)]) -> Result<(), StoreError> {
         let mut wtxn = self.env.write_txn()?;
         for (path, blob, file) in items {
-            #[derive(Serialize)]
-            struct StoredRef<'a> {
-                blob: &'a str,
-                parsed: &'a ParsedFile,
-            }
-            let Ok(raw) = serde_json::to_vec(&StoredRef {
-                blob,
-                parsed: &file.parsed,
-            }) else {
-                continue;
+            let stored = Stored {
+                blob: blob.clone(),
+                lang: file.parsed.lang,
+                has_errors: file.parsed.has_errors,
+                incomplete: file.parsed.incomplete,
+                parsed: store_format::encode(&file.parsed),
             };
-            self.db.put(&mut wtxn, Self::key(path), &raw)?;
+            self.db.put(&mut wtxn, Self::key(path), &stored.encode())?;
         }
         wtxn.commit()?;
         Ok(())
@@ -557,6 +622,35 @@ mod tests {
         assert_eq!(cache.used_bytes(), weight * 2);
         cache.invalidate(&paths[3]);
         assert_eq!((cache.len(), cache.used_bytes()), (1, weight));
+    }
+
+    #[test]
+    fn a_stored_file_round_trips_through_its_header() {
+        let parsed = parser::parse_source(parser::Lang::Rust, "struct S;\nfn f() {}\n").unwrap();
+        let blob = "ce013625030ba8dba906f756967f9e9ca394464a".to_string();
+        for (lang, has_errors, incomplete) in [
+            (parser::Lang::Rust, false, false),
+            (parser::Lang::Tsx, true, false),
+            (parser::Lang::CSharp, false, true),
+            (parser::Lang::Cpp, true, true),
+        ] {
+            let stored = Stored {
+                blob: blob.clone(),
+                lang,
+                has_errors,
+                incomplete,
+                parsed: store_format::encode(&parsed),
+            };
+            assert_eq!(Stored::decode(&stored.encode()), stored);
+        }
+
+        // Too short for a header, and a hash length longer than the record:
+        // both are a miss, never a partial file.
+        for damaged in [&[0x01][..], &[0x01, 0x02], &[0x01, 0x00, 0xff, 0x00]] {
+            let miss = Stored::decode(damaged);
+            assert!(miss.blob.is_empty() && miss.parsed.is_empty());
+            assert!(miss.has_errors && miss.incomplete);
+        }
     }
 
     #[test]

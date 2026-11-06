@@ -3,6 +3,7 @@
 pub mod cache;
 pub mod changes;
 pub mod refs;
+pub mod store_format;
 pub mod text;
 
 use std::cmp::Ordering;
