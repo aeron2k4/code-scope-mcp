@@ -52,6 +52,11 @@ impl<T> Deref for Found<T> {
 }
 
 /// Apply `f` to every file on all cores; results keep the order of `files`.
+///
+/// A whole tree on one core would waste the others, but small pieces would
+/// spend more time spawning threads than working, so the work is split in
+/// chunks of at least [`MIN_FILES_PER_WORKER`] files, and one thread per core
+/// otherwise.
 fn par_flat_map<T, F>(files: &[PathBuf], f: F) -> Vec<T>
 where
     T: Send,
@@ -60,16 +65,17 @@ where
     par_groups(files, f).into_iter().flatten().collect()
 }
 
+/// Files a worker must get before another worker is worth spawning.
+const MIN_FILES_PER_WORKER: usize = 32;
+
 /// Like [`par_flat_map`], but keeping each file's results apart.
 fn par_groups<T, F>(files: &[PathBuf], f: F) -> Vec<Vec<T>>
 where
     T: Send,
     F: Fn(&Path) -> Vec<T> + Sync,
 {
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .min(files.len().max(1));
+    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let workers = cores.min(files.len().div_ceil(MIN_FILES_PER_WORKER)).max(1);
     let chunk = files.len().div_ceil(workers).max(1);
     std::thread::scope(|s| {
         let handles: Vec<_> = files
@@ -362,6 +368,16 @@ mod tests {
             ..Default::default()
         };
         assert!(search_symbols(root, &cache, "search", &opts).is_empty());
+    }
+
+    #[test]
+    fn parallel_work_keeps_the_order_of_the_files() {
+        let many: Vec<PathBuf> = (0..MIN_FILES_PER_WORKER * 2)
+            .map(|i| PathBuf::from(format!("{i}.rs")))
+            .collect();
+        let ordered = par_flat_map(&many, |p| vec![p.display().to_string()]);
+        let expected: Vec<String> = many.iter().map(|p| p.display().to_string()).collect();
+        assert_eq!(ordered, expected);
     }
 
     #[test]
