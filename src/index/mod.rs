@@ -5,9 +5,11 @@ pub mod changes;
 pub mod refs;
 pub mod text;
 
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering as SeqOrdering};
 
 use serde::Serialize;
 
@@ -55,6 +57,15 @@ where
     T: Send,
     F: Fn(&Path) -> Vec<T> + Sync,
 {
+    par_groups(files, f).into_iter().flatten().collect()
+}
+
+/// Like [`par_flat_map`], but keeping each file's results apart.
+fn par_groups<T, F>(files: &[PathBuf], f: F) -> Vec<Vec<T>>
+where
+    T: Send,
+    F: Fn(&Path) -> Vec<T> + Sync,
+{
     let workers = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
@@ -65,7 +76,7 @@ where
             .chunks(chunk)
             .map(|chunk| {
                 let f = &f;
-                s.spawn(move || chunk.iter().flat_map(|p| f(p)).collect::<Vec<T>>())
+                s.spawn(move || chunk.iter().map(|p| f(p)).collect::<Vec<_>>())
             })
             .collect();
         handles
@@ -121,6 +132,26 @@ pub struct SymbolHit {
     #[serde(skip)]
     score: u8,
 }
+
+impl Ord for SymbolHit {
+    fn cmp(&self, other: &Self) -> Ordering {
+        rank(self, other)
+    }
+}
+
+impl PartialOrd for SymbolHit {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for SymbolHit {
+    fn eq(&self, other: &Self) -> bool {
+        rank(self, other) == Ordering::Equal
+    }
+}
+
+impl Eq for SymbolHit {}
 
 #[derive(Debug, Clone)]
 pub struct SearchOptions {
@@ -183,7 +214,7 @@ pub fn search_symbols(
         .collect();
 
     let incomplete = AtomicUsize::new(0);
-    let mut hits: Vec<SymbolHit> = par_flat_map(&files, |rel| {
+    let per_file: Vec<Vec<SymbolHit>> = par_groups(&files, |rel| {
         let file = match cache.get(&root.join(rel)) {
             Ok(f) => f,
             Err(err) => {
@@ -192,7 +223,7 @@ pub fn search_symbols(
             }
         };
         if file.parsed.incomplete {
-            incomplete.fetch_add(1, Ordering::Relaxed);
+            incomplete.fetch_add(1, SeqOrdering::Relaxed);
         }
         let mut local = Vec::new();
         for sym in &file.parsed.symbols {
@@ -216,18 +247,37 @@ pub fn search_symbols(
         local
     });
 
-    hits.sort_by(|a, b| {
-        a.score
-            .cmp(&b.score)
-            .then_with(|| a.path.cmp(&b.path))
-            .then(a.start_line.cmp(&b.start_line))
-    });
-    hits.truncate(opts.limit);
+    // Keep only the best `limit` hits, so that a common name in a large
+    // repository never holds every match in memory: `best` keeps the worst
+    // kept hit on top, and a better hit replaces it. Each file's hits are
+    // already in rank order, so the comparison happens at most once per hit.
+    let keep = opts.limit.min(per_file.iter().map(Vec::len).sum::<usize>());
+    let mut best: BinaryHeap<SymbolHit> = BinaryHeap::with_capacity(keep + 1);
+    for hits in per_file.into_iter().flatten() {
+        if best.len() < keep {
+            best.push(hits);
+        } else if let Some(worst) = best.peek()
+            && rank(&hits, worst) == Ordering::Less
+        {
+            best.pop();
+            best.push(hits);
+        }
+    }
+    let mut hits: Vec<SymbolHit> = best.into();
+    hits.sort_by(rank);
     Found {
         hits,
         truncated,
         incomplete: incomplete.into_inner(),
     }
+}
+
+/// The order `search_symbols` returns hits in.
+fn rank(a: &SymbolHit, b: &SymbolHit) -> Ordering {
+    a.score
+        .cmp(&b.score)
+        .then_with(|| a.path.cmp(&b.path))
+        .then(a.start_line.cmp(&b.start_line))
 }
 
 #[cfg(test)]
@@ -275,6 +325,43 @@ mod tests {
         let hits = search_symbols(dir.path(), &cache, "PARSE", &opts);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].name, "parse_all");
+    }
+
+    #[test]
+    fn the_limit_keeps_the_best_hits_not_the_first_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Files sort before `z.rs`, but only `z.rs` holds the exact name.
+        for (name, code) in [
+            ("a.rs", "fn search_all() {}\n"),
+            ("b.py", "def unsearch():\n    pass\n"),
+            ("z.rs", "fn search() {}\n"),
+        ] {
+            fs::write(root.join(name), code).unwrap();
+        }
+        let cache = ParseCache::default();
+        let opts = SearchOptions {
+            limit: 1,
+            ..Default::default()
+        };
+        let hits = search_symbols(root, &cache, "search", &opts);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, "search");
+        assert_eq!(hits[0].path, "z.rs");
+
+        let opts = SearchOptions {
+            limit: 2,
+            ..Default::default()
+        };
+        let hits = search_symbols(root, &cache, "search", &opts);
+        let names: Vec<_> = hits.iter().map(|h| h.name.as_str()).collect();
+        assert_eq!(names, ["search", "search_all"]);
+
+        let opts = SearchOptions {
+            limit: 0,
+            ..Default::default()
+        };
+        assert!(search_symbols(root, &cache, "search", &opts).is_empty());
     }
 
     #[test]
