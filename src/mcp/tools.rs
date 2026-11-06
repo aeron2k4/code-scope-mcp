@@ -528,11 +528,11 @@ impl Workspace {
     }
 
     pub fn list_files(&self, dir: Option<&str>, limit: usize) -> Result<String> {
-        let sub = self.resolve_dir(dir)?;
-        let files = git::list_files(&self.root.join(&sub), limit);
+        let base = self.root.join(self.resolve_dir(dir)?);
+        let files = git::list_files(&base, limit);
         let mut out = String::new();
         for f in &files {
-            let _ = writeln!(out, "{}", self.display(&self.root.join(&sub).join(f)));
+            let _ = writeln!(out, "{}", self.display(&base.join(f)));
         }
         if files.len() == limit {
             let _ = writeln!(out, "… limit of {limit} files reached");
@@ -1174,6 +1174,28 @@ mod tests {
         }
         // Every path went through the cache that holds them.
         assert_eq!(ws.cache.stats().parses, 2);
+    }
+
+    #[test]
+    fn a_subdirectory_search_reports_paths_relative_to_the_root() {
+        let (dir, ws) = workspace();
+        fs::create_dir_all(dir.path().join("src/deep")).unwrap();
+        fs::write(
+            dir.path().join("src/deep/a.rs"),
+            "fn run() {\n    load;\n}\n",
+        )
+        .unwrap();
+        // Nested, and written both ways a client may spell it.
+        for sub in ["src/deep", "src/deep/", "./src/deep"] {
+            let text = ws.search_text("load", false, false, Some(sub), 10).unwrap();
+            assert_eq!(text, "src/deep/a.rs:2: load;  [in run]\n", "dir = {sub}");
+            let refs = ws.find_references("load", Some(sub), false, 10).unwrap();
+            assert_eq!(refs, "src/deep/a.rs:2:5: load;  [in run]\n", "dir = {sub}");
+            let listed = ws.list_files(Some(sub), 10).unwrap();
+            assert_eq!(listed, "src/deep/a.rs\n", "dir = {sub}");
+        }
+        // Parsed once: neither search re-reads or re-parses it.
+        assert_eq!(ws.cache.stats().parses, 1);
     }
 
     #[test]

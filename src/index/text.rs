@@ -9,7 +9,8 @@ use serde::Serialize;
 
 use super::cache::ParseCache;
 use super::{
-    DEFAULT_MAX_FILES, enclosing_symbol, files_under, line_excerpt, par_flat_map, slash_path,
+    DEFAULT_MAX_FILES, enclosing_symbol, file_path, files_under, line_excerpt, par_flat_map,
+    slash_path,
 };
 use crate::ast::parser::Lang;
 
@@ -75,7 +76,7 @@ pub fn search_text(
     let not_utf8 = AtomicUsize::new(0);
     let oversized = AtomicUsize::new(0);
     let mut found = par_flat_map(&files, |rel| {
-        let source = match read_text(&root.join(rel)) {
+        let source = match read_text(&file_path(root, rel)) {
             Ok(source) => source,
             Err(skipped) => {
                 match skipped {
@@ -121,7 +122,7 @@ pub fn search_text(
         .into_iter()
         .filter_map(|(path, line, byte)| {
             if current.as_ref() != Some(&path) {
-                let abs = root.join(&*path);
+                let abs = file_path(root, Path::new(&*path));
                 source = read_text(&abs).ok();
                 parsed = Lang::from_path(&abs).and_then(|_| cache.get(&abs).ok());
                 current = Some(Arc::clone(&path));

@@ -127,6 +127,16 @@ fn files_under(root: &Path, dir: &Path, max_files: usize) -> (Vec<PathBuf>, bool
     (files, truncated)
 }
 
+/// The on-disk path of a file that [`files_under`] reported.
+///
+/// The parse cache is keyed by absolute paths, so every lookup under a
+/// sub-directory has to go through the root. Looking one up by its relative
+/// path instead re-reads and re-parses it, and every search under a
+/// directory would pay for that.
+fn file_path(root: &Path, rel: &Path) -> PathBuf {
+    root.join(rel)
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SymbolHit {
     pub path: String,
@@ -222,7 +232,7 @@ pub fn search_symbols(
 
     let incomplete = AtomicUsize::new(0);
     let per_file: Vec<Vec<SymbolHit>> = par_groups(&files, |rel| {
-        let file = match cache.get(&root.join(rel)) {
+        let file = match cache.get(&file_path(root, rel)) {
             Ok(f) => f,
             Err(err) => {
                 tracing::debug!(%err, "skipping file in search");
