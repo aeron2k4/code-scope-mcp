@@ -410,7 +410,10 @@ impl Workspace {
         Ok(out)
     }
 
-    /// Resolve an optional sub-directory, defaulting to the root.
+    /// Resolve an optional sub-directory, defaulting to the root. It comes
+    /// back relative to the root, as the file walkers expect: an absolute path
+    /// makes their results absolute too, and the cache, which is keyed by
+    /// `root.join(rel)`, then misses every file.
     fn resolve_dir(&self, dir: Option<&str>) -> Result<PathBuf> {
         let base = match dir {
             Some(d) if !d.trim().is_empty() => self.resolve(d)?,
@@ -419,7 +422,10 @@ impl Workspace {
         if !base.is_dir() {
             bail!("not a directory: {}", self.display(&base));
         }
-        Ok(base)
+        Ok(base
+            .strip_prefix(&self.root)
+            .map(Path::to_path_buf)
+            .unwrap_or_default())
     }
 
     pub fn find_references(
@@ -429,7 +435,7 @@ impl Workspace {
         include_definitions: bool,
         limit: usize,
     ) -> Result<String> {
-        let base = self.resolve_dir(dir)?;
+        let base = self.root.join(self.resolve_dir(dir)?);
         let opts = RefOptions {
             include_definitions,
             max_files: self.max_files,
@@ -470,7 +476,7 @@ impl Workspace {
         if pattern.is_empty() {
             bail!("pattern must not be empty");
         }
-        let base = self.resolve_dir(dir)?;
+        let base = self.root.join(self.resolve_dir(dir)?);
         let source = if regex {
             pattern.to_string()
         } else {
@@ -522,11 +528,11 @@ impl Workspace {
     }
 
     pub fn list_files(&self, dir: Option<&str>, limit: usize) -> Result<String> {
-        let base = self.resolve_dir(dir)?;
-        let files = git::list_files(&base, limit);
+        let sub = self.resolve_dir(dir)?;
+        let files = git::list_files(&self.root.join(&sub), limit);
         let mut out = String::new();
         for f in &files {
-            let _ = writeln!(out, "{}", self.display(&base.join(f)));
+            let _ = writeln!(out, "{}", self.display(&self.root.join(&sub).join(f)));
         }
         if files.len() == limit {
             let _ = writeln!(out, "… limit of {limit} files reached");
@@ -1149,6 +1155,25 @@ mod tests {
             ws.search_text("hit", false, false, None, 0).unwrap(),
             "… 5 more matching lines\n"
         );
+    }
+
+    #[test]
+    fn searches_under_a_subdirectory_keep_cache_hits() {
+        let (dir, ws) = workspace();
+        fs::write(dir.path().join("src/a.rs"), "fn run() {\n    load\n}\n").unwrap();
+        for sub in [None, Some("src"), Some("src/")] {
+            let out = ws.search_text("load", false, false, sub, 10).unwrap();
+            assert_eq!(
+                out.lines().find(|l| l.starts_with("src/a.rs")),
+                Some("src/a.rs:2: load  [in run]"),
+                "dir = {sub:?}"
+            );
+            let out = ws.find_references("load", sub, false, 10).unwrap();
+            assert_eq!(out, "src/a.rs:2:5: load  [in run]\n", "dir = {sub:?}");
+            assert!(ws.list_files(sub, 10).unwrap().starts_with("src/a.rs\n"));
+        }
+        // Every path went through the cache that holds them.
+        assert_eq!(ws.cache.stats().parses, 2);
     }
 
     #[test]
