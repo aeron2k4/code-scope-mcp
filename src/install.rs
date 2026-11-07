@@ -33,6 +33,7 @@ When exploring or reading source code, prefer the astlens MCP tools over Read/Gr
 - `get_file_outline` before opening a file; `search_symbols` to find a definition.
 - `read_symbol` to read one function/class instead of the whole file.
 - `replace_symbol` to rewrite or delete a whole function/class, `insert_symbol` to add one; no Read needed.
+- `replace_lines` for a repair that is not a whole definition (a stray brace, two lines): pass the lines as they are now, and it refuses if they changed. Do not edit code with a python/perl/sed script.
 - `read_file_pruned` when a whole file is needed but may be large.
 - `find_references` to see where a symbol is used; `search_text` instead of Grep.
 - `changed_symbols` to see which symbols a diff touches before reading it.
@@ -46,6 +47,7 @@ When exploring or reading source code, prefer the astlens MCP tools over read/gr
 - `astlens_get_file_outline` before opening a file; `astlens_search_symbols` to find a definition.
 - `astlens_read_symbol` to read one function/class instead of the whole file.
 - `astlens_replace_symbol` to rewrite or delete a whole function/class, `astlens_insert_symbol` to add one; no read needed.
+- `astlens_replace_lines` for a repair that is not a whole definition (a stray brace, two lines): pass the lines as they are now, and it refuses if they changed. Do not edit code with a python/perl/sed script.
 - `astlens_read_file_pruned` when a whole file is needed but may be large.
 - `astlens_find_references` to see where a symbol is used; `astlens_search_text` instead of grep.
 - `astlens_changed_symbols` to see which symbols a diff touches before reading it.
