@@ -108,6 +108,7 @@ async fn mcp_session_over_jsonrpc() {
             "list_files",
             "read_file_pruned",
             "read_symbol",
+            "replace_lines",
             "replace_symbol",
             "search_symbols",
             "search_text"

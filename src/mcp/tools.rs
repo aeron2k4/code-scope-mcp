@@ -273,6 +273,77 @@ impl Workspace {
         ))
     }
 
+    /// Replace or delete the lines `start..=end` (1-based, as they are on
+    /// disk) and leave everything else alone. `expect` holds those lines as
+    /// they are now, without line numbers: the write is refused unless they
+    /// still match, so a stale line number cannot cut the wrong code. An
+    /// empty `new_source` deletes the lines. The file is re-read rather than
+    /// taken from the cache, and the write is refused if it would introduce
+    /// syntax errors.
+    pub fn replace_lines(
+        &self,
+        rel: &str,
+        start: usize,
+        end: usize,
+        expect: &str,
+        new_source: &str,
+    ) -> Result<String> {
+        let path = self.resolve(rel)?;
+        let (source, parsed) = self.read_fresh(&path)?;
+        let starts = line_starts(&source);
+        if start == 0 || end < start {
+            bail!("{start}-{end} is not a range of lines; they start at 1");
+        }
+        if end > starts.len() {
+            bail!(
+                "{} has {} lines; asked for {start}-{end}",
+                self.display(&path),
+                starts.len()
+            );
+        }
+        let after = starts.get(end).copied().unwrap_or(source.len());
+        let offset = starts[start - 1];
+        let current = &source[offset..after];
+        if !current
+            .lines()
+            .map(str::trim_end)
+            .eq(expect.lines().map(str::trim_end))
+        {
+            bail!(
+                "not written: {} lines {start}-{end} are not what `expect` says; they are:\n{}",
+                self.display(&path),
+                excerpt(current, start)
+            );
+        }
+
+        let eol = line_ending(&source);
+        let mut replacement = with_line_ending(new_source.trim_end_matches(['\r', '\n']), eol);
+        // A break is needed before the next line, and kept at the end of a
+        // file that already ended with one.
+        if !replacement.is_empty() && (after < source.len() || source.ends_with('\n')) {
+            replacement.push_str(eol);
+        }
+        let updated = format!("{}{replacement}{}", &source[..offset], &source[after..]);
+        self.write_checked(&path, &parsed, &updated, || {
+            format!("the new lines {start}-{end}")
+        })?;
+
+        let kept = starts.len() - (end - start + 1);
+        if replacement.is_empty() {
+            Ok(format!(
+                "{}: deleted lines {start}-{end}; {kept} lines left\n",
+                self.display(&path)
+            ))
+        } else {
+            let added = replacement.trim_end_matches(['\r', '\n']).lines().count();
+            let counted = if added == 1 { "line" } else { "lines" };
+            Ok(format!(
+                "{}: lines {start}-{end} are now {added} {counted}\n",
+                self.display(&path)
+            ))
+        }
+    }
+
     /// Insert `new_source` as a new definition after or before an existing
     /// symbol, separated by a blank line, or at the end of the file when no
     /// anchor is given. Inserting before a symbol keeps its doc comments,
@@ -664,6 +735,34 @@ fn line_ending(source: &str) -> &'static str {
     }
 }
 
+/// Byte offset where each 1-based line starts. An empty file has none.
+fn line_starts(source: &str) -> Vec<usize> {
+    if source.is_empty() {
+        return Vec::new();
+    }
+    let mut starts = vec![0];
+    for (i, byte) in source.bytes().enumerate() {
+        if byte == b'\n' && i + 1 < source.len() {
+            starts.push(i + 1);
+        }
+    }
+    starts
+}
+
+/// Numbered lines of a refused write, so the caller can copy the range it
+/// meant into the next call.
+fn excerpt(text: &str, first_line: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = String::new();
+    for (i, line) in lines.iter().take(10).enumerate() {
+        let _ = writeln!(out, "{}\t{line}", first_line + i);
+    }
+    if lines.len() > 10 {
+        let _ = writeln!(out, "… {} more lines", lines.len() - 10);
+    }
+    out
+}
+
 fn with_line_ending(text: &str, eol: &str) -> String {
     let text = text.replace("\r\n", "\n");
     if eol == "\n" {
@@ -747,6 +846,23 @@ pub struct ReplaceSymbolParams {
     /// Start line of the symbol, to choose among several with the same name.
     #[serde(default)]
     pub line: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReplaceLinesParams {
+    /// File path relative to the workspace root.
+    pub path: String,
+    /// First line to replace, 1-based.
+    pub start: usize,
+    /// Last line to replace, 1-based and inclusive.
+    pub end: usize,
+    /// Those lines exactly as they are now, without line numbers. The write
+    /// is refused if they differ, so a stale line number cannot cut the
+    /// wrong code.
+    pub expect: String,
+    /// Replacement for those lines, without line numbers and with
+    /// indentation. Empty deletes them.
+    pub new_source: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -912,6 +1028,17 @@ impl AstLens {
     }
 
     #[tool(
+        description = "Replace or delete a range of lines in a file without reading it first. `expect` holds those lines as they are now, without line numbers; the write is refused if they no longer match or would introduce syntax errors. Empty new_source deletes the lines."
+    )]
+    async fn replace_lines(
+        &self,
+        Parameters(p): Parameters<ReplaceLinesParams>,
+    ) -> Result<String, String> {
+        self.run(move |ws| ws.replace_lines(&p.path, p.start, p.end, &p.expect, &p.new_source))
+            .await
+    }
+
+    #[tool(
         description = "Insert a new function, class, method, ... into a file without reading it first: after or before a named symbol (a blank line apart), or at the end of the file when neither is given. Indent new_source for its place, e.g. inside a class. Refused if the result has syntax errors."
     )]
     async fn insert_symbol(
@@ -1025,7 +1152,9 @@ impl ServerHandler for AstLens {
                  a whole file within a token budget. Use find_references to see where a symbol \
                  is used and search_text instead of grep. To rewrite a whole function or class, \
                  use replace_symbol, and insert_symbol to add one, instead of reading and \
-                 editing the file. changed_symbols summarises a git diff by symbol.",
+                 editing the file. For a few lines that are not a whole definition, use \
+                 replace_lines with the lines as they are now. changed_symbols summarises a \
+                 git diff by symbol.",
             )
     }
 }
@@ -1252,6 +1381,117 @@ mod tests {
             fs::read_to_string(&file).unwrap(),
             "pub struct Cfg;\n\nimpl Cfg {\n}\n"
         );
+    }
+
+    #[test]
+    fn replace_lines_deletes_a_stray_brace() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("C0143p.java");
+        // The shape a decompiler leaves behind: one closing brace too many
+        // before `} catch`, which breaks the whole file below it.
+        fs::write(
+            &file,
+            "class C {\n    void m() {\n        try {\n            run();\n        }\n        }\n        } catch (Exception e) {\n    }\n}\n",
+        )
+        .unwrap();
+        let ws = Workspace::new(dir.path()).unwrap();
+
+        let out = ws
+            .replace_lines("C0143p.java", 6, 6, "        }", "")
+            .unwrap();
+        assert_eq!(out, "C0143p.java: deleted lines 6-6; 8 lines left\n");
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "class C {\n    void m() {\n        try {\n            run();\n        }\n        } catch (Exception e) {\n    }\n}\n"
+        );
+    }
+
+    #[test]
+    fn replace_lines_swaps_a_range_and_keeps_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.py");
+        fs::write(&file, "def a():\n    pass\n\n\ndef b():\n    pass\n").unwrap();
+        let ws = Workspace::new(dir.path()).unwrap();
+
+        let out = ws
+            .replace_lines("a.py", 2, 3, "    pass\n\n", "    return 1\n")
+            .unwrap();
+        assert_eq!(out, "a.py: lines 2-3 are now 1 line\n");
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "def a():\n    return 1\n\ndef b():\n    pass\n"
+        );
+    }
+
+    #[test]
+    fn replace_lines_refuses_a_stale_expect() {
+        let (dir, ws) = workspace();
+        let file = dir.path().join("src/lib.rs");
+        let before = fs::read_to_string(&file).unwrap();
+
+        let err = ws
+            .replace_lines("src/lib.rs", 2, 2, "    Cfg", "")
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("lines 2-2 are not what `expect` says"),
+            "{msg}"
+        );
+        // The real lines come back, numbered, so the next call can use them.
+        assert!(msg.contains("\n2\t"), "{msg}");
+        assert_eq!(fs::read_to_string(&file).unwrap(), before);
+    }
+
+    #[test]
+    fn replace_lines_refuses_new_syntax_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.rs");
+        fs::write(&file, "fn a() {}\nfn b() {}\n").unwrap();
+        let ws = Workspace::new(dir.path()).unwrap();
+
+        let err = ws
+            .replace_lines("a.rs", 1, 1, "fn a() {}", "fn a( {")
+            .unwrap_err();
+        assert!(err.to_string().contains("syntax errors"), "{err}");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "fn a() {}\nfn b() {}\n");
+    }
+
+    #[test]
+    fn replace_lines_keeps_crlf_and_rejects_bad_ranges() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.py");
+        fs::write(&file, "a = 1\r\nb = 2\r\nc = 3\r\n").unwrap();
+        let ws = Workspace::new(dir.path()).unwrap();
+
+        ws.replace_lines("a.py", 2, 2, "b = 2", "b = 20").unwrap();
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "a = 1\r\nb = 20\r\nc = 3\r\n"
+        );
+
+        let err = ws.replace_lines("a.py", 0, 1, "a = 1", "").unwrap_err();
+        assert!(err.to_string().contains("start at 1"), "{err}");
+        let err = ws.replace_lines("a.py", 3, 9, "c = 3", "").unwrap_err();
+        assert!(err.to_string().contains("has 3 lines"), "{err}");
+    }
+
+    #[test]
+    fn replace_lines_invalidates_the_cache() {
+        let (dir, ws) = workspace();
+        // Warm the cache so the rewrite has to drop it.
+        let warm = ws.cache.get(&dir.path().join("src/lib.rs")).unwrap();
+        assert!(warm.source.contains("pub fn load"));
+
+        ws.replace_lines(
+            "src/lib.rs",
+            4,
+            4,
+            "    pub fn load() -> Self {",
+            "    pub fn load() -> Cfg {",
+        )
+        .unwrap();
+        let after = ws.cache.get(&dir.path().join("src/lib.rs")).unwrap();
+        assert!(after.source.contains("-> Cfg {"), "{}", after.source);
     }
 
     #[test]
