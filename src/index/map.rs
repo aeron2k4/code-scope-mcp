@@ -47,6 +47,12 @@ const COMMON_DEFINERS: usize = 5;
 const UNREFERENCED: f64 = 0.01;
 /// Score of test code's symbols, relative to the others'.
 const TEST_WEIGHT: f64 = 0.1;
+/// Score of a private symbol, a Go lower-case name, a Python `_name` or a
+/// Rust item without `pub`, relative to the others': the map shows what
+/// the rest of the code can use, and a helper only its own package sees
+/// comes after it. Not C and C++, whose private header definitions are
+/// what including files use.
+const PRIVATE_WEIGHT: f64 = 0.4;
 /// How fast repeated mentions of a name in one file stop counting more: the
 /// BM25 `k1`.
 const TERM_SATURATION: f64 = 1.2;
@@ -1364,7 +1370,8 @@ impl Graph {
     }
 
     /// Every symbol but `impl` blocks, scored by the rank its file receives
-    /// through its name, split among the file's symbols of that name. The
+    /// through its name, split among the file's symbols of that name, and
+    /// less for a private one (see [`PRIVATE_WEIGHT`]). The
     /// symbols of `focus` files count in full even when nothing uses them;
     /// those of test code count a tenth.
     fn score_symbols(
@@ -1390,6 +1397,7 @@ impl Graph {
                 } else {
                     UNREFERENCED
                 };
+                let narrow_private = !matches!(self.units[f].lang, Some(Lang::C | Lang::Cpp));
                 let mut same_name = vec![0u32; defs.len()];
                 for s in 0..n.len() {
                     if let Some(at) = ident_of(s) {
@@ -1403,9 +1411,14 @@ impl Graph {
                     if kind == SymbolKind::Impl {
                         continue;
                     }
+                    let narrow = if narrow_private && n.reach(s) == Reach::Private {
+                        PRIVATE_WEIGHT
+                    } else {
+                        1.0
+                    };
                     let referenced = ident_of(s).map_or(0.0, |at| {
                         flows[slots[at] as usize] / f64::from(same_name[at])
-                    });
+                    }) * narrow;
                     let nested = if n.parent(s).is_some() { 0.5 } else { 1.0 };
                     let test = if tests.is_test(n, f, s) {
                         TEST_WEIGHT
@@ -1927,6 +1940,40 @@ mod tests {
             .max_by(|&a, &b| ranks[a].total_cmp(&ranks[b]))
             .unwrap();
         assert_eq!(slash_path(&files[best]), "pkg/core.py");
+    }
+
+    #[test]
+    fn a_private_symbol_scores_below_a_public_one_used_as_much() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = [
+            ("p/a.go", "package p\n\nfunc Open() {}\nfunc open() {}\n"),
+            ("p/b.go", "package p\n\nfunc use() { Open(); open() }\n"),
+        ];
+        for (path, text) in files {
+            let path = dir.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let cache = ParseCache::default();
+        let (paths, _) = files_under(dir.path(), dir.path(), 100);
+        let names: Vec<_> = paths
+            .iter()
+            .map(|p| cache.symbol_names(&dir.path().join(p)).unwrap())
+            .collect();
+        let tests = TestCode::none(names.len());
+        let slashed: Vec<String> = paths.iter().map(|p| slash_path(p)).collect();
+        let graph = Graph::build(&names, &slashed, &tests, &[]);
+        let ranks = graph.rank(&personalization(names.len(), &BTreeSet::new()));
+        let candidates = graph.score_symbols(&names, &ranks, &tests, &BTreeSet::new());
+        let a = slashed.iter().position(|p| p == "p/a.go").unwrap() as u32;
+        let score = |s: u32| {
+            candidates
+                .iter()
+                .find(|c| c.file == a && c.symbol == s)
+                .unwrap()
+                .score
+        };
+        assert!(score(1) < score(0) * 0.5, "{} {}", score(1), score(0));
     }
 
     fn graph_of(dir: &Path, files: &[(&str, &str)]) -> (Graph, Vec<f64>) {
