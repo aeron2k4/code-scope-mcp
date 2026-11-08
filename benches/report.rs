@@ -18,6 +18,7 @@ use astlens::ast::parser::Lang;
 use astlens::ast::pruner::{self, PruneOptions, estimate_tokens};
 use astlens::git;
 use astlens::index::cache::{ParseCache, PersistentStore};
+use astlens::index::map::{self, MapOptions};
 use astlens::index::refs::{self, RefOptions};
 use astlens::index::text::{self, TextOptions};
 use astlens::index::{self, SearchOptions};
@@ -32,6 +33,8 @@ const QUERIES: [&str; 6] = ["new", "parse", "read", "error", "close", "test"];
 const TEXT_REGEX: &str = r"TODO|FIXME|XXX";
 const WARM_ROUNDS: usize = 5;
 const STARTUP_ROUNDS: usize = 10;
+/// `codebase_map`'s default budget.
+const MAP_BUDGET: usize = 2_000;
 
 fn median(mut xs: Vec<f64>) -> f64 {
     if xs.is_empty() {
@@ -78,6 +81,11 @@ struct CorpusReport {
     word_lines: usize,
     text_ms_median: f64,
     text_regex_ms: f64,
+    map_first: Duration,
+    map_warm_ms: f64,
+    map_tokens: usize,
+    map_symbols: usize,
+    map_files: usize,
 }
 
 fn bench_corpus(name: &str, root: &Path) -> CorpusReport {
@@ -189,6 +197,32 @@ fn bench_corpus(name: &str, root: &Path) -> CorpusReport {
     text::search_text(root, root, &cache, &re, &text_opts);
     let text_regex_ms = ms(start.elapsed());
 
+    // 5. codebase_map of the whole corpus, on the warm cache.
+    let map_opts = MapOptions {
+        max_tokens: MAP_BUDGET,
+        focus: Vec::new(),
+        max_files: MAX_FILES,
+    };
+    let start = Instant::now();
+    let map_text = map::codebase_map(root, root, &cache, &map_opts);
+    let map_first = start.elapsed();
+    let mut map_warm = Vec::new();
+    for _ in 0..WARM_ROUNDS {
+        let start = Instant::now();
+        map::codebase_map(root, root, &cache, &map_opts);
+        map_warm.push(ms(start.elapsed()));
+    }
+    // A file's line, then its symbols indented under it; the first line
+    // is the summary and the footer starts with an ellipsis.
+    let body = || {
+        map_text
+            .lines()
+            .skip(1)
+            .filter(|l| !l.starts_with('\u{2026}'))
+    };
+    let map_symbols = body().filter(|l| l.starts_with(' ')).count();
+    let map_files = body().filter(|l| !l.starts_with(' ')).count();
+
     CorpusReport {
         name: name.to_string(),
         files: files.len(),
@@ -212,6 +246,11 @@ fn bench_corpus(name: &str, root: &Path) -> CorpusReport {
         word_lines,
         text_ms_median: median(text_times),
         text_regex_ms,
+        map_first,
+        map_warm_ms: median(map_warm),
+        map_tokens: estimate_tokens(&map_text),
+        map_symbols,
+        map_files,
     }
 }
 
@@ -360,19 +399,41 @@ fn render(reports: &[CorpusReport], startup: f64) -> String {
     }
 
     out.push_str(&format!(
+        "\n## Codebase map\n\n`codebase_map` of the whole corpus with the default `max_tokens` of {MAP_BUDGET}, \
+         on the parse cache the searches above filled.\n\n"
+    ));
+    out.push_str("| Corpus | First map | Repeat (median) | Symbols shown | Files shown | Map tokens | Every outline / map |\n");
+    out.push_str("|---|---:|---:|---:|---:|---:|---:|\n");
+    for r in reports {
+        out.push_str(&format!(
+            "| {} | {:.1} ms | {:.1} ms | {} | {} | {} | {:.0}× ({} tokens) |\n",
+            r.name,
+            ms(r.map_first),
+            r.map_warm_ms,
+            r.map_symbols,
+            r.map_files,
+            r.map_tokens,
+            r.outline_tokens as f64 / r.map_tokens.max(1) as f64,
+            r.outline_tokens,
+        ));
+    }
+
+    out.push_str(&format!(
         "\n## Startup\n\nSpawn → `initialize` response: **{startup:.1} ms** (median of {STARTUP_ROUNDS}; no indexing at startup).\n"
     ));
     out.push_str(&format!(
         "\n### Columns\n\n\
          - **Cold parse**: read and tree-sitter-parse every supported file on one thread.\n\
          - **Search: cold**: first `search_symbols` on an empty cache (walks the tree, parses in parallel, persists results).\n\
-         - **Search: warm**: later searches served from the in-memory cache (still walks and `stat`s every file).\n\
+         - **Search: warm**: later searches, scored against the symbol names kept in memory (still walks and `stat`s every file).\n\
          - **Search: after restart**: new process state with the LMDB store; files are validated by git blob hash instead of re-parsed.\n\
          - **Pruned to budget**: `read_file_pruned` output for files that exceed the budget.\n\
          - **`read_symbol` / whole file**: tokens for one function/method versus reading its entire file.\n\
          - **`find_references`**: identifier tokens named QUERY, definitions included; looked up in the identifier offsets recorded at parse time (warm cache).\n\
          - **Word matches dropped**: whole-word text matches that are not references (comments, strings, docs, non-source files).\n\
-         - **`search_text` regex**: one run of `{TEXT_REGEX}` over every text file.\n",
+         - **`search_text` regex**: one run of `{TEXT_REGEX}` over every text file.\n\
+         - **First map**: walks the tree, reads every file's names and mentions from the cache, builds the graph, ranks it and prints the best symbols.\n\
+         - **Every outline / map**: how many times more tokens `get_file_outline` of every file takes than the map.\n",
     ));
     out
 }

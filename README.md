@@ -11,21 +11,24 @@ C#, GDScript. `.h` headers are parsed as C, or as C++ when C fails.
 
 On the Go 1.27.3 standard library (8,236 source files, 82 MB), with a warm cache:
 
-- `search_symbols`: 15 ms; after a restart, 72 ms from the on-disk store
-  versus 2.6 s cold.
-- `find_references`: 14 ms. It skips 49% of the lines a whole-word
+- `search_symbols`: 15 ms; after a restart, 96 ms from the on-disk store
+  versus 2.4 s cold.
+- `find_references`: 13 ms. It skips 49% of the lines a whole-word
   `grep -w` matches: comments, strings, docs, and files in languages it does
   not parse (assembly, ...), which can hold real uses.
-- `search_text` over every text file: 42 ms median for a whole-word query,
-  34 ms for the regex `TODO|FIXME|XXX`.
+- `search_text` over every text file: 37 ms median for a whole-word query,
+  32 ms for the regex `TODO|FIXME|XXX`.
 - Outlines use 81% fewer tokens than full source; reading one function costs
   a median 0.9% of its file.
+- `codebase_map` of the whole library: 240 ms, 120 symbols in 58 files within
+  its default 2,000 tokens, 2,051 times fewer than every file's outline.
 - The server answers `initialize` in ~3 ms. After searches over the whole
   corpus it holds ~240 MB resident with the on-disk store (~410 MB without).
 
 On the Linux kernel (66,075 files, 1 GB), a warm `search_symbols` over the
-whole tree takes 108 ms and `find_references` about 1 s. The server walks
-20,000 files by default; raise `ASTLENS_MAX_FILES` for a tree that large.
+whole tree takes 179 ms, `find_references` 281 ms and `codebase_map` 3.5 s.
+The server walks 20,000 files by default; raise `ASTLENS_MAX_FILES` for a tree
+that large.
 
 Full results for Go, CPython, tokio, the Linux kernel and VS Code are in
 [`BENCHMARKS.md`](BENCHMARKS.md).
@@ -143,7 +146,11 @@ the symbols enclosing it. A mention only counts where the language lets it
 reach the definition: another file of the same language family, outside the
 definition's function, past its `static`, `private` or unexported scope, and
 qualified or imported the way the language needs (a Go package, a Python
-module, a JavaScript import path, the owner of a method). `focus` takes files or
+module, a JavaScript import path, the owner of a method). A name defined once
+per platform in one directory (Go build constraints, Rust `cfg`) counts once,
+for its most common build. Private symbols (a Go lower-case name, a Python
+`_name`, a Rust item without `pub`) score below public ones used as much, so
+the map leads with what the rest of the code can call. `focus` takes files or
 identifiers and ranks around them; `dir` limits the map to a directory.
 
 Paths are relative to the workspace root. The tools that only read
