@@ -42,6 +42,19 @@ jobs:
             echo "::error::tag $TAG does not match Cargo.toml version $version"
             exit 1
           fi
+      # The release notes are the tag's section of CHANGELOG.md; a tag without
+      # one stops here. Both files come from main, which holds the tag, so an
+      # older tag released by hand finds them too.
+      - name: Release notes
+        run: |
+          git show origin/main:CHANGELOG.md > "$RUNNER_TEMP/CHANGELOG.md"
+          git show origin/main:scripts/release-notes.sh |
+            bash -s "$TAG" "$RUNNER_TEMP/CHANGELOG.md" > release-notes.md
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: notes
+          path: release-notes.md
+          if-no-files-found: error
 
   # Linux decides the release: once its tests and build pass, the release goes
   # out without waiting for the Windows and macOS runners.
@@ -77,6 +90,9 @@ jobs:
         with:
           name: linux
           path: dist
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: notes
       # One checksum file for all binaries: `sha256sum -c SHA256SUMS`.
       - name: Checksums
         run: cd dist && sha256sum astlens-* > SHA256SUMS
@@ -94,7 +110,7 @@ jobs:
           fi
           gh release create "$TAG" dist/* \
             --title "astlens $TAG" \
-            --generate-notes \
+            --notes-file release-notes.md \
             --verify-tag
 
   # Added to the published release when they finish. A failure leaves the

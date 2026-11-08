@@ -23,15 +23,19 @@ BENCH_OUT=BENCHMARKS.md cargo bench --bench report
 
 ## Releasing
 
-Bump `version` in `Cargo.toml`, commit, then push a matching tag:
+Bump `version` in `Cargo.toml`, rename the `Unreleased` section of
+[`CHANGELOG.md`](CHANGELOG.md) to `X.Y.Z (date)`, commit, then push a matching
+tag:
 
 ```sh
 git tag -a v0.1.0 -m "astlens 0.1.0"
 git push origin v0.1.0
 ```
 
-The release workflow checks that the tag matches `Cargo.toml`, runs the tests on
-Linux and publishes a GitHub Release with the Linux binary, `SHA256SUMS` and
-generated notes, without waiting for the Windows runner. The Windows binary is
-then built and added to that release, so it appears later. Until then,
+The release workflow checks that the tag matches `Cargo.toml` and that
+`CHANGELOG.md` has a section for it, runs the tests on Linux and publishes a
+GitHub Release with the Linux binary, `SHA256SUMS` and that section as its
+notes (`scripts/release-notes.sh vX.Y.Z` prints them), without waiting for the
+Windows and macOS runners. Those binaries are then built and added to that
+release, so they appear later. Until then,
 downloading it fails, including through `scripts/install.sh`.
