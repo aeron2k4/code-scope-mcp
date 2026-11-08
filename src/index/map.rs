@@ -8,10 +8,15 @@
 //! name. The best symbols are then printed by file, each under the symbols
 //! that enclose it, as many as fit `max_tokens`.
 //!
-//! Only names are compared, so a mention of `new` counts for every file that
-//! defines a `new`. Names shared by many files are weighted down, and long,
-//! specific names up, so the ranking follows the names that say where they
-//! point.
+//! Only names are compared, not resolved, but a mention counts for a
+//! definition only where its language lets it reach that definition, and the
+//! way the language needs it qualified. Names shared by many files are
+//! weighted down, and long, specific names up, so the ranking follows the
+//! names that say where they point.
+//!
+//! A tree with more source files than `max_files` is mapped from the
+//! shallowest of them, which hold the core of most projects, rather than
+//! from the first ones in path order.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
@@ -51,15 +56,17 @@ const RANK_CHUNK: usize = 4096;
 const FOOTER_GROUPS: usize = 10;
 /// Fewest tokens a printed symbol line costs, to bound how many can fit.
 const MIN_LINE_TOKENS: usize = 3;
+/// Files listed per file mapped, to pick the shallowest source files of a
+/// tree too large to map whole.
+const LISTED_PER_MAPPED: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct MapOptions {
     pub max_tokens: usize,
     /// Files, directories or identifiers to rank around.
     pub focus: Vec<String>,
+    /// Most source files mapped.
     pub max_files: usize,
-    /// Appended when the walk stopped at `max_files`.
-    pub truncated_note: String,
 }
 
 impl Default for MapOptions {
@@ -68,7 +75,6 @@ impl Default for MapOptions {
             max_tokens: 2000,
             focus: Vec::new(),
             max_files: DEFAULT_MAX_FILES,
-            truncated_note: String::new(),
         }
     }
 }
@@ -80,15 +86,24 @@ pub fn codebase_map(root: &Path, dir: &Path, cache: &ParseCache, opts: &MapOptio
         p if p.is_empty() => ".".to_string(),
         p => p,
     };
-    let (files, truncated) = files_under(root, dir, opts.max_files);
+    let listed = opts.max_files.saturating_mul(LISTED_PER_MAPPED);
+    let (files, unlisted) = files_under(root, dir, listed);
     let files: Vec<PathBuf> = files
         .into_iter()
         .filter(|p| Lang::from_path(p).is_some())
         .collect();
-    let truncated_note = if truncated {
-        opts.truncated_note.as_str()
+    let sources = files.len();
+    let files = shallowest(files, &prefix, opts.max_files);
+    let truncated_note = if files.len() < sources || unlisted {
+        format!(
+            "… mapped the {} shallowest of {}{} source files; narrow with `dir` or raise \
+             ASTLENS_MAX_FILES\n",
+            files.len(),
+            sources,
+            if unlisted { "+" } else { "" }
+        )
     } else {
-        ""
+        String::new()
     };
 
     let incomplete = AtomicUsize::new(0);
@@ -121,7 +136,7 @@ pub fn codebase_map(root: &Path, dir: &Path, cache: &ParseCache, opts: &MapOptio
             "… {incomplete} files took too long to parse fully; some of their symbols are missing"
         );
     }
-    notes.push_str(truncated_note);
+    notes.push_str(&truncated_note);
     if names.iter().all(|n| n.is_empty()) {
         return format!("no symbols in source files under {shown_dir}\n{notes}");
     }
@@ -160,6 +175,51 @@ pub fn codebase_map(root: &Path, dir: &Path, cache: &ParseCache, opts: &MapOptio
         notes: &notes,
     };
     map.fit(&paths, candidates, opts.max_tokens)
+}
+
+/// At most `keep` of the sorted `files` under `prefix`, still sorted: the
+/// shallowest ones, since the core of a project sits near its top and its
+/// leaves (drivers, platforms, plugins) deeper. Of the deepest level that
+/// fits only in part, each top-level directory gives a file in turn, so no
+/// directory crowds out the others by sorting first.
+fn shallowest(files: Vec<PathBuf>, prefix: &Path, keep: usize) -> Vec<PathBuf> {
+    if files.len() <= keep {
+        return files;
+    }
+    let below = |p: &PathBuf| p.strip_prefix(prefix).unwrap_or(p).to_path_buf();
+    let depth = |p: &PathBuf| below(p).components().count();
+    let mut by_depth: Vec<usize> = files.iter().map(depth).collect();
+    by_depth.sort_unstable();
+    let level = by_depth[keep];
+    let whole = by_depth.partition_point(|&d| d < level);
+
+    let mut turns: HashMap<PathBuf, usize> = HashMap::new();
+    let mut partial: Vec<(usize, usize)> = Vec::new();
+    let mut kept = vec![false; files.len()];
+    for (i, path) in files.iter().enumerate() {
+        match depth(path).cmp(&level) {
+            std::cmp::Ordering::Less => kept[i] = true,
+            std::cmp::Ordering::Equal => {
+                let top = below(path)
+                    .components()
+                    .next()
+                    .map(|c| PathBuf::from(c.as_os_str()));
+                let turn = turns.entry(top.unwrap_or_default()).or_default();
+                partial.push((*turn, i));
+                *turn += 1;
+            }
+            std::cmp::Ordering::Greater => {}
+        }
+    }
+    partial.sort_unstable();
+    for &(_, i) in partial.iter().take(keep - whole) {
+        kept[i] = true;
+    }
+    files
+        .into_iter()
+        .zip(kept)
+        .filter_map(|(p, k)| k.then_some(p))
+        .collect()
 }
 
 /// Focus strings split into the files they name and the identifiers.
@@ -201,6 +261,7 @@ impl Focus {
             if mentions::is_token(f) {
                 out.idents.push(mentions::hash(f));
                 out.idents.push(mentions::macro_hash(f));
+                out.idents.push(mentions::tag_hash(f));
             }
             out.unmatched.push(f.to_string());
         }
@@ -259,7 +320,8 @@ const NO_OWNER: u32 = 0;
 /// lists the files defining it and `refs` the files that mention it without
 /// defining it, with the share of their out-weight each sends. A file's rank
 /// thus flows through each name it mentions, and does not define, to that
-/// name's definers.
+/// name's definers: to the one nearest it, if one is (see [`nearest`]),
+/// else evenly to all.
 struct Graph {
     /// Name hash to its first ident; idents of one name are consecutive.
     by_name: HashIds,
@@ -275,13 +337,19 @@ struct Graph {
     /// Per ident, `def_start[i]..def_start[i + 1]` into `def_file`.
     def_start: Vec<u32>,
     def_file: Vec<u32>,
-    /// Per ident, `ref_start[i]..ref_start[i + 1]` into `ref_file`/`ref_w`.
+    /// Per ident, `ref_start[i]..ref_start[i + 1]` into `ref_file`, `ref_w`
+    /// and `ref_near`, the definer the file most likely means as an index
+    /// into the ident's definers, or [`ALL`] (see [`nearest`]).
     ref_start: Vec<u32>,
     ref_file: Vec<u32>,
     ref_w: Vec<f32>,
-    /// Per file, `file_start[f]..file_start[f + 1]` into `file_defs`.
+    ref_near: Vec<u32>,
+    /// Per file, `file_start[f]..file_start[f + 1]` into `file_defs`, the
+    /// idents it defines, and `file_slots`, its place among the definers of
+    /// each as an index into `def_file`.
     file_start: Vec<u32>,
     file_defs: Vec<u32>,
+    file_slots: Vec<u32>,
     /// (file, share of its rank that follows the teleport instead of its
     /// references): 1 for a file that mentions no name another file
     /// defines, less for one whose mentions say little (see [`MIN_OUT`]).
@@ -307,7 +375,8 @@ fn owner_token(parent: &str) -> Option<&str> {
 /// The (name, owner) hashes symbol `s` is defined under, or `None` for a
 /// symbol that takes no rank: `impl` blocks, which name a type defined
 /// elsewhere, modules, which hold the symbols that do, and names that are
-/// not plain identifiers. A Rust macro is named as it is called, `name!`.
+/// not plain identifiers. A Rust macro is named as it is called, `name!`,
+/// and a C `struct`, `union` or `enum` as its tag is written, `struct name`.
 ///
 /// The owner of an item of a Rust `impl Trait for Type` is `Type` when the
 /// workspace defines a type of that name (in `types`, sorted hashes), and
@@ -323,6 +392,9 @@ fn name_key(n: &SymbolNames, s: usize, types: &[u32], module: u32) -> Option<(u3
     }
     if kind == SymbolKind::Macro && n.lang() == Some(Lang::Rust) {
         return Some((mentions::macro_hash(name), NO_OWNER));
+    }
+    if matches!(kind, SymbolKind::Struct | SymbolKind::Enum) && n.lang() == Some(Lang::C) {
+        return Some((mentions::tag_hash(name), NO_OWNER));
     }
     let owner = n
         .parent(s)
@@ -366,13 +438,50 @@ type Key = (u32, u32, u32);
 /// or private to its file.
 fn def_key(n: &SymbolNames, s: usize, unit: &Unit, types: &[u32]) -> Option<Key> {
     let (name, owner) = name_key(n, s, types, unit.module_owner())?;
-    match n.reach(s) {
-        Reach::Public => Some((name, owner, unit.public_key)),
-        Reach::Private => {
-            (unit.private_key != FILE_ONLY).then_some((name, owner, unit.private_key))
-        }
-        Reach::Local => None,
+    Some((name, owner, unit.key(n.reach(s))?))
+}
+
+/// The `ref_near` of a file that may mean any of the definers of a name.
+const ALL: u32 = u32::MAX;
+
+/// The most definers of a name among which [`nearest`] picks one.
+const NEAREST_OF: usize = 64;
+
+/// Which of `definers` (files, at `paths`) a file at `path` most likely means
+/// by a name they all define, as an index into them: the one sharing the
+/// most directories with it, as a vendored copy of a library is used by the
+/// code around it; [`ALL`] when several share as many, or there are too many
+/// to tell.
+fn nearest(definers: &[u32], paths: &[String], path: &str) -> u32 {
+    if definers.len() < 2 || definers.len() > NEAREST_OF {
+        return ALL;
     }
+    let mut best: Option<(usize, u32)> = None;
+    let mut tied = false;
+    for (k, &d) in (0u32..).zip(definers) {
+        let shared = shared_dirs(&paths[d as usize], path);
+        match best {
+            Some((most, _)) if shared < most => {}
+            Some((most, _)) if shared == most => tied = true,
+            _ => {
+                best = Some((shared, k));
+                tied = false;
+            }
+        }
+    }
+    match best {
+        Some((_, k)) if !tied => k,
+        _ => ALL,
+    }
+}
+
+/// How many leading directories the paths `a` and `b` share.
+fn shared_dirs(a: &str, b: &str) -> usize {
+    a.bytes()
+        .zip(b.bytes())
+        .take_while(|(x, y)| x == y)
+        .filter(|&(x, _)| x == b'/')
+        .count()
 }
 
 /// How many of the `uses` of name `h` (mentions besides the file's own
@@ -453,6 +562,31 @@ const PUBLIC_END: u32 = 16;
 /// The scope key of definitions no other file can mention.
 const FILE_ONLY: u32 = u32::MAX;
 
+/// Whether the slash-separated `path` is that of a C or C++ header.
+fn is_header(path: &str) -> bool {
+    path.rsplit_once('.').is_some_and(|(_, ext)| {
+        matches!(
+            ext,
+            "h" | "hh" | "hpp" | "hxx" | "h++" | "inl" | "ipp" | "tcc" | "tpp"
+        )
+    })
+}
+
+/// The slash-terminated prefix of the files that may include the headers in
+/// `dir` (`""` for all): those under the directory holding the last
+/// `include` directory on the way, whose headers are for the code around it
+/// (`include/linux/` for the whole tree, `arch/x86/include/asm/` for
+/// `arch/x86/`), or else those under `dir` itself, whose headers are for the
+/// code beside them.
+fn include_root(dir: &str) -> String {
+    let parts: Vec<&str> = dir.split('/').filter(|p| !p.is_empty()).collect();
+    let end = parts
+        .iter()
+        .rposition(|p| p.eq_ignore_ascii_case("include"))
+        .unwrap_or(parts.len());
+    parts[..end].iter().map(|p| format!("{p}/")).collect()
+}
+
 fn is_public(scope: u32) -> bool {
     scope < PUBLIC_END
 }
@@ -499,6 +633,9 @@ struct Unit {
     /// Whether it is a JavaScript module, whose exports only the files
     /// importing it use.
     js_module: bool,
+    /// For a C or C++ header, the [`mentions::import_hash`] of its stem,
+    /// which the files including it mention; [`NO_OWNER`] for other files.
+    header: u32,
 }
 
 impl Unit {
@@ -537,6 +674,11 @@ impl Unit {
             ),
             _ => (NO_OWNER, NO_OWNER),
         };
+        let header = if matches!(lang, Some(Lang::C | Lang::Cpp)) && is_header(path) {
+            mentions::import_hash(stem)
+        } else {
+            NO_OWNER
+        };
         Unit {
             lang,
             scope,
@@ -545,15 +687,39 @@ impl Unit {
             module,
             package,
             js_module: n.is_module(),
+            header,
         }
     }
 
-    /// The owner of the file's top-level definitions: its Go package or
-    /// Python module, which other files name to use them; [`NO_OWNER`] for
-    /// the other languages.
+    /// The scope key of the definitions of the file that `reach` other
+    /// files: a C or C++ header's public ones reach no further than its
+    /// private ones, the files including it.
+    fn key(&self, reach: Reach) -> Option<u32> {
+        match reach {
+            Reach::Public if self.header == NO_OWNER => Some(self.public_key),
+            Reach::Public | Reach::Private => {
+                (self.private_key != FILE_ONLY).then_some(self.private_key)
+            }
+            Reach::Local => None,
+        }
+    }
+
+    /// Whether the file at `path`, whose mentions are `mentions`, can
+    /// mention the private definitions of this file: it is in their
+    /// [`Scope`], or includes this header by name.
+    fn reaches(&self, mentions: &Mentions, path: &str) -> bool {
+        self.scope.reaches(path) || (self.header != NO_OWNER && mentions.contains(self.header))
+    }
+
+    /// The owner of the file's top-level definitions: its Go package, Python
+    /// module or JavaScript module, which other files name or import to use
+    /// them, so that the definitions of one module are told apart from
+    /// another's of the same name; [`NO_OWNER`] for the other languages and
+    /// for a JavaScript script, whose globals need no import.
     fn module_owner(&self) -> u32 {
         match self.lang {
             Some(Lang::Go | Lang::Python) => self.module,
+            Some(Lang::JavaScript | Lang::TypeScript | Lang::Tsx) if self.js_module => self.module,
             _ => NO_OWNER,
         }
     }
@@ -572,15 +738,15 @@ impl Unit {
 /// [`Reach::Private`]), by its language.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Scope {
-    /// Every file: the language has no private definitions, or a C header's
-    /// `static` ones reach the files including it.
+    /// Every file: the language has no private definitions.
     Public,
     /// Only the file itself: C and C++ `static`, Java and C# `private`, what
     /// a JavaScript module does not export.
     File,
     /// The files under the slash-terminated `prefix` (`""` for all): a Rust
-    /// module and the modules under it, a Python package. With `nested`
-    /// false, only the files right in it: a Go package.
+    /// module and the modules under it, a Python package, the files that may
+    /// include a C or C++ header (see [`include_root`]). With `nested` false,
+    /// only the files right in it: a Go package.
     Within { prefix: String, nested: bool },
 }
 
@@ -594,7 +760,7 @@ impl Scope {
                 format!("{dir}/")
             }
         };
-        let (stem, ext) = file.rsplit_once('.').unwrap_or((file, ""));
+        let stem = file.rsplit_once('.').map_or(file, |(stem, _)| stem);
         match lang {
             Some(Lang::Rust) => Scope::Within {
                 // `a/mod.rs` and `lib.rs` hold the module of their directory,
@@ -614,11 +780,10 @@ impl Scope {
                 prefix: dir_prefix(),
                 nested: true,
             },
-            Some(Lang::C | Lang::Cpp)
-                if matches!(ext, "h" | "hh" | "hpp" | "hxx" | "inl" | "ipp" | "tcc") =>
-            {
-                Scope::Public
-            }
+            Some(Lang::C | Lang::Cpp) if is_header(path) => Scope::Within {
+                prefix: include_root(dir),
+                nested: true,
+            },
             Some(
                 Lang::C
                 | Lang::Cpp
@@ -733,7 +898,7 @@ impl Graph {
         // name itself, even in test code or privately, most likely means its
         // own definition, so those mentions are left out, as are those of
         // private definitions the file cannot reach.
-        let edges: Vec<Vec<(u32, f32)>> = par_ranges(names.len(), 256, |range| {
+        let edges: Vec<Vec<(u32, f32, u32)>> = par_ranges(names.len(), 256, |range| {
             range
                 .map(|f| {
                     let n = &names[f];
@@ -770,10 +935,15 @@ impl Graph {
                         for id in variants(h) {
                             let owner = ident_owner[id];
                             let scope = ident_scope[id];
+                            // The definers of an ident share their language
+                            // family, scope and module, but not their header.
                             let unit = &units[definers(id)[0] as usize];
                             if unit.public_key != units[f].public_key
                                 || own.binary_search(&(h, owner)).is_ok()
-                                || (!is_public(scope) && !unit.scope.reaches(path))
+                                || (!is_public(scope)
+                                    && !definers(id)
+                                        .iter()
+                                        .any(|&d| units[d as usize].reaches(mentions, path)))
                             {
                                 continue;
                             }
@@ -782,7 +952,8 @@ impl Graph {
                                 continue;
                             }
                             let w = term_weight(uses) * multiplier[id] * factor;
-                            out.push((id as u32, w as f32));
+                            let near = nearest(definers(id), paths, path);
+                            out.push((id as u32, w as f32, near));
                         }
                     }
                     out
@@ -792,7 +963,7 @@ impl Graph {
 
         let mut ref_count = vec![0u32; idents + 1];
         for out in &edges {
-            for &(id, _) in out {
+            for &(id, ..) in out {
                 ref_count[id as usize + 1] += 1;
             }
         }
@@ -813,14 +984,15 @@ impl Graph {
         let total_refs = ref_start[idents] as usize;
         let mut ref_file = vec![0u32; total_refs];
         let mut ref_w = vec![0f32; total_refs];
+        let mut ref_near = vec![ALL; total_refs];
         let mut fill = ref_start.clone();
         let mut dangling = Vec::new();
         for (f, out) in edges.into_iter().enumerate() {
             let total: f64 = out
                 .iter()
-                .map(|&(id, w)| f64::from(w) * f64::from(idf[id as usize]))
+                .map(|&(id, w, _)| f64::from(w) * f64::from(idf[id as usize]))
                 .sum();
-            let raw: f64 = out.iter().map(|&(_, w)| f64::from(w)).sum();
+            let raw: f64 = out.iter().map(|&(_, w, _)| f64::from(w)).sum();
             let kept = (raw / MIN_OUT).min(1.0);
             if total <= 0.0 || kept <= 0.0 {
                 dangling.push((f as u32, 1.0));
@@ -829,11 +1001,12 @@ impl Graph {
             if kept < 1.0 {
                 dangling.push((f as u32, (1.0 - kept) as f32));
             }
-            for (id, w) in out {
+            for (id, w, near) in out {
                 let at = &mut fill[id as usize];
                 ref_file[*at as usize] = f as u32;
                 ref_w[*at as usize] =
                     (kept * f64::from(w) * f64::from(idf[id as usize]) / total) as f32;
+                ref_near[*at as usize] = near;
                 *at += 1;
             }
         }
@@ -847,11 +1020,13 @@ impl Graph {
             file_start[i] += file_start[i - 1];
         }
         let mut file_defs = vec![0u32; def_file.len()];
+        let mut file_slots = vec![0u32; def_file.len()];
         let mut fill = file_start.clone();
         for (ident, range) in def_start.windows(2).enumerate() {
-            for &f in &def_file[range[0] as usize..range[1] as usize] {
-                let at = &mut fill[f as usize];
+            for slot in range[0]..range[1] {
+                let at = &mut fill[def_file[slot as usize] as usize];
                 file_defs[*at as usize] = ident as u32;
+                file_slots[*at as usize] = slot;
                 *at += 1;
             }
         }
@@ -868,8 +1043,10 @@ impl Graph {
             ref_start,
             ref_file,
             ref_w,
+            ref_near,
             file_start,
             file_defs,
+            file_slots,
             dangling,
         }
     }
@@ -903,27 +1080,46 @@ impl Graph {
             .find(|&i| self.ident_owner[i] == owner && self.ident_scope[i] == scope)
     }
 
-    /// Whether some file defines `name`, or a Rust macro `name!` (up to hash
-    /// collisions).
+    /// Whether some file defines `name`, a Rust macro `name!` or a C tag
+    /// `struct name` (up to hash collisions).
     fn defines(&self, name: &str) -> bool {
-        [mentions::hash(name), mentions::macro_hash(name)]
-            .iter()
-            .any(|h| self.by_name.contains_key(h))
+        [
+            mentions::hash(name),
+            mentions::macro_hash(name),
+            mentions::tag_hash(name),
+        ]
+        .iter()
+        .any(|h| self.by_name.contains_key(h))
     }
 
-    /// Rank each ident receives from the files that mention it, split
-    /// evenly among its definers.
+    /// The places of the definitions `file` makes among the definers of
+    /// each, in the order of [`Graph::defs_of`].
+    fn slots_of(&self, file: usize) -> &[u32] {
+        &self.file_slots[self.file_start[file] as usize..self.file_start[file + 1] as usize]
+    }
+
+    /// Rank each definition receives from the files that mention its name,
+    /// per place in `def_file`: what a file sends to the definer it most
+    /// likely means, and an even share of what it sends to all definers.
     fn flows(&self, ranks: &[f64]) -> Vec<f64> {
         par_ranges(self.idents(), RANK_CHUNK, |range| {
-            range
-                .map(|i| {
-                    let refs = self.ref_start[i] as usize..self.ref_start[i + 1] as usize;
-                    let sent: f64 = refs
-                        .map(|k| ranks[self.ref_file[k] as usize] * f64::from(self.ref_w[k]))
-                        .sum();
-                    sent / self.definers(i).len() as f64
-                })
-                .collect()
+            let mut out = Vec::new();
+            for i in range {
+                let base = out.len();
+                let definers = self.definers(i).len();
+                out.resize(base + definers, 0.0);
+                let mut even = 0.0;
+                for k in self.ref_start[i] as usize..self.ref_start[i + 1] as usize {
+                    let sent = ranks[self.ref_file[k] as usize] * f64::from(self.ref_w[k]);
+                    match self.ref_near[k] {
+                        ALL => even += sent,
+                        near => out[base + near as usize] += sent,
+                    }
+                }
+                let even = even / definers as f64;
+                out[base..].iter_mut().for_each(|x| *x += even);
+            }
+            out
         })
     }
 
@@ -941,7 +1137,7 @@ impl Graph {
             let next: Vec<f64> = par_ranges(self.files(), RANK_CHUNK, |range| {
                 range
                     .map(|f| {
-                        let inflow: f64 = self.defs_of(f).iter().map(|&i| flows[i as usize]).sum();
+                        let inflow: f64 = self.slots_of(f).iter().map(|&k| flows[k as usize]).sum();
                         (1.0 - DAMPING) * personal[f] + DAMPING * (inflow + dangling * personal[f])
                     })
                     .collect()
@@ -972,6 +1168,7 @@ impl Graph {
             for f in range {
                 let n = &names[f];
                 let defs = self.defs_of(f);
+                let slots = self.slots_of(f);
                 let ident_of = |s: usize| {
                     let id = self.ident(def_key(n, s, &self.units[f], &self.types)?)?;
                     defs.binary_search(&(id as u32)).ok()
@@ -995,7 +1192,7 @@ impl Graph {
                         continue;
                     }
                     let referenced = ident_of(s).map_or(0.0, |at| {
-                        flows[defs[at] as usize] / f64::from(same_name[at])
+                        flows[slots[at] as usize] / f64::from(same_name[at])
                     });
                     let nested = if n.parent(s).is_some() { 0.5 } else { 1.0 };
                     let test = if tests.is_test(n, f, s) {
@@ -1539,11 +1736,15 @@ mod tests {
     /// The files `files[f]` sends rank to, by name of the file.
     fn targets(graph: &Graph, files: &[(&str, &str)], f: usize) -> BTreeSet<String> {
         (0..graph.idents())
-            .filter(|&i| {
+            .flat_map(|i| {
                 let refs = graph.ref_start[i] as usize..graph.ref_start[i + 1] as usize;
-                refs.into_iter().any(|k| graph.ref_file[k] == f as u32)
+                let definers = graph.definers(i);
+                refs.filter(move |&k| graph.ref_file[k] == f as u32)
+                    .flat_map(move |k| match graph.ref_near[k] {
+                        ALL => definers,
+                        near => std::slice::from_ref(&definers[near as usize]),
+                    })
             })
-            .flat_map(|i| graph.definers(i).iter())
             .map(|&d| files[d as usize].0.to_string())
             .collect()
     }
@@ -1731,8 +1932,13 @@ mod tests {
         ];
         let (graph, _) = graph_of(dir.path(), &files);
         let js = family(Some(Lang::TypeScript));
-        let weight_of = |name: &str| {
-            let id = graph.ident((mentions::hash(name), NO_OWNER, js)).unwrap();
+        let weight_of = |name: &str, module: &str| {
+            let owner = if module.is_empty() {
+                NO_OWNER
+            } else {
+                mentions::import_hash(module)
+            };
+            let id = graph.ident((mentions::hash(name), owner, js)).unwrap();
             let refs = graph.ref_start[id] as usize..graph.ref_start[id + 1] as usize;
             refs.filter(|&k| graph.ref_file[k] == 2)
                 .map(|k| graph.ref_w[k])
@@ -1740,12 +1946,55 @@ mod tests {
         };
         // A script's global counts less unimported, a module's export not
         // at all.
-        let (imported, global) = (weight_of("otherScheme"), weight_of("fileScheme"));
+        let imported = weight_of("otherScheme", "other");
+        let global = weight_of("fileScheme", "");
         assert!(
             imported > 5.0 * global && global > 0.0,
             "{imported} vs {global}"
         );
-        assert_eq!(weight_of("modScheme"), 0.0);
+        assert_eq!(weight_of("modScheme", "mod-scheme"), 0.0);
+    }
+
+    #[test]
+    fn an_import_picks_one_of_the_modules_exporting_a_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = [
+            ("a/state.ts", "export type URI = string;\n"),
+            ("base/uri.ts", "export class URI {}\n"),
+            (
+                "x/user.ts",
+                "import { URI } from '../base/uri';\nlet u: URI;\n",
+            ),
+        ];
+        let (graph, _) = graph_of(dir.path(), &files);
+        assert_eq!(
+            targets(&graph, &files, 2),
+            BTreeSet::from(["base/uri.ts".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_name_means_the_definition_nearest_its_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = [
+            ("src/base/uri.rs", "pub struct Uri;\n"),
+            ("vendor/copy/base/uri.rs", "pub struct Uri;\n"),
+            ("src/app/user.rs", "fn f(u: Uri) {}\n"),
+            ("vendor/copy/user.rs", "fn f(u: Uri) {}\n"),
+            ("other/user.rs", "fn f(u: Uri) {}\n"),
+        ];
+        let (graph, _) = graph_of(dir.path(), &files);
+        let set = |paths: &[&str]| paths.iter().map(|p| p.to_string()).collect::<BTreeSet<_>>();
+        assert_eq!(targets(&graph, &files, 2), set(&["src/base/uri.rs"]));
+        assert_eq!(
+            targets(&graph, &files, 3),
+            set(&["vendor/copy/base/uri.rs"])
+        );
+        assert_eq!(
+            targets(&graph, &files, 4),
+            set(&["src/base/uri.rs", "vendor/copy/base/uri.rs"]),
+            "as near to both"
+        );
     }
 
     #[test]
@@ -1806,6 +2055,80 @@ mod tests {
     }
 
     #[test]
+    fn a_c_struct_is_used_by_its_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = [
+            ("lib.h", "struct buf { int a; };\n"),
+            ("var.c", "int f(void) { int buf = 0; return buf; }\n"),
+            ("tag.c", "int g(struct buf *b) { return b->a; }\n"),
+        ];
+        let (graph, _) = graph_of(dir.path(), &files);
+        assert!(targets(&graph, &files, 1).is_empty());
+        assert_eq!(
+            targets(&graph, &files, 2),
+            BTreeSet::from(["lib.h".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_header_reaches_the_code_around_it_and_its_includers() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = [
+            ("drivers/a/a.h", "#define A_LIMIT 4\n"),
+            ("include/linux/l.h", "#define L_MAX 1\n"),
+            ("drivers/a/a.c", "int f(void) { return A_LIMIT; }\n"),
+            ("fs/b.c", "int g(void) { return A_LIMIT + L_MAX; }\n"),
+            (
+                "fs/c.c",
+                "#include \"../drivers/a/a.h\"\nint h(void) { return A_LIMIT; }\n",
+            ),
+        ];
+        let (graph, _) = graph_of(dir.path(), &files);
+        let set = |paths: &[&str]| paths.iter().map(|p| p.to_string()).collect::<BTreeSet<_>>();
+        assert_eq!(targets(&graph, &files, 2), set(&["drivers/a/a.h"]));
+        assert_eq!(targets(&graph, &files, 3), set(&["include/linux/l.h"]));
+        assert_eq!(targets(&graph, &files, 4), set(&["drivers/a/a.h"]));
+    }
+
+    #[test]
+    fn a_large_tree_is_mapped_from_its_shallowest_files() {
+        let files: Vec<PathBuf> = [
+            "src/arch/a/x.c",
+            "src/arch/b/y.c",
+            "src/drivers/a/x.c",
+            "src/drivers/a/y.c",
+            "src/drivers/b/x.c",
+            "src/include/linux/list.h",
+            "src/kernel/fork.c",
+            "src/kernel/sched/core.c",
+            "src/main.c",
+            "src/mm/mm.c",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        let kept = |keep| -> Vec<String> {
+            shallowest(files.clone(), Path::new("src"), keep)
+                .iter()
+                .map(|p| slash_path(p))
+                .collect()
+        };
+        assert_eq!(kept(10).len(), 10);
+        assert_eq!(kept(3), ["src/kernel/fork.c", "src/main.c", "src/mm/mm.c"]);
+        assert_eq!(
+            kept(6),
+            [
+                "src/arch/a/x.c",
+                "src/drivers/a/x.c",
+                "src/include/linux/list.h",
+                "src/kernel/fork.c",
+                "src/main.c",
+                "src/mm/mm.c",
+            ]
+        );
+    }
+
+    #[test]
     fn scopes_follow_modules_packages_and_headers() {
         let within = |prefix: &str, nested| Scope::Within {
             prefix: prefix.into(),
@@ -1829,7 +2152,19 @@ mod tests {
             Scope::of(Some(Lang::Python), "pkg/m.py"),
             within("pkg/", true)
         );
-        assert_eq!(Scope::of(Some(Lang::C), "inc/x.h"), Scope::Public);
+        assert_eq!(Scope::of(Some(Lang::C), "inc/x.h"), within("inc/", true));
+        assert_eq!(
+            Scope::of(Some(Lang::C), "include/linux/x.h"),
+            within("", true)
+        );
+        assert_eq!(
+            Scope::of(Some(Lang::Cpp), "arch/x86/include/asm/x.hpp"),
+            within("arch/x86/", true)
+        );
+        assert_eq!(
+            Scope::of(Some(Lang::C), "Python/Include/internal/x.h"),
+            within("Python/", true)
+        );
         assert_eq!(Scope::of(Some(Lang::C), "x.c"), Scope::File);
         assert_eq!(Scope::of(Some(Lang::TypeScript), "x.ts"), Scope::File);
         assert!(within("p/", false).reaches("p/y.go"));
@@ -1865,8 +2200,14 @@ mod tests {
         let rust = unit("main.rs").private_key;
         assert!(!is_public(rust) && rust != FILE_ONLY);
         assert_eq!(unit("x.c").private_key, FILE_ONLY);
-        assert_eq!(unit("x.h").private_key, unit("x.h").public_key);
-        assert!(is_public(unit("x.h").public_key));
+        assert_eq!(unit("x.h").public_key, unit("x.c").public_key);
+        assert_eq!(
+            unit("x.h").key(Reach::Public),
+            Some(unit("x.h").private_key)
+        );
+        assert!(!is_public(unit("x.h").private_key));
+        assert_eq!(unit("x.h").header, mentions::import_hash("x"));
+        assert_eq!(unit("x.c").header, NO_OWNER);
         assert_eq!(unit("src/strings.test.ts").private_key, FILE_ONLY);
         assert_eq!(
             unit("src/strings.test.ts").public_key,
@@ -1886,7 +2227,7 @@ mod tests {
         let imported = mentions::import_hash;
         assert_eq!(unit("src/strings.test.ts").module, imported("strings"));
         assert_eq!(unit("src/index.ts").module, imported("src"));
-        assert_eq!(unit("src/index.ts").module_owner(), NO_OWNER);
+        assert_eq!(unit("src/index.ts").module_owner(), imported("src"));
         assert_eq!(unit("main.rs").module, NO_OWNER);
     }
 
@@ -1942,9 +2283,9 @@ mod tests {
             ));
         }
         let (graph, _) = graph_of(dir.path(), &files);
-        let js = family(Some(Lang::JavaScript));
+        let (js, lib) = (family(Some(Lang::JavaScript)), mentions::import_hash("lib"));
         let weight_of = |name: &str| {
-            let id = graph.ident((mentions::hash(name), NO_OWNER, js)).unwrap();
+            let id = graph.ident((mentions::hash(name), lib, js)).unwrap();
             let refs = graph.ref_start[id] as usize..graph.ref_start[id + 1] as usize;
             refs.filter(|&k| graph.ref_file[k] == 1)
                 .map(|k| graph.ref_w[k])

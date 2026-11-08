@@ -43,21 +43,41 @@ pub fn import_hash(stem: &str) -> u32 {
     (hash(stem) ^ u32::from(b'/')).wrapping_mul(0x0100_0193)
 }
 
+/// Hash of a C `struct`, `union` or `enum` tag `name` written after its
+/// keyword, `struct name`, recorded beside the token's own: tags have a
+/// namespace of their own, so a variable or field `name` is no use of one.
+/// It is the hash of `name{`, which no token has.
+pub fn tag_hash(name: &str) -> u32 {
+    (hash(name) ^ u32::from(b'{')).wrapping_mul(0x0100_0193)
+}
+
 /// Whether [`Mentions::of`] counts the members of a file in `lang` apart.
 pub fn tracks_members(lang: Lang) -> bool {
     !matches!(lang, Lang::Java | Lang::CSharp | Lang::GdScript)
 }
 
-/// Whether the Go source `before` a token ends in the keyword `package`.
-fn is_package_clause(before: &[u8]) -> bool {
-    before
-        .trim_ascii_end()
-        .strip_suffix(b"package")
-        .is_some_and(|rest| {
+/// Whether the source `before` a token ends in one of `keywords`, as a word
+/// of its own.
+fn ends_in_keyword(before: &[u8], keywords: &[&[u8]]) -> bool {
+    let before = before.trim_ascii_end();
+    keywords.iter().any(|keyword| {
+        before.strip_suffix(*keyword).is_some_and(|rest| {
             !rest
                 .last()
                 .is_some_and(|&b| b.is_ascii_alphanumeric() || b == b'_')
         })
+    })
+}
+
+/// Whether the Go source `before` a token ends in the keyword `package`.
+fn is_package_clause(before: &[u8]) -> bool {
+    ends_in_keyword(before, &[b"package"])
+}
+
+/// Whether the C source `before` a token ends in `struct`, `union` or
+/// `enum`, so the token is a tag.
+fn is_tag(before: &[u8]) -> bool {
+    ends_in_keyword(before, &[b"struct", b"union", b"enum"])
 }
 
 /// Whether the source `before` a token of `lang` ends in a member access:
@@ -158,6 +178,28 @@ fn imported_modules(source: &str) -> Vec<&str> {
     out
 }
 
+/// The stems of the headers a C or C++ file includes, `list` for
+/// `#include <linux/list.h>`. Like a JavaScript import path, the header's
+/// name is a string, yet it names the file whose definitions the file uses.
+fn included_headers(source: &str) -> Vec<&str> {
+    source
+        .lines()
+        .filter_map(|line| {
+            let rest = line.trim_start().strip_prefix('#')?.trim_start();
+            let rest = rest.strip_prefix("include")?.trim_start();
+            let close = match rest.chars().next()? {
+                '"' => '"',
+                '<' => '>',
+                _ => return None,
+            };
+            let path = &rest[1..1 + rest[1..].find(close)?];
+            let file = path.rsplit('/').next()?;
+            let stem = file.split('.').next()?;
+            (!stem.is_empty()).then_some(stem)
+        })
+        .collect()
+}
+
 /// Distinct identifier tokens of a file, as sorted hashes with how often each
 /// occurs (at most 255).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -178,10 +220,13 @@ impl Mentions {
     /// also counts as [`member_hash`]. Java, C# and GDScript have no free
     /// functions, so they leave that out. The name of a Go file's `package`
     /// clause is no mention. A JavaScript or TypeScript file mentions the
-    /// [`import_hash`] of each path it imports.
+    /// [`import_hash`] of each path it imports, and a C or C++ file that of
+    /// each header it includes. In C, a token after `struct`, `union` or
+    /// `enum` also counts as [`tag_hash`].
     pub fn of(parsed: &ParsedFile, source: &str) -> Self {
         let rust = parsed.lang == Lang::Rust;
         let go = parsed.lang == Lang::Go;
+        let c = parsed.lang == Lang::C;
         let members = tracks_members(parsed.lang);
         let bytes = source.as_bytes();
         let mut all: Vec<u32> = Vec::with_capacity(parsed.idents.len());
@@ -203,9 +248,15 @@ impl Mentions {
             if members && is_member_access(parsed.lang, &bytes[..start]) {
                 all.push(member_hash(hash(token)));
             }
+            if c && is_tag(&bytes[..start]) {
+                all.push(tag_hash(token));
+            }
         }
         if matches!(parsed.lang, Lang::JavaScript | Lang::TypeScript | Lang::Tsx) {
             all.extend(imported_modules(source).into_iter().map(import_hash));
+        }
+        if matches!(parsed.lang, Lang::C | Lang::Cpp) {
+            all.extend(included_headers(source).into_iter().map(import_hash));
         }
         all.sort_unstable();
         let mut hashes = Vec::new();
@@ -377,6 +428,36 @@ mod tests {
         );
         assert_eq!(m.count(hash("syscall")), 1);
         assert_eq!(m.count(member_hash(hash("Println"))), 1);
+    }
+
+    #[test]
+    fn a_c_tag_counts_apart_from_its_name() {
+        let m = mentions(
+            "a.c",
+            "struct buf *b = buf; union\n  u x; enum kind k; mystruct buf2;\n",
+        );
+        assert_eq!(m.count(tag_hash("buf")), 1);
+        assert_eq!(m.count(hash("buf")), 2);
+        assert_eq!(m.count(tag_hash("u")), 1);
+        assert_eq!(m.count(tag_hash("kind")), 1);
+        assert_eq!(m.count(tag_hash("buf2")), 0);
+        assert_eq!(
+            mentions("a.cpp", "struct buf *b;\n").count(tag_hash("buf")),
+            0
+        );
+    }
+
+    #[test]
+    fn a_c_file_mentions_the_headers_it_includes() {
+        let m = mentions(
+            "a.c",
+            "#include <linux/list.h>\n  #  include \"local.h\"\n#include MACRO\n\
+             #define X \"no.h\"\nint x;\n",
+        );
+        assert!(m.contains(import_hash("list")));
+        assert!(m.contains(import_hash("local")));
+        assert!(!m.contains(import_hash("no")));
+        assert!(!m.contains(import_hash("MACRO")));
     }
 
     #[test]

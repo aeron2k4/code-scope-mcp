@@ -783,7 +783,6 @@ impl Workspace {
             max_tokens: max_tokens.max(1),
             focus,
             max_files: self.max_files,
-            truncated_note: self.truncation_note(true),
         };
         Ok(map::codebase_map(&self.root, &base, &self.cache, &opts))
     }
