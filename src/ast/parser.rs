@@ -76,12 +76,21 @@ impl Lang {
         })
     }
 
-    /// Position in [`Self::ALL`], for compact storage.
+    /// Position in [`Self::ALL`], for compact storage. A match rather than a
+    /// search, so a new language cannot be left without a number.
     pub fn index(self) -> usize {
-        Self::ALL
-            .iter()
-            .position(|l| *l == self)
-            .expect("every language is in ALL")
+        match self {
+            Lang::Rust => 0,
+            Lang::Python => 1,
+            Lang::JavaScript => 2,
+            Lang::TypeScript => 3,
+            Lang::Tsx => 4,
+            Lang::Go => 5,
+            Lang::C => 6,
+            Lang::Cpp => 7,
+            Lang::Java => 8,
+            Lang::CSharp => 9,
+        }
     }
 
     /// The language at `index` in [`Self::ALL`].
@@ -310,12 +319,23 @@ impl SymbolKind {
         Self::Macro,
     ];
 
-    /// Position in [`Self::ALL`], for compact storage.
+    /// Position in [`Self::ALL`], for compact storage. A match rather than a
+    /// search, so a new kind cannot be left without a number.
     pub fn index(self) -> usize {
-        Self::ALL
-            .iter()
-            .position(|k| *k == self)
-            .expect("every kind is in ALL")
+        match self {
+            Self::Function => 0,
+            Self::Method => 1,
+            Self::Class => 2,
+            Self::Struct => 3,
+            Self::Enum => 4,
+            Self::Interface => 5,
+            Self::Trait => 6,
+            Self::Impl => 7,
+            Self::Module => 8,
+            Self::Constant => 9,
+            Self::Type => 10,
+            Self::Macro => 11,
+        }
     }
 
     /// The kind at `index` in [`Self::ALL`].
@@ -900,6 +920,18 @@ mod tests {
         for lang in Lang::ALL {
             lang.query()
                 .unwrap_or_else(|e| panic!("{}: {e}", lang.name()));
+        }
+    }
+
+    #[test]
+    fn index_is_the_position_in_all() {
+        for (i, lang) in Lang::ALL.into_iter().enumerate() {
+            assert_eq!(lang.index(), i, "{lang:?}");
+            assert_eq!(Lang::from_index(i), Some(lang));
+        }
+        for (i, kind) in SymbolKind::ALL.into_iter().enumerate() {
+            assert_eq!(kind.index(), i, "{kind:?}");
+            assert_eq!(SymbolKind::from_index(i), Some(kind));
         }
     }
 

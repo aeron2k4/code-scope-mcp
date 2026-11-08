@@ -84,8 +84,11 @@ impl Stored {
         let mut out = Vec::with_capacity(2 * HEADER_BYTES + 40 + self.parsed.len());
         out.push(self.lang.index() as u8);
         out.push(u8::from(self.has_errors) | u8::from(self.incomplete) << 1);
-        out.push(u8::try_from(self.blob.len()).expect("a blob hash is 40 bytes"));
-        out.extend_from_slice(self.blob.as_bytes());
+        // A blob hash is 40 or 64 bytes. A longer one is cut, which can only
+        // make the entry miss, never match another blob.
+        let blob = &self.blob.as_bytes()[..self.blob.len().min(u8::MAX as usize)];
+        out.push(blob.len() as u8);
+        out.extend_from_slice(blob);
         out.extend_from_slice(&self.parsed);
         out
     }
