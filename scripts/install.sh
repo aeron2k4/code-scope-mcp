@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Install the astlens binary. Runs on Linux and
-# Windows (in Git Bash), which needs curl, and on macOS, which needs cargo: there
-# are no macOS binaries. Afterwards, `astlens --install` sets up Claude Code
-# and/or OpenCode.
+# Install the astlens binary. Downloads it with curl on Linux x86_64, macOS
+# (Apple silicon and Intel) and Windows x86_64 (in Git Bash); elsewhere builds
+# it with cargo. Afterwards, `astlens --install` sets up Claude Code and/or
+# OpenCode.
 #
 #   scripts/install.sh                   download the latest release
 #   scripts/install.sh --version v0.1.0  download that release instead
@@ -51,7 +51,8 @@ arch=$(uname -m)
 exe=
 case "$os" in
   Linux) [ "$arch" = x86_64 ] && asset=astlens-linux ;;
-  Darwin) ;;
+  # A universal binary, for both arm64 and x86_64.
+  Darwin) asset=astlens-macos ;;
   MINGW*|MSYS*|CYGWIN*) exe=.exe; [ "$arch" = x86_64 ] && asset=astlens-windows.exe ;;
   *) die "unsupported OS: $os" ;;
 esac
@@ -133,7 +134,13 @@ if [ "$source_build" = 1 ]; then
   fi
 else
   need curl
-  need sha256sum
+  # macOS has shasum, and sha256sum only on recent versions.
+  if have sha256sum; then
+    sha256() { sha256sum "$1" | cut -d' ' -f1; }
+  else
+    need shasum
+    sha256() { shasum -a 256 "$1" | cut -d' ' -f1; }
+  fi
   if [ "$version" = latest ]; then
     base="https://github.com/$REPO/releases/latest/download"
   else
@@ -144,7 +151,7 @@ else
   curl -fsSL -o "$tmpdir/SHA256SUMS" "$base/SHA256SUMS" || die "download failed: $base/SHA256SUMS"
   want=$(awk -v f="$asset" '$2==f || $2=="*"f {print $1}' "$tmpdir/SHA256SUMS")
   [ -n "$want" ] || die "$asset is not listed in SHA256SUMS"
-  [ "$(sha256sum "$tmpdir/$asset" | cut -d' ' -f1)" = "$want" ] || die "checksum mismatch for $asset"
+  [ "$(sha256 "$tmpdir/$asset")" = "$want" ] || die "checksum mismatch for $asset"
   BIN=$BIN_DIR/astlens$exe
   mkdir -p "$BIN_DIR"
   install -m 755 "$tmpdir/$asset" "$BIN"

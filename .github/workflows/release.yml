@@ -44,7 +44,7 @@ jobs:
           fi
 
   # Linux decides the release: once its tests and build pass, the release goes
-  # out without waiting for the Windows runner.
+  # out without waiting for the Windows and macOS runners.
   linux:
     needs: check
     runs-on: ubuntu-22.04 # older glibc, so the binary runs on more distros
@@ -80,58 +80,98 @@ jobs:
       # One checksum file for all binaries: `sha256sum -c SHA256SUMS`.
       - name: Checksums
         run: cd dist && sha256sum astlens-* > SHA256SUMS
+      # A release that already exists is left as it is, so running this
+      # workflow by hand for an old tag only adds or replaces the binaries
+      # built below.
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG exists; keeping its Linux binary"
+            exit 0
+          fi
           gh release create "$TAG" dist/* \
-            --repo "$GITHUB_REPOSITORY" \
             --title "astlens $TAG" \
             --generate-notes \
             --verify-tag
 
-  # Added to the published release when it finishes. A failure here leaves the
-  # release without the Windows binary.
-  windows:
+  # Added to the published release when they finish. A failure leaves the
+  # release without that binary, and the other one is still added.
+  others:
     needs: release
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset: astlens-windows.exe
+          - os: macos-latest
+            asset: astlens-macos
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ env.TAG }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          targets: ${{ runner.os == 'macOS' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-      - run: cargo build --release --locked
-      - run: cp target/release/astlens.exe astlens-windows.exe
+      - if: runner.os == 'Windows'
+        run: |
+          cargo build --release --locked
+          cp target/release/astlens.exe "${{ matrix.asset }}"
         shell: bash
+      # One universal binary for Apple silicon and Intel Macs.
+      - if: runner.os == 'macOS'
+        run: |
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release --locked --target "$target"
+          done
+          lipo -create -output "${{ matrix.asset }}" \
+            target/aarch64-apple-darwin/release/astlens \
+            target/x86_64-apple-darwin/release/astlens
+          lipo -info "${{ matrix.asset }}"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: windows
-          path: astlens-windows.exe
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
           if-no-files-found: error
 
-  # Separate from the build, so that the write token never meets the build's
-  # third-party actions and build scripts.
-  windows-publish:
-    needs: windows
+  # Separate from the builds, so that the write token never meets their
+  # third-party actions and build scripts. One job for all of them, so that
+  # SHA256SUMS is rewritten once.
+  others-publish:
+    needs: [release, others]
+    if: ${{ !cancelled() && needs.release.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
-          name: windows
-      - name: Add binary and checksum to the release
+          pattern: astlens-*
+          path: dist
+          merge-multiple: true
+      - name: Add binaries and checksums to the release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          asset=astlens-windows.exe
-          gh release upload "$TAG" "$asset" --clobber
-
+          shopt -s nullglob
+          assets=(dist/astlens-*)
+          if [ ${#assets[@]} -eq 0 ]; then
+            echo "::error::no binary was built"
+            exit 1
+          fi
           gh release download "$TAG" --pattern SHA256SUMS --clobber
-          grep -v "  $asset\$" SHA256SUMS > sums.new || true
-          echo "$(sha256sum "$asset" | cut -d' ' -f1)  $asset" >> sums.new
-          mv sums.new SHA256SUMS
+          for path in "${assets[@]}"; do
+            asset=${path#dist/}
+            gh release upload "$TAG" "$path" --clobber
+            grep -v "  $asset\$" SHA256SUMS > sums.new || true
+            echo "$(sha256sum "$path" | cut -d' ' -f1)  $asset" >> sums.new
+            mv sums.new SHA256SUMS
+          done
           gh release upload "$TAG" SHA256SUMS --clobber

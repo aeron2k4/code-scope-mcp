@@ -27,8 +27,9 @@ Full results for Go, CPython and tokio are in [`BENCHMARKS.md`](BENCHMARKS.md).
 
 ## Installation
 
-Installing takes two steps, on Linux and Windows x86_64 (run it in Git Bash on
-Windows). First the binary, which needs `curl`, not `sudo`:
+Installing takes two steps, on Linux x86_64, macOS (Apple silicon and Intel)
+and Windows x86_64 (run it in Git Bash on Windows). First the binary, which
+needs `curl`, not `sudo`:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/aeron2k4/code-scope-mcp/main/scripts/install.sh | bash
@@ -144,7 +145,7 @@ that write stay inside the workspace.
 ## Build from source
 
 This needs Rust 1.90 or later. Use it on platforms without a prebuilt binary,
-such as macOS and Linux ARM.
+such as Linux ARM.
 
 ```sh
 git clone https://github.com/aeron2k4/code-scope-mcp.git
