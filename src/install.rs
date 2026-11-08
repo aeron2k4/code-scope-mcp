@@ -30,6 +30,7 @@ const MEMORY_END: &str = "<!-- astlens:end -->";
 const MEMORY_TEXT: &str = "\
 # Code navigation
 When exploring or reading source code, prefer the astlens MCP tools over Read/Grep:
+- `codebase_map` for a first look at an unfamiliar codebase or directory: the symbols the rest of the code uses most; `focus` ranks around the task's files.
 - `get_file_outline` before opening a file; `search_symbols` to find a definition.
 - `read_symbol` to read one function/class instead of the whole file; `read_lines` for a range of lines (a compiler error, a search hit).
 - `replace_symbol` to rewrite or delete a whole function/class, `insert_symbol` to add one; no Read needed.
@@ -45,6 +46,7 @@ Load the tools with ToolSearch (\"select:mcp__astlens__...\") if they are deferr
 const OPENCODE_MEMORY_TEXT: &str = "\
 # Code navigation
 When exploring or reading source code, prefer the astlens MCP tools over read/grep:
+- `astlens_codebase_map` for a first look at an unfamiliar codebase or directory: the symbols the rest of the code uses most; `focus` ranks around the task's files.
 - `astlens_get_file_outline` before opening a file; `astlens_search_symbols` to find a definition.
 - `astlens_read_symbol` to read one function/class instead of the whole file; `astlens_read_lines` for a range of lines (a compiler error, a search hit).
 - `astlens_replace_symbol` to rewrite or delete a whole function/class, `astlens_insert_symbol` to add one; no read needed.

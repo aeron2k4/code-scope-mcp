@@ -101,6 +101,7 @@ async fn mcp_session_over_jsonrpc() {
         names,
         [
             "changed_symbols",
+            "codebase_map",
             "find_references",
             "get_file_outline",
             "git_status",
@@ -153,6 +154,19 @@ async fn mcp_session_over_jsonrpc() {
     assert_eq!(
         tool_text(&refs),
         "app.py:2:9: def run(self):  [definition]  [in App]\n"
+    );
+
+    let map = client
+        .call(
+            13,
+            "tools/call",
+            json!({"name": "codebase_map", "arguments": {"max_tokens": 500}}),
+        )
+        .await;
+    assert_eq!(
+        tool_text(&map),
+        ".: 2 symbols in 1 of 1 file, the ones other files use most\n\
+         app.py\n  class App [class] L1-3\n    def run(self) [method] L2-3\n"
     );
 
     let text = client

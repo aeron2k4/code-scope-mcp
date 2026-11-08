@@ -639,7 +639,8 @@ pub struct Occurrence {
     pub start_byte: usize,
 }
 
-fn is_ident_char(c: char) -> bool {
+/// Whether `c` can be part of an identifier token, for matching whole tokens.
+pub fn is_ident_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '$'
 }
 

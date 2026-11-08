@@ -23,12 +23,14 @@ use crate::atomic::write_atomic;
 use crate::git;
 use crate::index::cache::{ParseCache, PersistentStore};
 use crate::index::changes::{self, Change, DiffSpec};
+use crate::index::map::{self, MapOptions};
 use crate::index::refs::{self, RefOptions};
 use crate::index::text::{self, TextHit, TextOptions};
 use crate::index::{self, SearchOptions};
 use crate::libraries;
 
 const DEFAULT_MAX_TOKENS: usize = 4000;
+const DEFAULT_MAP_TOKENS: usize = 2000;
 const DEFAULT_SEARCH_LIMIT: usize = 50;
 const DEFAULT_LIST_LIMIT: usize = 500;
 const DEFAULT_HIT_LIMIT: usize = 100;
@@ -768,6 +770,24 @@ impl Workspace {
         Ok(out)
     }
 
+    /// The symbols under `dir` that the rest of the code uses most, by file,
+    /// within `max_tokens`; see [`map::codebase_map`].
+    pub fn codebase_map(
+        &self,
+        dir: Option<&str>,
+        max_tokens: usize,
+        focus: Vec<String>,
+    ) -> Result<String> {
+        let base = self.root.join(self.resolve_dir(dir)?);
+        let opts = MapOptions {
+            max_tokens: max_tokens.max(1),
+            focus,
+            max_files: self.max_files,
+            truncated_note: self.truncation_note(true),
+        };
+        Ok(map::codebase_map(&self.root, &base, &self.cache, &opts))
+    }
+
     pub fn search_text(
         &self,
         pattern: &str,
@@ -1300,6 +1320,21 @@ pub struct FindReferencesParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CodebaseMapParams {
+    /// Sub-directory relative to the workspace root to map, or the absolute
+    /// path of a dependency source. Default: the root.
+    #[serde(default)]
+    pub dir: Option<String>,
+    /// Token budget for the map (default 2000).
+    #[serde(default)]
+    pub max_tokens: Option<usize>,
+    /// Files, directories or identifiers to rank around, e.g. the files of
+    /// the task at hand: they and what they use come first.
+    #[serde(default)]
+    pub focus: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SearchTextParams {
     /// Text to find; a literal string unless `regex` is true.
     pub pattern: String,
@@ -1378,6 +1413,23 @@ impl AstLens {
     ) -> Result<String, String> {
         self.run(move |ws| Ok(ws.search(&p.query, p.kind, p.limit.unwrap_or(DEFAULT_SEARCH_LIMIT))))
             .await
+    }
+
+    #[tool(
+        description = "Map of a codebase for a first look: the symbols the rest of the code uses most (ranked by references between files), with signatures and line ranges, grouped by file, within a token budget. `focus` ranks around given files, directories or identifiers."
+    )]
+    async fn codebase_map(
+        &self,
+        Parameters(p): Parameters<CodebaseMapParams>,
+    ) -> Result<String, String> {
+        self.run(move |ws| {
+            ws.codebase_map(
+                p.dir.as_deref(),
+                p.max_tokens.unwrap_or(DEFAULT_MAP_TOKENS),
+                p.focus.unwrap_or_default(),
+            )
+        })
+        .await
     }
 
     #[tool(
@@ -1543,8 +1595,9 @@ impl ServerHandler for AstLens {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "AST-aware code navigation. Prefer get_file_outline and search_symbols to locate \
-                 code, read_symbol to read exactly one definition, read_lines for a range of \
+                "AST-aware code navigation. Start in an unfamiliar codebase with codebase_map, \
+                 which shows the symbols the rest of the code uses most. Prefer get_file_outline \
+                 and search_symbols to locate code, read_symbol to read exactly one definition, read_lines for a range of \
                  lines such as a compiler error's, and read_file_pruned to read a whole file \
                  within a token budget. Use find_references to see where a symbol is used and \
                  search_text instead of grep. To rewrite a whole function or class, use \

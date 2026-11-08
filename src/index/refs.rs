@@ -5,6 +5,7 @@ use std::path::Path;
 use serde::Serialize;
 
 use super::cache::ParseCache;
+use super::mentions;
 use super::{
     DEFAULT_MAX_FILES, Found, enclosing_symbol, files_under, line_excerpt, par_flat_map, slash_path,
 };
@@ -150,8 +151,18 @@ pub fn find_references(
         .filter(|p| Lang::from_path(p).is_some())
         .collect();
 
+    // A file whose tokens lack the name's hash holds no occurrence of it, so
+    // the names kept in memory spare reading it. A name with other characters
+    // (`r#type`) is never one whole token and is looked for in every file.
+    let token = mentions::is_token(name).then(|| mentions::hash(name));
     let candidates = par_flat_map(&files, |rel| {
         let abs = root.join(rel);
+        if let Some(h) = token
+            && let Ok(names) = cache.symbol_names(&abs)
+            && !names.mentions().contains(h)
+        {
+            return Vec::new();
+        }
         let file = match cache.get(&abs) {
             Ok(f) => f,
             Err(err) => {

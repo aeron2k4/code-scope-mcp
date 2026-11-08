@@ -117,6 +117,7 @@ directory as the workspace root.
 
 | Tool               | Purpose                                                                          |
 | ------------------ | -------------------------------------------------------------------------------- |
+| `codebase_map`     | The symbols the rest of the code uses most, by file, within `max_tokens`         |
 | `get_file_outline` | Symbols in a file with signatures and line ranges                                |
 | `search_symbols`   | Ranked name search across the workspace (exact > prefix > substring)             |
 | `read_symbol`      | Exact source of one definition, line-numbered                                    |
@@ -135,6 +136,15 @@ directory as the workspace root.
 Files in other languages are plain text: `read_lines`, `read_file_pruned` (the
 text, cut at `max_tokens`), `replace_text`, `replace_lines` and `insert_symbol`
 at the end of the file work on them, without the syntax check.
+
+`codebase_map` ranks files by PageRank over the names they mention and the
+files defining them, then prints the best symbols of the best files, each under
+the symbols enclosing it. A mention only counts where the language lets it
+reach the definition: another file of the same language family, outside the
+definition's function, past its `static`, `private` or unexported scope, and
+qualified or imported the way the language needs (a Go package, a Python
+module, a JavaScript import path, the owner of a method). `focus` takes files or
+identifiers and ranks around them; `dir` limits the map to a directory.
 
 Paths are relative to the workspace root. The tools that only read
 (`get_file_outline`, `read_symbol`, `read_lines`, `read_file_pruned`, and

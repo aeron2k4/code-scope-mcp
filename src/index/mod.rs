@@ -2,6 +2,8 @@
 
 pub mod cache;
 pub mod changes;
+pub mod map;
+pub mod mentions;
 pub mod names;
 pub mod refs;
 pub mod store_format;
@@ -77,23 +79,34 @@ where
 /// Files a worker must get before another worker is worth spawning.
 const MIN_FILES_PER_WORKER: usize = 32;
 
-/// Like [`par_flat_map`], but keeping each file's results apart.
-///
-/// Workers take [`MIN_FILES_PER_WORKER`] files at a time from a shared
-/// counter rather than one fixed slice each: files that cost far more than
-/// the rest, such as the generated register headers of the Linux kernel,
-/// tend to sit together in one directory and would leave a single worker
-/// busy while the others wait.
 fn par_groups<T, F>(files: &[PathBuf], f: F) -> Vec<Vec<T>>
 where
     T: Send,
     F: Fn(&Path) -> Vec<T> + Sync,
 {
+    par_ranges(files.len(), MIN_FILES_PER_WORKER, |range| {
+        files[range].iter().map(|p| f(p)).collect()
+    })
+}
+
+/// `f` over `0..len` in pieces of `chunk`, on all cores, as one result per
+/// index in index order. Workers take the next piece from a shared counter,
+/// so a slow piece holds up only its own worker. With a single piece the
+/// work runs on the calling thread.
+pub(crate) fn par_ranges<T, F>(len: usize, chunk: usize, f: F) -> Vec<T>
+where
+    T: Send,
+    F: Fn(std::ops::Range<usize>) -> Vec<T> + Sync,
+{
+    let chunk = chunk.max(1);
+    let batches = len.div_ceil(chunk);
+    if batches <= 1 {
+        return if len == 0 { Vec::new() } else { f(0..len) };
+    }
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
-    let batches = files.len().div_ceil(MIN_FILES_PER_WORKER);
-    let workers = cores.min(batches).max(1);
+    let workers = cores.min(batches);
     let next = AtomicUsize::new(0);
-    let mut done: Vec<(usize, Vec<Vec<T>>)> = std::thread::scope(|s| {
+    let mut done: Vec<(usize, Vec<T>)> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..workers)
             .map(|_| {
                 let (f, next) = (&f, &next);
@@ -101,16 +114,11 @@ where
                     let mut mine = Vec::new();
                     loop {
                         let batch = next.fetch_add(1, SeqOrdering::Relaxed);
-                        let start = batch * MIN_FILES_PER_WORKER;
-                        let Some(chunk) =
-                            files.get(start..files.len().min(start + MIN_FILES_PER_WORKER))
-                        else {
-                            break mine;
-                        };
-                        if chunk.is_empty() {
+                        let start = batch * chunk;
+                        if start >= len {
                             break mine;
                         }
-                        mine.push((batch, chunk.iter().map(|p| f(p)).collect::<Vec<_>>()));
+                        mine.push((batch, f(start..len.min(start + chunk))));
                     }
                 })
             })

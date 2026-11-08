@@ -484,7 +484,7 @@ impl ParseCache {
             return Ok(Arc::clone(&entry.names));
         }
         let file = self.get(path)?;
-        let names = Arc::new(SymbolNames::new(&file.parsed));
+        let names = Arc::new(SymbolNames::new(&file.parsed, &file.source));
         if let Ok(mut map) = self.names.write() {
             if let Some(old) = map.remove(path) {
                 self.names_bytes
@@ -908,8 +908,8 @@ mod tests {
                 p
             })
             .collect();
-        let weight =
-            SymbolNames::new(&ParseCache::default().get(&paths[0]).unwrap().parsed).weight();
+        let file = ParseCache::default().get(&paths[0]).unwrap();
+        let weight = SymbolNames::new(&file.parsed, &file.source).weight();
         // Half the budget goes to names: room for two files' names.
         let cache = ParseCache::default().with_max_bytes(4 * weight + 4);
         let names_bytes = || cache.names_bytes.load(Ordering::Relaxed) as usize;
