@@ -22,7 +22,7 @@ use crate::git;
 use crate::index::cache::{ParseCache, PersistentStore};
 use crate::index::changes::{self, Change, DiffSpec};
 use crate::index::refs::{self, RefOptions};
-use crate::index::text::{self, TextOptions};
+use crate::index::text::{self, TextHit, TextOptions};
 use crate::index::{self, SearchOptions};
 use crate::libraries;
 
@@ -35,6 +35,8 @@ const MAX_REGEX_BYTES: usize = 1 << 20;
 const MAX_SYMBOL_MATCHES: usize = 5;
 /// Most lines one `read_lines` call returns.
 const MAX_READ_LINES: usize = 400;
+/// Most context lines `search_text` shows on each side of a match.
+const MAX_CONTEXT_LINES: usize = 20;
 /// Says what an empty result of a symbol search did not cover.
 const UNSEARCHED_NOTE: &str = "… not searched: hidden files, non-UTF-8 files, files over 2 MB\n";
 
@@ -734,6 +736,20 @@ impl Workspace {
         dir: Option<&str>,
         limit: usize,
     ) -> Result<String> {
+        self.search_text_around(pattern, regex, case_insensitive, dir, limit, 0)
+    }
+
+    /// [`Self::search_text`] showing `context` lines on each side of every
+    /// match, like `grep -C`.
+    pub fn search_text_around(
+        &self,
+        pattern: &str,
+        regex: bool,
+        case_insensitive: bool,
+        dir: Option<&str>,
+        limit: usize,
+        context: usize,
+    ) -> Result<String> {
         if pattern.is_empty() {
             bail!("pattern must not be empty");
         }
@@ -753,6 +769,7 @@ impl Workspace {
         let opts = TextOptions {
             max_files: self.max_files,
             limit,
+            context: context.min(MAX_CONTEXT_LINES),
         };
         let found = text::search_text(&self.root, &base, &self.cache, &re, &opts);
         let mut note = self.truncation_note(found.truncated);
@@ -770,12 +787,16 @@ impl Workspace {
             ));
         }
         let mut out = String::new();
-        for h in &found.hits {
-            let _ = write!(out, "{}:{}: {}", h.path, h.line, h.text);
-            if let Some(sym) = &h.enclosing {
-                let _ = write!(out, "  [in {sym}]");
+        if opts.context > 0 {
+            write_with_context(&mut out, &found.hits);
+        } else {
+            for h in &found.hits {
+                let _ = write!(out, "{}:{}: {}", h.path, h.line, h.text);
+                if let Some(sym) = &h.enclosing {
+                    let _ = write!(out, "  [in {sym}]");
+                }
+                out.push('\n');
             }
-            out.push('\n');
         }
         if found.total > found.hits.len() {
             let _ = writeln!(
@@ -881,6 +902,46 @@ impl Workspace {
 pub enum Anchor<'a> {
     After(&'a str),
     Before(&'a str),
+}
+
+/// Hits with the lines around them, grouped under their file's path: `12: `
+/// before a matching line, `11- ` before the others, and `--` between groups
+/// of lines that do not touch.
+fn write_with_context(out: &mut String, hits: &[TextHit]) {
+    for file in hits.chunk_by(|a, b| a.path == b.path) {
+        let mut lines: std::collections::BTreeMap<usize, (&str, Option<&TextHit>)> =
+            std::collections::BTreeMap::new();
+        for hit in file {
+            for (n, text) in &hit.context {
+                lines.entry(*n).or_insert((text, None));
+            }
+        }
+        for hit in file {
+            if let Some(line) = lines.get_mut(&hit.line) {
+                line.1 = Some(hit);
+            }
+        }
+        let _ = writeln!(out, "{}", file[0].path);
+        let mut prev: Option<usize> = None;
+        for (n, (text, hit)) in lines {
+            if prev.is_some_and(|p| n > p + 1) {
+                out.push_str("--\n");
+            }
+            prev = Some(n);
+            match hit {
+                Some(hit) => {
+                    let _ = write!(out, "{n}: {text}");
+                    if let Some(sym) = &hit.enclosing {
+                        let _ = write!(out, "  [in {sym}]");
+                    }
+                }
+                None => {
+                    let _ = write!(out, "{n}- {text}");
+                }
+            }
+            out.push('\n');
+        }
+    }
 }
 
 /// The one symbol called `name` (plain or qualified), optionally starting at
@@ -1215,6 +1276,10 @@ pub struct SearchTextParams {
     /// Maximum number of matching lines (default 100).
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Lines to show before and after each match, like grep -C (default 0,
+    /// at most 20). Matches are then grouped by file.
+    #[serde(default)]
+    pub context: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -1379,19 +1444,20 @@ impl AstLens {
     }
 
     #[tool(
-        description = "Search file contents for a literal string or regex, respecting .gitignore and skipping hidden files unless `dir` names a hidden directory. Returns path:line, the line and the enclosing symbol. Use instead of grep."
+        description = "Search file contents for a literal string or regex, respecting .gitignore and skipping hidden files unless `dir` names a hidden directory. Returns path:line, the line and the enclosing symbol; `context` adds the lines around each match. Use instead of grep."
     )]
     async fn search_text(
         &self,
         Parameters(p): Parameters<SearchTextParams>,
     ) -> Result<String, String> {
         self.run(move |ws| {
-            ws.search_text(
+            ws.search_text_around(
                 &p.pattern,
                 p.regex.unwrap_or(false),
                 p.case_insensitive.unwrap_or(false),
                 p.dir.as_deref(),
                 p.limit.unwrap_or(DEFAULT_HIT_LIMIT),
+                p.context.unwrap_or(0),
             )
         })
         .await
@@ -1577,6 +1643,43 @@ mod tests {
             ws.search_text("hit", false, false, None, 0).unwrap(),
             "… 5 more matching lines\n"
         );
+    }
+
+    #[test]
+    fn search_text_shows_context_around_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = "fn a() {\n    hit();\n    x();\n    hit();\n}\n\n\n\nfn b() {\n    hit();\n}\n";
+        fs::write(dir.path().join("a.rs"), src).unwrap();
+        fs::write(dir.path().join("b.py"), "hit = 1\n").unwrap();
+        let ws = Workspace::new(dir.path()).unwrap();
+        let out = ws
+            .search_text_around("hit", false, false, None, 10, 1)
+            .unwrap();
+        assert_eq!(
+            out,
+            "a.rs\n\
+             1- fn a() {\n\
+             2:     hit();  [in a]\n\
+             3-     x();\n\
+             4:     hit();  [in a]\n\
+             5- }\n\
+             --\n\
+             9- fn b() {\n\
+             10:     hit();  [in b]\n\
+             11- }\n\
+             b.py\n\
+             1: hit = 1  [in hit]\n"
+        );
+        // Capped, and none asked for keeps the one-line format.
+        let out = ws
+            .search_text_around("fn b", false, false, Some("a.rs"), 10, 1000)
+            .unwrap();
+        assert!(out.starts_with("a.rs\n1- fn a() {\n"), "{out}");
+        assert!(out.ends_with("11- }\n"), "{out}");
+        let out = ws
+            .search_text_around("fn b", false, false, Some("a.rs"), 10, 0)
+            .unwrap();
+        assert_eq!(out, "a.rs:9: fn b() {  [in b]\n");
     }
 
     #[test]

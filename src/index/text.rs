@@ -9,7 +9,8 @@ use serde::Serialize;
 
 use super::cache::ParseCache;
 use super::{
-    DEFAULT_MAX_FILES, enclosing_symbol, files_under, line_excerpt, par_flat_map, slash_path,
+    DEFAULT_MAX_FILES, MAX_EXCERPT_CHARS, enclosing_symbol, files_under, line_excerpt,
+    par_flat_map, slash_path,
 };
 use crate::ast::parser::Lang;
 
@@ -26,6 +27,10 @@ pub struct TextHit {
     pub text: String,
     /// Qualified name of the innermost enclosing symbol (source files only).
     pub enclosing: Option<String>,
+    /// With [`TextOptions::context`], the numbered lines around the hit and
+    /// the hit's own line, indentation kept, in order.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub context: Vec<(usize, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -34,6 +39,8 @@ pub struct TextOptions {
     pub max_files: usize,
     /// Number of hits to keep; the others are only counted.
     pub limit: usize,
+    /// Lines to return before and after each kept hit.
+    pub context: usize,
 }
 
 impl Default for TextOptions {
@@ -41,6 +48,7 @@ impl Default for TextOptions {
         TextOptions {
             max_files: DEFAULT_MAX_FILES,
             limit: usize::MAX,
+            context: 0,
         }
     }
 }
@@ -136,6 +144,7 @@ pub fn search_text(
                     .as_ref()
                     .and_then(|f| enclosing_symbol(&f.parsed.symbols, byte))
                     .map(|s| s.qualified_name()),
+                context: context_lines(text, byte, line, opts.context),
             })
         })
         .collect();
@@ -146,6 +155,34 @@ pub fn search_text(
         not_utf8: not_utf8.into_inner(),
         oversized: oversized.into_inner(),
     }
+}
+
+/// The lines from `n` before the one holding `byte` (number `line`) to `n`
+/// after it, without their line breaks and cut to [`MAX_EXCERPT_CHARS`].
+fn context_lines(source: &str, byte: usize, line: usize, n: usize) -> Vec<(usize, String)> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let start = source[..byte].rfind('\n').map_or(0, |i| i + 1);
+    let mut first = start;
+    let mut first_line = line;
+    while first_line > 1 && line - first_line < n {
+        first = source[..first - 1].rfind('\n').map_or(0, |i| i + 1);
+        first_line -= 1;
+    }
+    source[first..]
+        .split_inclusive('\n')
+        .take(line - first_line + n + 1)
+        .enumerate()
+        .map(|(i, text)| {
+            let text = text.trim_end_matches(['\n', '\r']);
+            let text = match text.char_indices().nth(MAX_EXCERPT_CHARS) {
+                Some((cut, _)) => format!("{}…", &text[..cut]),
+                None => text.to_string(),
+            };
+            (first_line + i, text)
+        })
+        .collect()
 }
 
 /// Why a file was left out of a search. Binary files are not worth reporting,
@@ -242,5 +279,19 @@ mod tests {
         assert_eq!(kept, [("a.rs", 2, Some("x")), ("a.rs", 3, Some("x"))]);
         // The file past the limit was not parsed.
         assert_eq!(cache.stats().parses, 1);
+    }
+
+    #[test]
+    fn context_stops_at_the_ends_of_the_file() {
+        let src = "one\r\ntwo\r\nthree";
+        assert_eq!(
+            context_lines(src, 0, 1, 3),
+            [(1, "one".into()), (2, "two".into()), (3, "three".into())]
+        );
+        assert_eq!(
+            context_lines(src, src.len() - 2, 3, 1),
+            [(2, "two".into()), (3, "three".into())]
+        );
+        assert!(context_lines(src, 0, 1, 0).is_empty());
     }
 }
