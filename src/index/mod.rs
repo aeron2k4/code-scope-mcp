@@ -7,7 +7,6 @@ pub mod store_format;
 pub mod text;
 
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering as SeqOrdering};
@@ -127,16 +126,6 @@ fn files_under(root: &Path, dir: &Path, max_files: usize) -> (Vec<PathBuf>, bool
     (files, truncated)
 }
 
-/// The on-disk path of a file that [`files_under`] reported.
-///
-/// The parse cache is keyed by absolute paths, so every lookup under a
-/// sub-directory has to go through the root. Looking one up by its relative
-/// path instead re-reads and re-parses it, and every search under a
-/// directory would pay for that.
-fn file_path(root: &Path, rel: &Path) -> PathBuf {
-    root.join(rel)
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct SymbolHit {
     pub path: String,
@@ -149,26 +138,6 @@ pub struct SymbolHit {
     #[serde(skip)]
     score: u8,
 }
-
-impl Ord for SymbolHit {
-    fn cmp(&self, other: &Self) -> Ordering {
-        rank(self, other)
-    }
-}
-
-impl PartialOrd for SymbolHit {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl PartialEq for SymbolHit {
-    fn eq(&self, other: &Self) -> bool {
-        rank(self, other) == Ordering::Equal
-    }
-}
-
-impl Eq for SymbolHit {}
 
 #[derive(Debug, Clone)]
 pub struct SearchOptions {
@@ -232,7 +201,9 @@ pub fn search_symbols(
 
     let incomplete = AtomicUsize::new(0);
     let per_file: Vec<Vec<SymbolHit>> = par_groups(&files, |rel| {
-        let file = match cache.get(&file_path(root, rel)) {
+        // The cache is keyed by absolute paths: a relative one would miss
+        // and parse the file again.
+        let file = match cache.get(&root.join(rel)) {
             Ok(f) => f,
             Err(err) => {
                 tracing::debug!(%err, "skipping file in search");
@@ -264,23 +235,15 @@ pub fn search_symbols(
         local
     });
 
-    // Keep only the best `limit` hits, so that a common name in a large
-    // repository never holds every match in memory: `best` keeps the worst
-    // kept hit on top, and a better hit replaces it. Each file's hits are
-    // already in rank order, so the comparison happens at most once per hit.
-    let keep = opts.limit.min(per_file.iter().map(Vec::len).sum::<usize>());
-    let mut best: BinaryHeap<SymbolHit> = BinaryHeap::with_capacity(keep + 1);
-    for hits in per_file.into_iter().flatten() {
-        if best.len() < keep {
-            best.push(hits);
-        } else if let Some(worst) = best.peek()
-            && rank(&hits, worst) == Ordering::Less
-        {
-            best.pop();
-            best.push(hits);
+    // Every hit is already in memory here, so the best `limit` are picked in
+    // linear time and only those are sorted.
+    let mut hits: Vec<SymbolHit> = per_file.into_iter().flatten().collect();
+    if hits.len() > opts.limit {
+        if opts.limit > 0 {
+            hits.select_nth_unstable_by(opts.limit - 1, rank);
         }
+        hits.truncate(opts.limit);
     }
-    let mut hits: Vec<SymbolHit> = best.into();
     hits.sort_by(rank);
     Found {
         hits,

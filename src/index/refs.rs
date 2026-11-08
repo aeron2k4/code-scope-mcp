@@ -6,8 +6,7 @@ use serde::Serialize;
 
 use super::cache::ParseCache;
 use super::{
-    DEFAULT_MAX_FILES, Found, enclosing_symbol, file_path, files_under, line_excerpt, par_flat_map,
-    slash_path,
+    DEFAULT_MAX_FILES, Found, enclosing_symbol, files_under, line_excerpt, par_flat_map, slash_path,
 };
 use crate::ast::parser::{self, Lang, SymbolKind};
 
@@ -152,7 +151,7 @@ pub fn find_references(
         .collect();
 
     let candidates = par_flat_map(&files, |rel| {
-        let abs = file_path(root, rel);
+        let abs = root.join(rel);
         let file = match cache.get(&abs) {
             Ok(f) => f,
             Err(err) => {

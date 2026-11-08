@@ -7,7 +7,7 @@ use std::path::Path;
 use anyhow::Result;
 use serde::Serialize;
 
-use super::{file_path, text};
+use super::text;
 use crate::ast::parser::{self, Lang, ParsedFile, SymbolKind};
 use crate::git;
 
@@ -66,8 +66,7 @@ pub fn changed_symbols(root: &Path, spec: DiffSpec<'_>) -> Result<Vec<FileChange
     let mut diffs = git::diff(root, spec.base, spec.staged)?;
     if !spec.staged {
         for path in git::untracked(root)? {
-            let lines = std::fs::read_to_string(file_path(root, Path::new(&path)))
-                .map_or(0, |s| s.lines().count());
+            let lines = std::fs::read_to_string(root.join(&path)).map_or(0, |s| s.lines().count());
             diffs.push(git::FileDiff {
                 path,
                 old: Vec::new(),
@@ -107,7 +106,7 @@ fn file_changes(root: &Path, spec: DiffSpec<'_>, diff: &git::FileDiff) -> Result
     } else if spec.staged {
         git::show(root, "", &diff.path)?
     } else {
-        text::read_text(&file_path(root, Path::new(&diff.path))).ok()
+        text::read_text(&root.join(&diff.path)).ok()
     };
     let (Some(old), Some(new)) = (old, new) else {
         return Ok(unparsed);
