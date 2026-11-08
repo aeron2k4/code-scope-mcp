@@ -22,9 +22,11 @@
 export LC_ALL=C
 
 # One jq for all fields, NUL-separated since a command can span lines.
-for field in tool cwd cmd file limit path glob type; do
+# workdir is the directory a command starts in, when not the workspace root
+# (OpenCode's shell tool); cwd always stays the workspace root.
+for field in tool cwd cmd workdir file limit path glob type; do
   IFS= read -r -d '' "$field"
-done < <(jq -j '[.tool_name, .cwd] + (.tool_input | [.command, .file_path, .limit, .path, .glob, .type])
+done < <(jq -j '[.tool_name, .cwd] + (.tool_input | [.command, .workdir, .file_path, .limit, .path, .glob, .type])
   | map(((. // "") | tostring) + "\u0000") | add')
 [ -n "$cwd" ] || cwd=$PWD
 
@@ -65,14 +67,32 @@ deny() {
   exit 0
 }
 
+# Absolute path $1 without . and .. components or repeated slashes, so that
+# src/../../etc is not taken for a path inside the workspace.
+normalize() {
+  local rest=$1/ part out=''
+  while [ -n "$rest" ]; do
+    part=${rest%%/*}
+    rest=${rest#*/}
+    case "$part" in
+      '' | .) ;;
+      ..) out=${out%/*} ;;
+      *) out+=/$part ;;
+    esac
+  done
+  printf '%s' "${out:-/}"
+}
+
 # Absolute path of $1 relative to directory $2.
 absolute() {
   case "$1" in
-    /*) printf '%s' "$1" ;;
-    "~"*) printf '%s' "$HOME${1#\~}" ;;
-    *) printf '%s/%s' "$2" "$1" ;;
+    /*) normalize "$1" ;;
+    "~"*) normalize "$HOME${1#\~}" ;;
+    *) normalize "$2/$1" ;;
   esac
 }
+
+cwd=$(normalize "$cwd")
 
 inside_workspace() {
   case "$1/" in "$cwd"/*) return 0 ;; *) return 1 ;; esac
@@ -498,6 +518,7 @@ check_bash() {
   lex "$cmd"
 
   local dir=$cwd piped=0 i=0 n=${#WORDS[@]}
+  [ -n "$workdir" ] && dir=$(absolute "$workdir" "$cwd")
   local -a seg
   while ((i <= n)); do
     local w=${WORDS[i]-;}

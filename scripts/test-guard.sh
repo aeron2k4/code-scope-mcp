@@ -164,6 +164,21 @@ cat src/main.rs
 END
 )\""
 
+# .. never leaves or re-enters the workspace by spelling alone.
+expect allow Read "{\"file_path\": \"$WS/src/../../elsewhere/x.rs\"}" 'Read .. outside'
+expect deny Read "{\"file_path\": \"/nowhere/..$WS/src/main.rs\"}" 'Read .. back inside'
+bash_cmd allow "cat ../../x.rs"
+
+# OpenCode's shell starts in workdir; the workspace stays cwd.
+workdir_cmd() {
+  expect "$1" Bash "$(jq -n --arg c "$2" --arg w "$3" '{command: $c, workdir: $w}')" "$2 (workdir $3)"
+}
+workdir_cmd deny "cat $WS/src/main.rs" /tmp
+workdir_cmd deny "cat main.rs" src
+workdir_cmd deny "cat main.rs" "$WS/src"
+workdir_cmd allow "cat main.rs" /tmp
+workdir_cmd allow "cat /etc/x.rs" /
+
 # OpenCode gets its own tool names in the denial reason.
 reason=$(jq -n --arg c "$WS" \
   '{tool_name: "Read", cwd: $c, tool_input: {file_path: "src/main.rs"}}' |

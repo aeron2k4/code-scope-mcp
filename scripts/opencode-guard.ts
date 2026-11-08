@@ -15,20 +15,11 @@ interface GuardOutput {
   }
 }
 
-function workingDirectory(workdir: unknown, cwd: string): string {
-  if (typeof workdir !== "string" || workdir === "") return cwd
-  if (workdir === "~") return process.env.HOME || cwd
-  if (workdir.startsWith("~/")) return `${process.env.HOME || cwd}${workdir.slice(1)}`
-  if (workdir.startsWith("/")) return workdir
-  return `${cwd.replace(/\/+$/, "")}/${workdir}`
-}
-
 /// The reason to reject the call, or undefined to let it run. The guard fails
 /// open: a missing bash, jq or script never blocks the tool.
 function rejected(tool: string, input: Record<string, unknown>, cwd: string): string | undefined {
   let toolName: string
   let toolInput: Record<string, unknown>
-  let directory = cwd
   switch (tool) {
     case "read":
       toolName = "Read"
@@ -40,14 +31,15 @@ function rejected(tool: string, input: Record<string, unknown>, cwd: string): st
       break
     case "shell":
       toolName = "Bash"
-      toolInput = { command: input.command }
-      directory = workingDirectory(input.workdir, cwd)
+      // The command starts in workdir, but the workspace stays cwd: the guard
+      // resolves workdir itself.
+      toolInput = { command: input.command, workdir: input.workdir }
       break
     default:
       return undefined
   }
 
-  const payload = JSON.stringify({ tool_name: toolName, cwd: directory, tool_input: toolInput })
+  const payload = JSON.stringify({ tool_name: toolName, cwd, tool_input: toolInput })
   const result = spawnSync("bash", [guard], {
     input: payload,
     encoding: "utf8",
