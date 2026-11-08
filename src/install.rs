@@ -115,49 +115,27 @@ impl Paths {
     }
 }
 
-/// Run the `claude` CLI. On Windows an npm install provides `claude.cmd`,
-/// which `Command` does not find under the bare name.
-fn claude(args: &[&str]) -> io::Result<Output> {
+/// Run a command-line program. On Windows an npm install provides
+/// `claude.cmd` or `opencode.cmd`, which `Command` does not find under the
+/// bare name.
+fn run_cli(program: &str, args: &[&str]) -> io::Result<Output> {
     let run = |program: &str| {
         Command::new(program)
             .args(args)
             .stdin(Stdio::null())
             .output()
     };
-    match run("claude") {
-        Err(err) if cfg!(windows) && err.kind() == io::ErrorKind::NotFound => run("claude.cmd"),
+    match run(program) {
+        Err(err) if cfg!(windows) && err.kind() == io::ErrorKind::NotFound => {
+            run(&format!("{program}.cmd"))
+        }
         other => other,
     }
 }
 
-/// Like [`claude`], for OpenCode's npm-provided Windows wrapper.
-fn opencode(args: &[&str]) -> io::Result<Output> {
-    let run = |program: &str| {
-        Command::new(program)
-            .args(args)
-            .stdin(Stdio::null())
-            .output()
-    };
-    match run("opencode") {
-        Err(err) if cfg!(windows) && err.kind() == io::ErrorKind::NotFound => run("opencode.cmd"),
-        other => other,
-    }
-}
-
-fn has_jq() -> bool {
-    Command::new("jq")
-        .arg("--version")
-        .stdin(Stdio::null())
-        .output()
-        .is_ok_and(|output| output.status.success())
-}
-
-fn has_bash() -> bool {
-    Command::new("bash")
-        .arg("--version")
-        .stdin(Stdio::null())
-        .output()
-        .is_ok_and(|output| output.status.success())
+/// Whether `program --version` runs and succeeds.
+fn runs(program: &str) -> bool {
+    run_cli(program, &["--version"]).is_ok_and(|output| output.status.success())
 }
 
 fn current_exe() -> Result<PathBuf> {
@@ -177,12 +155,11 @@ fn native_path(path: &Path) -> String {
 }
 
 fn claude_available() -> bool {
-    claude(&["--version"]).is_ok_and(|output| output.status.success())
+    runs("claude")
 }
 
 fn opencode_available(paths: &Paths) -> bool {
-    opencode(&["--version"]).is_ok_and(|output| output.status.success())
-        || paths.config_dir.exists()
+    runs("opencode") || paths.config_dir.exists()
 }
 
 pub fn install(enforce: bool, client: Client) -> Result<()> {
@@ -205,6 +182,26 @@ pub fn install(enforce: bool, client: Client) -> Result<()> {
         }
     };
 
+    // Checked once, before anything is written, so a missing tool never
+    // leaves one client set up and the other not.
+    if enforce {
+        let guard = match (claude_target, opencode_target) {
+            (true, true) => "the hook and the guard plugin need",
+            (true, false) => "the hook needs",
+            _ => "the guard plugin needs",
+        };
+        if !runs("jq") {
+            bail!(
+                "'jq' not found, and {guard} it; install jq, or use --no-enforce to register the MCP server only"
+            );
+        }
+        if opencode_target && !runs("bash") {
+            bail!(
+                "'bash' not found, and the guard plugin needs it; install bash, or use --no-enforce to register the MCP server only"
+            );
+        }
+    }
+
     if claude_target {
         install_claude(&paths, enforce)?;
     }
@@ -218,12 +215,6 @@ pub fn install(enforce: bool, client: Client) -> Result<()> {
 }
 
 fn install_claude(paths: &Paths, enforce: bool) -> Result<()> {
-    if enforce && !has_jq() {
-        bail!(
-            "'jq' not found, and the hook needs it; install jq, or use --no-enforce to skip the hook"
-        );
-    }
-
     let exe = current_exe()?;
     log("Registering MCP server 'astlens' with Claude Code (user scope)");
     // alwaysLoad keeps the tools in the model's manifest; without it Claude Code
@@ -234,7 +225,7 @@ fn install_claude(paths: &Paths, enforce: bool) -> Result<()> {
         "args": ["--serve"],
         "alwaysLoad": true,
     });
-    register(&config.to_string(), claude)?;
+    register(&config.to_string(), |args| run_cli("claude", args))?;
 
     if enforce {
         log(format_args!("Writing hook {}", paths.claude_hook.display()));
@@ -257,17 +248,6 @@ fn install_claude(paths: &Paths, enforce: bool) -> Result<()> {
 }
 
 fn install_opencode(paths: &Paths, enforce: bool) -> Result<()> {
-    if enforce && !has_jq() {
-        bail!(
-            "'jq' not found, and the guard plugin needs it; install jq, or use --no-enforce to skip the guard"
-        );
-    }
-    if enforce && !has_bash() {
-        bail!(
-            "'bash' not found, and the guard plugin needs it; install bash, or use --no-enforce to skip the guard"
-        );
-    }
-
     let exe = current_exe()?;
     setup_opencode(paths, &native_path(&exe), enforce)
 }
@@ -333,7 +313,7 @@ fn register(config: &str, mut run: impl FnMut(&[&str]) -> io::Result<Output>) ->
 pub fn uninstall() -> Result<()> {
     let paths = Paths::from_env()?;
     log("Removing MCP server registration from Claude Code");
-    let failure = match claude(&["mcp", "remove", "--scope", "user", SERVER]) {
+    let failure = match run_cli("claude", &["mcp", "remove", "--scope", "user", SERVER]) {
         Ok(output) if output.status.success() => None,
         Ok(output) => Some(format!(
             "'claude mcp remove' failed: {}",
