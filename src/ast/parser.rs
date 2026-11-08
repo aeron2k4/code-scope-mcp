@@ -174,6 +174,10 @@ const GDSCRIPT_QUERY: &str = r#"
 (enum_definition name: (_) @name) @enum
 (const_statement name: (_) @name) @constant
 (signal_statement name: (_) @name) @function
+(source (variable_statement name: (_) @name) @variable)
+(source (export_variable_statement name: (_) @name) @variable)
+(source (onready_variable_statement name: (_) @name) @variable)
+(class_body (variable_statement name: (_) @name) @variable)
 "#;
 
 const RUST_QUERY: &str = r#"
@@ -194,6 +198,13 @@ const RUST_QUERY: &str = r#"
 const PYTHON_QUERY: &str = r#"
 (function_definition name: (_) @name) @function
 (class_definition name: (_) @name) @class
+(module
+  (expression_statement
+    (assignment left: (identifier) @name)) @constant
+  (#match? @name "^_*[A-Z][A-Z0-9_]*$"))
+(module
+  (expression_statement
+    (assignment left: (identifier) @name)) @variable)
 "#;
 
 const JS_QUERY: &str = r#"
@@ -209,6 +220,29 @@ const JS_QUERY: &str = r#"
   (variable_declarator
     name: (identifier) @name
     value: [(arrow_function) (function_expression)])) @function
+; Top-level variables. One holding a function also matches a pattern above,
+; which comes first and so wins.
+(program
+  (lexical_declaration kind: "const"
+    (variable_declarator name: (identifier) @name)) @constant)
+(program
+  (export_statement
+    declaration: (lexical_declaration kind: "const"
+      (variable_declarator name: (identifier) @name)) @constant))
+(program
+  (lexical_declaration kind: "let"
+    (variable_declarator name: (identifier) @name)) @variable)
+(program
+  (export_statement
+    declaration: (lexical_declaration kind: "let"
+      (variable_declarator name: (identifier) @name)) @variable))
+(program
+  (variable_declaration
+    (variable_declarator name: (identifier) @name)) @variable)
+(program
+  (export_statement
+    declaration: (variable_declaration
+      (variable_declarator name: (identifier) @name)) @variable))
 "#;
 
 const TS_EXTRA_QUERY: &str = r#"
@@ -229,6 +263,10 @@ const GO_QUERY: &str = r#"
 (type_spec name: (_) @name type: (interface_type)) @interface
 (type_spec name: (_) @name) @type
 (type_alias name: (_) @name) @type
+(source_file (const_declaration (const_spec name: (identifier) @name) @constant))
+(source_file (var_declaration (var_spec name: (identifier) @name) @variable))
+(source_file
+  (var_declaration (var_spec_list (var_spec name: (identifier) @name) @variable)))
 "#;
 
 /// C functions and prototypes, shared with C++. The name sits inside the
@@ -318,11 +356,12 @@ pub enum SymbolKind {
     Constant,
     Type,
     Macro,
+    Variable,
 }
 
 impl SymbolKind {
     /// Every kind, in the order the store writes them.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::Function,
         Self::Method,
         Self::Class,
@@ -335,6 +374,7 @@ impl SymbolKind {
         Self::Constant,
         Self::Type,
         Self::Macro,
+        Self::Variable,
     ];
 
     /// Position in [`Self::ALL`], for compact storage. A match rather than a
@@ -353,6 +393,7 @@ impl SymbolKind {
             Self::Constant => 9,
             Self::Type => 10,
             Self::Macro => 11,
+            Self::Variable => 12,
         }
     }
 
@@ -377,6 +418,7 @@ impl SymbolKind {
             "constant" => SymbolKind::Constant,
             "type" => SymbolKind::Type,
             "macro" => SymbolKind::Macro,
+            "variable" => SymbolKind::Variable,
             _ => return None,
         })
     }
@@ -395,6 +437,7 @@ impl SymbolKind {
             SymbolKind::Constant => "constant",
             SymbolKind::Type => "type",
             SymbolKind::Macro => "macro",
+            SymbolKind::Variable => "variable",
         }
     }
 
@@ -638,7 +681,7 @@ fn extract_symbols(
             continue;
         };
         let name = node_text(name_node, source).to_string();
-        if name.is_empty() {
+        if name.is_empty() || is_require(name_node, source) {
             continue;
         }
         let node = own_declarator(node, name_node);
@@ -695,6 +738,16 @@ fn extract_symbols(
         symbols.push(sym);
     }
     Ok((symbols, timed_out.get()))
+}
+
+/// `const fs = require("fs")` is an import, not a definition of the file.
+fn is_require(name: Node<'_>, source: &str) -> bool {
+    name.parent()
+        .filter(|d| d.kind() == "variable_declarator")
+        .and_then(|d| d.child_by_field_name("value"))
+        .filter(|v| v.kind() == "call_expression")
+        .and_then(|call| call.child_by_field_name("function"))
+        .is_some_and(|f| node_text(f, source) == "require")
 }
 
 fn node_text<'s>(node: Node<'_>, source: &'s str) -> &'s str {
@@ -841,7 +894,9 @@ fn declaration_start(node: Node<'_>) -> usize {
             | "template_declaration"
             | "linkage_specification" => true,
             // `type T int` holds one spec; `type ( ... )` is a group of them.
-            "type_declaration" => parent.child_count() == 2,
+            "type_declaration" | "const_declaration" | "var_declaration" => {
+                parent.child_count() == 2
+            }
             _ => false,
         };
         if !wraps || parent.start_position().row != row {
@@ -922,6 +977,7 @@ mod tests {
                 found,
                 [
                     ("a", "a = () => { 1 }"),
+                    ("n", "n = 1"),
                     ("b", "b = function () {}"),
                     ("c", "const c = () => 3;"),
                 ]
@@ -1184,18 +1240,77 @@ macro_rules! m { () => {} }
                 ("hit".into(), SymbolKind::Function),
                 ("SPEED".into(), SymbolKind::Constant),
                 ("State".into(), SymbolKind::Enum),
+                ("health".into(), SymbolKind::Variable),
                 ("move".into(), SymbolKind::Function),
                 ("Inventory".into(), SymbolKind::Class),
                 ("Inventory::add".into(), SymbolKind::Method),
             ]
         );
-        let mv = &parsed.symbols[3];
+        let mv = &parsed.symbols[4];
         assert_eq!(mv.signature, "func move(delta: float) -> void");
         assert!(mv.body.is_some());
         assert_eq!(parsed.symbols[0].signature, "signal hit(damage: int)");
         // The comment and annotation above `move` belong to it.
         let start = symbol_start(&parsed, src, mv);
         assert!(src[start..].starts_with("# Moves"), "{:?}", &src[start..]);
+    }
+
+    #[test]
+    fn top_level_variables_are_symbols() {
+        let js = "const fs = require('fs');\nexport const CARDS = [1, 2];\nlet handlers = {}, f = () => 1;\nvar old = 1;\nfunction g() { const local = 1; }\nconst { a, b } = obj;\n";
+        for lang in [Lang::JavaScript, Lang::TypeScript] {
+            let parsed = parse_source(lang, js).unwrap();
+            assert_eq!(
+                names(&parsed),
+                vec![
+                    ("CARDS".into(), SymbolKind::Constant),
+                    ("handlers".into(), SymbolKind::Variable),
+                    ("f".into(), SymbolKind::Function),
+                    ("old".into(), SymbolKind::Variable),
+                    ("g".into(), SymbolKind::Function),
+                ],
+                "{}",
+                lang.name()
+            );
+            let cards = &parsed.symbols[0];
+            assert_eq!(cards.signature, "const CARDS = [1, 2];");
+            assert_eq!(
+                &js[cards.start_byte..cards.end_byte],
+                "export const CARDS = [1, 2];"
+            );
+        }
+
+        let py = "import os\nMAX_SIZE = 10\n_PRIVATE = 1\ncache: dict = {}\n\ndef f():\n    local = 1\n\nclass A:\n    field = 1\n";
+        let parsed = parse_source(Lang::Python, py).unwrap();
+        assert_eq!(
+            names(&parsed),
+            vec![
+                ("MAX_SIZE".into(), SymbolKind::Constant),
+                ("_PRIVATE".into(), SymbolKind::Constant),
+                ("cache".into(), SymbolKind::Variable),
+                ("f".into(), SymbolKind::Function),
+                ("A".into(), SymbolKind::Class),
+            ]
+        );
+
+        let go = "package p\nconst Max = 3\nconst (\n\tA = iota\n\tB\n)\nvar Debug = false\nvar (\n\tx int\n)\nfunc f() { const local = 1; var v int }\n";
+        let parsed = parse_source(Lang::Go, go).unwrap();
+        assert_eq!(
+            names(&parsed),
+            vec![
+                ("Max".into(), SymbolKind::Constant),
+                ("A".into(), SymbolKind::Constant),
+                ("B".into(), SymbolKind::Constant),
+                ("Debug".into(), SymbolKind::Variable),
+                ("x".into(), SymbolKind::Variable),
+                ("f".into(), SymbolKind::Function),
+            ]
+        );
+        // A lone spec takes its keyword along; one in a group does not.
+        let max = &parsed.symbols[0];
+        assert_eq!(&go[max.start_byte..max.end_byte], "const Max = 3");
+        let a = &parsed.symbols[1];
+        assert_eq!(&go[a.start_byte..a.end_byte], "A = iota");
     }
 
     #[test]

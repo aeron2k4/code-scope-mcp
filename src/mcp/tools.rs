@@ -1527,9 +1527,9 @@ mod tests {
         fs::write(dir.path().join("a.py"), "x = bar\r\ny = 1\r\n").unwrap();
         let ws = Workspace::new(dir.path()).unwrap();
         let out = ws.search_text("bar$", true, false, None, 10).unwrap();
-        assert_eq!(out, "a.py:1: x = bar\n");
+        assert_eq!(out, "a.py:1: x = bar  [in x]\n");
         let out = ws.search_text("^y", true, false, None, 10).unwrap();
-        assert_eq!(out, "a.py:2: y = 1\n");
+        assert_eq!(out, "a.py:2: y = 1  [in y]\n");
     }
 
     #[test]
