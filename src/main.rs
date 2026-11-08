@@ -11,6 +11,8 @@
 //! `ASTLENS_NO_CACHE=1` to keep the cache in memory only, and
 //! `ASTLENS_MAX_FILES` to change how many files a search walks (20000), and
 //! `ASTLENS_CACHE_MB` to change the memory kept for parsed files (512).
+//! `ASTLENS_LIBRARY_PATHS` adds directories, separated like `PATH`, to the
+//! dependency sources the read-only tools may open (see [`libraries`]).
 
 use std::ffi::OsString;
 use std::io::IsTerminal;
@@ -19,8 +21,8 @@ use std::path::PathBuf;
 use anyhow::Result;
 use astlens::cli::{self, Command};
 use astlens::index::cache::PersistentStore;
-use astlens::install;
 use astlens::mcp::{AstLens, Workspace};
+use astlens::{install, libraries};
 use rmcp::ServiceExt;
 use tracing_subscriber::EnvFilter;
 
@@ -110,7 +112,8 @@ fn main() -> Result<()> {
 #[tokio::main]
 async fn serve(root: Option<PathBuf>) -> Result<()> {
     init_tracing();
-    let mut workspace = with_persistence(Workspace::new(workspace_root(root)?)?);
+    let mut workspace = with_persistence(Workspace::new(workspace_root(root)?)?)
+        .with_libraries(libraries::default_roots());
     if let Some(max) = std::env::var("ASTLENS_MAX_FILES")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())

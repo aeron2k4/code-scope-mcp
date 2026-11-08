@@ -6,5 +6,6 @@ pub mod cli;
 pub mod git;
 pub mod index;
 pub mod install;
+pub mod libraries;
 pub mod mcp;
 pub mod opencode;

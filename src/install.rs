@@ -37,6 +37,7 @@ When exploring or reading source code, prefer the astlens MCP tools over Read/Gr
 - `read_file_pruned` when a whole file is needed but may be large.
 - `find_references` to see where a symbol is used; `search_text` instead of Grep.
 - `changed_symbols` to see which symbols a diff touches before reading it.
+- The read tools also open dependency sources by absolute path (e.g. under ~/.cargo/registry/src, ~/.rustup/toolchains, /usr/include).
 Use Read/Grep for non-code files or when astlens fails.
 Load the tools with ToolSearch (\"select:mcp__astlens__...\") if they are deferred.
 ";
@@ -51,6 +52,7 @@ When exploring or reading source code, prefer the astlens MCP tools over read/gr
 - `astlens_read_file_pruned` when a whole file is needed but may be large.
 - `astlens_find_references` to see where a symbol is used; `astlens_search_text` instead of grep.
 - `astlens_changed_symbols` to see which symbols a diff touches before reading it.
+- The read tools also open dependency sources by absolute path (e.g. under ~/.cargo/registry/src, ~/.rustup/toolchains, /usr/include).
 Use read/grep for non-code files or when astlens fails.
 ";
 

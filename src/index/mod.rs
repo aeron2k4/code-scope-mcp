@@ -115,10 +115,11 @@ fn line_excerpt(source: &str, byte: usize) -> String {
     }
 }
 
-/// Up to `max_files` files under `dir` (inside `root`), as paths relative to
-/// `root`, and whether more files were left out.
+/// Up to `max_files` files under `dir`, and whether more files were left out.
+/// They are relative to `root` when `dir` is inside it, and absolute when
+/// not, so `root.join` gives each file's path either way.
 fn files_under(root: &Path, dir: &Path, max_files: usize) -> (Vec<PathBuf>, bool) {
-    let prefix = dir.strip_prefix(root).unwrap_or(Path::new(""));
+    let prefix = dir.strip_prefix(root).unwrap_or(dir);
     let mut files = git::list_files(dir, max_files.saturating_add(1));
     let truncated = files.len() > max_files;
     files.truncate(max_files);

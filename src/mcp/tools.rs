@@ -24,6 +24,7 @@ use crate::index::changes::{self, Change, DiffSpec};
 use crate::index::refs::{self, RefOptions};
 use crate::index::text::{self, TextOptions};
 use crate::index::{self, SearchOptions};
+use crate::libraries;
 
 const DEFAULT_MAX_TOKENS: usize = 4000;
 const DEFAULT_SEARCH_LIMIT: usize = 50;
@@ -41,6 +42,9 @@ pub struct Workspace {
     root: PathBuf,
     cache: ParseCache,
     max_files: usize,
+    /// Canonical directories of dependency sources outside the root, which
+    /// the read-only tools may open too.
+    libraries: Vec<PathBuf>,
 }
 
 impl Workspace {
@@ -53,7 +57,17 @@ impl Workspace {
             root,
             cache: ParseCache::default(),
             max_files: index::DEFAULT_MAX_FILES,
+            libraries: Vec::new(),
         })
+    }
+
+    /// Let the read-only tools open files under `dirs` as well, by absolute
+    /// or `~/` path. Missing directories and those inside the root are left
+    /// out.
+    pub fn with_libraries(mut self, dirs: impl IntoIterator<Item = PathBuf>) -> Self {
+        self.libraries = libraries::existing(dirs);
+        self.libraries.retain(|dir| !dir.starts_with(&self.root));
+        self
     }
 
     /// Walk at most `max_files` files per workspace-wide search.
@@ -91,16 +105,57 @@ impl Workspace {
         &self.root
     }
 
-    /// Resolve a user-supplied path, refusing anything outside the root.
+    /// Resolve a user-supplied path for a write, refusing anything outside
+    /// the root.
     fn resolve(&self, rel: &str) -> Result<PathBuf> {
-        let joined = self.root.join(rel.trim());
-        let path = joined
-            .canonicalize()
-            .with_context(|| format!("no such path: {rel}"))?;
+        let path = self.canonical(rel)?;
         if !path.starts_with(&self.root) {
+            if self.in_library(&path) {
+                bail!("{rel} is a library source: it can be read, not edited");
+            }
             bail!("path escapes the workspace root: {rel}");
         }
         Ok(path)
+    }
+
+    /// Resolve a user-supplied path for a read: inside the root, or inside
+    /// one of the library directories.
+    fn resolve_read(&self, rel: &str) -> Result<PathBuf> {
+        let path = self.canonical(rel)?;
+        if path.starts_with(&self.root) || self.in_library(&path) {
+            return Ok(path);
+        }
+        if self.libraries.is_empty() {
+            bail!("path escapes the workspace root: {rel}");
+        }
+        let dirs: Vec<String> = self
+            .libraries
+            .iter()
+            .map(|d| index::slash_path(d))
+            .collect();
+        bail!(
+            "path escapes the workspace root: {rel}; outside it only library sources can be \
+             read, under {}",
+            dirs.join(", ")
+        )
+    }
+
+    fn in_library(&self, path: &Path) -> bool {
+        self.libraries.iter().any(|dir| path.starts_with(dir))
+    }
+
+    /// `rel` joined to the root, or taken as given when absolute, with a
+    /// leading `~/` standing for the home directory; then canonicalized.
+    fn canonical(&self, rel: &str) -> Result<PathBuf> {
+        let rel = rel.trim();
+        let home = rel
+            .strip_prefix("~/")
+            .zip(std::env::var_os("HOME"))
+            .map(|(rest, home)| PathBuf::from(home).join(rest));
+        let joined = home.unwrap_or_else(|| self.root.join(rel));
+        joined
+            .canonicalize()
+            .with_context(|| format!("no such path: {rel}"))
     }
 
     fn display(&self, path: &Path) -> String {
@@ -108,7 +163,7 @@ impl Workspace {
     }
 
     pub fn outline(&self, rel: &str, max_depth: Option<usize>) -> Result<String> {
-        let path = self.resolve(rel)?;
+        let path = self.resolve_read(rel)?;
         let file = self.cache.get(&path)?;
         let parsed = &file.parsed;
         let mut out = format!(
@@ -171,7 +226,7 @@ impl Workspace {
     }
 
     pub fn read_symbol(&self, rel: &str, name: &str) -> Result<String> {
-        let path = self.resolve(rel)?;
+        let path = self.resolve_read(rel)?;
         let file = self.cache.get(&path)?;
         let name = name.trim();
         let matches: Vec<_> = file
@@ -439,7 +494,7 @@ impl Workspace {
     /// Lines `start..=end` of a file, numbered: at most [`MAX_READ_LINES`],
     /// which is also how many come when `end` is not given.
     pub fn read_lines(&self, rel: &str, start: usize, end: Option<usize>) -> Result<String> {
-        let path = self.resolve(rel)?;
+        let path = self.resolve_read(rel)?;
         if !path.is_file() {
             bail!("{} is not a regular file", self.display(&path));
         }
@@ -594,7 +649,7 @@ impl Workspace {
     }
 
     pub fn read_pruned(&self, rel: &str, max_tokens: usize, keep: Vec<String>) -> Result<String> {
-        let path = self.resolve(rel)?;
+        let path = self.resolve_read(rel)?;
         let file = self.cache.get(&path)?;
         let opts = PruneOptions { max_tokens, keep };
         let result = pruner::prune(file.parsed.lang, &file.source, &file.parsed.symbols, &opts);
@@ -615,13 +670,14 @@ impl Workspace {
         Ok(out)
     }
 
-    /// Resolve an optional sub-directory, defaulting to the root. It comes
-    /// back relative to the root, as the file walkers expect: an absolute path
-    /// makes their results absolute too, and the cache, which is keyed by
-    /// `root.join(rel)`, then misses every file.
+    /// Resolve an optional sub-directory, defaulting to the root. A directory
+    /// inside the root comes back relative to it, as the file walkers expect:
+    /// an absolute path makes their results absolute too, and the cache,
+    /// which is keyed by `root.join(rel)`, then misses every file. A library
+    /// directory comes back absolute, and so do the files found under it.
     fn resolve_dir(&self, dir: Option<&str>) -> Result<PathBuf> {
         let base = match dir {
-            Some(d) if !d.trim().is_empty() => self.resolve(d)?,
+            Some(d) if !d.trim().is_empty() => self.resolve_read(d)?,
             _ => self.root.clone(),
         };
         if !base.is_dir() {
@@ -630,7 +686,7 @@ impl Workspace {
         Ok(base
             .strip_prefix(&self.root)
             .map(Path::to_path_buf)
-            .unwrap_or_default())
+            .unwrap_or(base))
     }
 
     pub fn find_references(
@@ -982,7 +1038,8 @@ fn line_break_len(text: &str) -> usize {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct OutlineParams {
-    /// File path relative to the workspace root.
+    /// File path relative to the workspace root, or the absolute path of a
+    /// dependency source (e.g. under ~/.cargo/registry/src).
     pub path: String,
     /// Maximum nesting depth to include (0 = top-level only). Default: all.
     #[serde(default)]
@@ -1003,7 +1060,8 @@ pub struct SearchParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ReadSymbolParams {
-    /// File path relative to the workspace root.
+    /// File path relative to the workspace root, or the absolute path of a
+    /// dependency source (e.g. under ~/.cargo/registry/src).
     pub path: String,
     /// Symbol name, plain (`new`) or qualified (`Parser::new`).
     pub name: String,
@@ -1059,7 +1117,8 @@ pub struct ReplaceTextParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ReadLinesParams {
-    /// File path relative to the workspace root.
+    /// File path relative to the workspace root, or the absolute path of a
+    /// dependency source (e.g. under ~/.cargo/registry/src).
     pub path: String,
     /// First line to return, 1-based.
     pub start: usize,
@@ -1097,7 +1156,8 @@ pub struct ChangedSymbolsParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ReadPrunedParams {
-    /// File path relative to the workspace root.
+    /// File path relative to the workspace root, or the absolute path of a
+    /// dependency source (e.g. under ~/.cargo/registry/src).
     pub path: String,
     /// Token budget for the returned text (default 4000).
     #[serde(default)]
@@ -1109,7 +1169,8 @@ pub struct ReadPrunedParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListFilesParams {
-    /// Sub-directory relative to the workspace root. Default: the root.
+    /// Sub-directory relative to the workspace root, or the absolute path of
+    /// a dependency source directory. Default: the root.
     #[serde(default)]
     pub dir: Option<String>,
     /// Maximum number of files (default 500).
@@ -1122,7 +1183,8 @@ pub struct FindReferencesParams {
     /// Symbol name, plain (`load`) or qualified (`Config::load`): the last segment is
     /// matched, and uses provably on another owner (`Other::load`) are dropped.
     pub name: String,
-    /// Sub-directory relative to the workspace root to search in. Default: the root.
+    /// Sub-directory relative to the workspace root to search in, or the
+    /// absolute path of a dependency source directory. Default: the root.
     #[serde(default)]
     pub dir: Option<String>,
     /// Also list the definitions themselves (default false).
@@ -1143,7 +1205,8 @@ pub struct SearchTextParams {
     /// Ignore case (default false).
     #[serde(default)]
     pub case_insensitive: Option<bool>,
-    /// Sub-directory relative to the workspace root to search in. Default: the root.
+    /// Sub-directory relative to the workspace root to search in, or the
+    /// absolute path of a dependency source directory. Default: the root.
     #[serde(default)]
     pub dir: Option<String>,
     /// Maximum number of matching lines (default 100).
@@ -1379,7 +1442,9 @@ impl ServerHandler for AstLens {
                  replace_symbol, and insert_symbol to add one, instead of reading and editing \
                  the file. For other changes (an import, a few lines, several spots in a file) \
                  use replace_text with the exact text to replace, or replace_lines with the \
-                 lines as they are now. changed_symbols summarises a git diff by symbol.",
+                 lines as they are now. changed_symbols summarises a git diff by symbol. The \
+                 tools that read also open dependency sources by absolute path (package caches \
+                 such as ~/.cargo/registry/src, toolchain sources, system headers).",
             )
     }
 }
@@ -2418,5 +2483,80 @@ mod tests {
         );
         let err = ws.outline("../no-such-file.rs", None).unwrap_err();
         assert!(err.to_string().contains("no such path"), "{err}");
+    }
+
+    #[test]
+    fn library_sources_can_be_read_but_not_edited() {
+        let (dir, ws) = workspace();
+        let lib = tempfile::tempdir().unwrap();
+        let src = lib.path().join("dep-1.0/src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("lib.rs"),
+            "/// Dep.\npub fn dep() -> u8 {\n    7\n}\n",
+        )
+        .unwrap();
+        let other = tempfile::tempdir().unwrap();
+        fs::write(other.path().join("secret.rs"), "fn secret() {}\n").unwrap();
+        let ws = ws.with_libraries([
+            lib.path().to_path_buf(),
+            dir.path().join("src"),
+            lib.path().join("missing"),
+        ]);
+        // A directory inside the root needs no entry; a missing one is dropped.
+        assert_eq!(ws.libraries, [lib.path().canonicalize().unwrap()]);
+
+        let file = src.join("lib.rs").canonicalize().unwrap();
+        let abs = file.to_string_lossy().into_owned();
+        let shown = index::slash_path(&file);
+        assert!(
+            ws.outline(&abs, None)
+                .unwrap()
+                .contains("pub fn dep() -> u8")
+        );
+        assert!(ws.read_symbol(&abs, "dep").unwrap().contains("3\t    7"));
+        assert!(
+            ws.read_lines(&abs, 3, Some(3))
+                .unwrap()
+                .ends_with("3\t    7\n")
+        );
+        assert!(
+            ws.read_pruned(&abs, 1000, vec![])
+                .unwrap()
+                .contains("pub fn dep")
+        );
+
+        // Searches under a library directory report absolute paths.
+        let base = lib.path().canonicalize().unwrap();
+        let base = base.to_string_lossy();
+        let hits = ws.search_text("7", false, false, Some(&base), 10).unwrap();
+        assert_eq!(hits, format!("{shown}:3: 7  [in dep]\n"));
+        assert_eq!(
+            ws.list_files(Some(&base), 10).unwrap(),
+            format!("{shown}\n")
+        );
+        let refs = ws.find_references("dep", Some(&base), true, 10).unwrap();
+        assert!(refs.contains(&format!("{shown}:2")), "{refs}");
+
+        let err = ws
+            .replace_text(&abs, &[text_edit("7", "8")])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("is a library source: it can be read, not edited"),
+            "{err}"
+        );
+        assert!(ws.replace_symbol(&abs, "dep", None, "").is_err());
+        assert!(fs::read_to_string(&file).unwrap().contains("    7\n"));
+
+        // Other directories outside the root stay closed, and the error says
+        // which ones are open.
+        let secret = other.path().join("secret.rs");
+        let err = ws
+            .read_lines(&secret.to_string_lossy(), 1, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("escapes the workspace root"), "{err}");
+        assert!(err.contains(&*base), "{err}");
     }
 }

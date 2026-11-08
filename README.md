@@ -126,6 +126,21 @@ directory as the workspace root.
 | `changed_symbols`  | Symbols added/modified/removed by uncommitted changes or since a revision        |
 | `git_status`       | Working-tree status                                                              |
 
+Paths are relative to the workspace root. The tools that only read
+(`get_file_outline`, `read_symbol`, `read_lines`, `read_file_pruned`, and
+`search_text`, `list_files`, `find_references` through `dir`) also take the
+absolute or `~/` path of a dependency source. They look under these
+directories, when they exist:
+- `~/.cargo/registry/src`, `~/.cargo/git/checkouts` (`CARGO_HOME`)
+- `~/.rustup/toolchains` (`RUSTUP_HOME`)
+- the Go module cache (`GOMODCACHE`, `GOPATH`)
+- `/usr/include`, `/usr/local/include`
+- `node_modules` and the `python3*` directories in `/usr/lib` and
+  `/usr/local/lib`, and the `python3*` directories in `~/.local/lib`
+
+`ASTLENS_LIBRARY_PATHS` adds more directories, separated like `PATH`. The tools
+that write stay inside the workspace.
+
 ## Build from source
 
 This needs Rust 1.90 or later. Use it on platforms without a prebuilt binary,
