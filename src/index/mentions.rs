@@ -40,7 +40,12 @@ pub fn member_hash(h: u32) -> u32 {
 /// imports: the hash of `stem/`, which no token has, so a module named like
 /// one of its exports, `red` in `red.ts`, is told apart from it.
 pub fn import_hash(stem: &str) -> u32 {
-    (hash(stem) ^ u32::from(b'/')).wrapping_mul(0x0100_0193)
+    import_hash_of(hash(stem))
+}
+
+/// The [`import_hash`] of a stem whose [`hash`] is `h`.
+pub fn import_hash_of(h: u32) -> u32 {
+    (h ^ u32::from(b'/')).wrapping_mul(0x0100_0193)
 }
 
 /// Hash of the [`module_stem`] of a relative path, `./a/state`, a
@@ -162,6 +167,132 @@ fn is_member_access(lang: Lang, before: &[u8]) -> bool {
     }
 }
 
+/// Hash of a name with hash `name` qualified by a token with hash `owner`,
+/// `owner.name`, as a Go file names what another package exports and a
+/// Python file what a module defines; a Python `from owner import name`
+/// counts once too. It differs from every hash of a single name.
+pub fn qualified_hash(owner: u32, name: u32) -> u32 {
+    (owner.rotate_left(13) ^ name ^ u32::from(b':')).wrapping_mul(0x0100_0193)
+}
+
+/// The identifier right before the `.` that ends `before`, `a` in `a.b`.
+fn qualifier(before: &[u8]) -> Option<&[u8]> {
+    let rest = before.strip_suffix(b".")?;
+    let start = rest
+        .iter()
+        .rposition(|&b| !(b.is_ascii_alphanumeric() || b == b'_'))
+        .map_or(0, |i| i + 1);
+    let ident = &rest[start..];
+    ident
+        .first()
+        .is_some_and(|b| !b.is_ascii_digit())
+        .then_some(ident)
+}
+
+/// The name hash a module or package is imported under: the module's own
+/// for an alias of it, `np` in `import numpy as np`, else the token's.
+fn unaliased(token: u32, aliases: &[(u32, u32)]) -> u32 {
+    aliases
+        .iter()
+        .find(|&&(alias, _)| alias == token)
+        .map_or(token, |&(_, name)| name)
+}
+
+/// What the Python imports of `source` name: the [`import_hash`] of each
+/// part of each module path and of each name imported from one, which may
+/// be a module, and the [`qualified_hash`] of each `from m import a` (of
+/// `a.b.m`, its last part, and `*` for all names), pushed on `out`, and the (alias, name) hashes of each
+/// `import a.m as n` and `from a import m as n`, pushed on `aliases`.
+fn python_imports(source: &str, out: &mut Vec<u32>, aliases: &mut Vec<(u32, u32)>) {
+    let mut lines = source.lines();
+    while let Some(line) = lines.next() {
+        let line = line.split('#').next().unwrap_or(line).trim();
+        if let Some(rest) = line.strip_prefix("from ") {
+            let Some((module, names)) = rest.split_once(" import ") else {
+                continue;
+            };
+            let module = module.trim();
+            out.extend(module.split('.').filter(|m| !m.is_empty()).map(import_hash));
+            let module = module.rsplit('.').next().unwrap_or("");
+            let mut names = names.trim().to_string();
+            if let Some(open) = names.strip_prefix('(') {
+                names = open.to_string();
+                while !names.contains(')') {
+                    let Some(next) = lines.next() else { break };
+                    names.push(',');
+                    names.push_str(next.split('#').next().unwrap_or(next));
+                }
+            }
+            let names = names.split(')').next().unwrap_or("");
+            for item in names.split(',') {
+                let mut words = item.split_whitespace();
+                let Some(name) = words.next() else { continue };
+                out.push(import_hash(name));
+                if !module.is_empty() {
+                    out.push(qualified_hash(hash(module), hash(name)));
+                }
+                if words.next() == Some("as")
+                    && let Some(alias) = words.next()
+                {
+                    aliases.push((hash(alias), hash(name)));
+                }
+            }
+        } else if let Some(rest) = line.strip_prefix("import ") {
+            for item in rest.split(',') {
+                let mut words = item.split_whitespace();
+                let Some(path) = words.next() else { continue };
+                out.extend(path.split('.').map(import_hash));
+                if words.next() == Some("as")
+                    && let Some(alias) = words.next()
+                {
+                    let module = path.rsplit('.').next().unwrap_or(path);
+                    aliases.push((hash(alias), hash(module)));
+                }
+            }
+        }
+    }
+}
+
+/// The (alias, package name) hashes of the Go imports of `source` that name
+/// their package, `foo "a/b"`, the name being the last part of the path
+/// not a major version, `b` for `a/b/v2`.
+fn go_aliases(source: &str, aliases: &mut Vec<(u32, u32)>) {
+    let mut block = false;
+    for line in source.lines() {
+        let line = line.trim();
+        let spec = if block {
+            if line.starts_with(')') {
+                block = false;
+                continue;
+            }
+            line
+        } else if let Some(rest) = line.strip_prefix("import") {
+            let rest = rest.trim_start();
+            if rest.starts_with('(') {
+                block = true;
+                continue;
+            }
+            rest
+        } else {
+            continue;
+        };
+        let Some((alias, path)) = spec.split_once(char::is_whitespace) else {
+            continue;
+        };
+        let path = path.trim().trim_matches('"');
+        if alias == "_" || alias == "." || !is_token(alias) {
+            continue;
+        }
+        let is_version = |part: &str| {
+            part.strip_prefix('v')
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        };
+        if let Some(name) = path.rsplit('/').find(|part| !is_version(part)) {
+            aliases.push((hash(alias), hash(name)));
+        }
+    }
+}
+
 /// Whether `name` is a whole identifier token, as the tokens of
 /// [`Mentions::of`] are. Only such a name can be looked up in them.
 pub fn is_token(name: &str) -> bool {
@@ -279,7 +410,10 @@ impl Mentions {
     /// module), or after `->` or a path through a type ([`is_member_access`]),
     /// also counts as [`member_hash`]. Java, C# and GDScript have no free
     /// functions, so they leave that out. The name of a Go file's `package`
-    /// clause is no mention. A JavaScript or TypeScript file mentions the
+    /// clause is no mention. In Go and Python, a token right after `name.`
+    /// also counts as the [`qualified_hash`] of the two, `name` being
+    /// unaliased as the imports say, and a Python file mentions that of
+    /// each name it imports from a module. A JavaScript or TypeScript file mentions the
     /// [`import_hash`] of the stem of each path it imports, or for a
     /// relative path the [`relative_hash`] of its stem and the
     /// [`import_hash`] of its [`relative_path`], or for a package the
@@ -291,8 +425,15 @@ impl Mentions {
         let go = parsed.lang == Lang::Go;
         let c = parsed.lang == Lang::C;
         let members = tracks_members(parsed.lang);
+        let qualifies = matches!(parsed.lang, Lang::Go | Lang::Python);
         let bytes = source.as_bytes();
         let mut all: Vec<u32> = Vec::with_capacity(parsed.idents.len());
+        let mut aliases = Vec::new();
+        match parsed.lang {
+            Lang::Python => python_imports(source, &mut all, &mut aliases),
+            Lang::Go => go_aliases(source, &mut aliases),
+            _ => {}
+        }
         for &start in &parsed.idents {
             let start = start as usize;
             let Some(token) = token_at(source, start) else {
@@ -301,7 +442,14 @@ impl Mentions {
             if go && is_package_clause(&bytes[..start]) {
                 continue;
             }
-            all.push(hash(token));
+            let h = hash(token);
+            all.push(h);
+            if qualifies
+                && let Some(owner) = qualifier(&bytes[..start])
+                && let Ok(owner) = std::str::from_utf8(owner)
+            {
+                all.push(qualified_hash(unaliased(hash(owner), &aliases), h));
+            }
             if rust {
                 let after = &bytes[start + token.len()..];
                 if after.first() == Some(&b'!') && after.get(1) != Some(&b'=') {
@@ -574,14 +722,56 @@ mod tests {
             assert!(m.contains(package_hash(package)), "{package}");
         }
         // Only JavaScript and TypeScript import by path.
-        let python = mentions("a.py", "from strings import x\ny = 'from ./strings'\n");
+        let python = mentions("a.py", "y = 'from ./strings'\n");
         assert!(!python.contains(import_hash("strings")));
+        assert!(!python.contains(relative_hash("strings")));
         assert_eq!(module_stem("a/strings.test.ts"), Some("strings"));
         assert_eq!(module_stem("a/index.ts"), Some("a"));
         assert_eq!(module_stem("./dir/"), Some("dir"));
         assert_eq!(module_stem("index.ts"), None);
         assert_eq!(module_stem("lodash-es"), Some("lodash-es"));
         assert_eq!(module_stem("../"), None);
+    }
+
+    #[test]
+    fn go_and_python_names_are_qualified_by_their_package() {
+        let q = |owner: &str, name: &str| qualified_hash(hash(owner), hash(name));
+        let go = mentions(
+            "a.go",
+            "package a\n\nimport (\n\tstr \"strings\"\n\t\"math/rand/v2\"\n\tr2 \"math/rand/v2\"\n)\n\
+             import u \"unsafe\"\n\nfunc f() { str.Contains(x, y); rand.N(3); r2.Int(); u.Sizeof(x); x.y.Z() }\n",
+        );
+        for (owner, name) in [
+            ("strings", "Contains"),
+            ("rand", "N"),
+            ("rand", "Int"),
+            ("unsafe", "Sizeof"),
+            ("y", "Z"),
+        ] {
+            assert!(go.contains(q(owner, name)), "{owner}.{name}");
+        }
+        assert!(!go.contains(q("str", "Contains")), "unaliased");
+        let py = mentions(
+            "a.py",
+            "import os.path as osp\nfrom types import GenericAlias\nfrom .shape import (\n    Circle,  # c\n    Square as Sq,\n)\n\
+             from . import parser\nfrom typing import *\nimport numpy as np\n\
+             def f():\n    osp.join(a)\n    np.array(b)\n    parser.parse_args()\n",
+        );
+        for (owner, name) in [
+            ("types", "GenericAlias"),
+            ("shape", "Circle"),
+            ("shape", "Square"),
+            ("typing", "*"),
+            ("path", "join"),
+            ("numpy", "array"),
+            ("parser", "parse_args"),
+        ] {
+            assert!(py.contains(q(owner, name)), "{owner}.{name}");
+        }
+        assert!(!py.contains(q("shape", "Sq")));
+        // Other languages qualify nothing.
+        let js = mentions("a.js", "strings.Contains(x);\n");
+        assert!(!js.contains(q("strings", "Contains")));
     }
 
     #[test]

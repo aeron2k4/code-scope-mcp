@@ -451,8 +451,10 @@ const NEAREST_OF: usize = 64;
 /// by a name they all define, as an index into them: the one sharing the
 /// most directories with it, as a vendored copy of a library is used by the
 /// code around it; [`ALL`] when several share as many, or there are too many
-/// to tell.
-fn nearest(definers: &[u32], paths: &[String], path: &str) -> u32 {
+/// to tell. With `alternates`, tied definers in one directory are builds of
+/// one name for different platforms, and the most common build stands for
+/// them (see [`build_rank`]).
+fn nearest(definers: &[u32], paths: &[String], path: &str, alternates: bool) -> u32 {
     if definers.len() < 2 || definers.len() > NEAREST_OF {
         return ALL;
     }
@@ -469,10 +471,57 @@ fn nearest(definers: &[u32], paths: &[String], path: &str) -> u32 {
             }
         }
     }
-    match best {
-        Some((_, k)) if !tied => k,
-        _ => ALL,
+    let Some((most, k)) = best else {
+        return ALL;
+    };
+    if !tied {
+        return k;
     }
+    if !alternates {
+        return ALL;
+    }
+    let dir = |d: u32| {
+        paths[d as usize]
+            .rsplit_once('/')
+            .map_or("", |(dir, _)| dir)
+    };
+    let near: Vec<(u32, &str)> = (0u32..)
+        .zip(definers)
+        .filter(|&(_, &d)| shared_dirs(&paths[d as usize], path) == most)
+        .map(|(k, &d)| (k, paths[d as usize].as_str()))
+        .collect();
+    let first_dir = dir(definers[near[0].0 as usize]);
+    if near
+        .iter()
+        .any(|&(k, _)| dir(definers[k as usize]) != first_dir)
+    {
+        return ALL;
+    }
+    near.iter()
+        .min_by_key(|&&(k, p)| (build_rank(p), k))
+        .map_or(ALL, |&(k, _)| k)
+}
+
+/// How rarely the file at `path` is built, by the platform words in its
+/// name: 0 for a file built everywhere or on the most common platforms
+/// (`os.go`, `os_unix.go`, `os_linux_amd64.go`), more for each other one
+/// (`os_plan9.go`, `os_js.go`) and for a fallback (`cpu_no_name.go`).
+fn build_rank(path: &str) -> usize {
+    const COMMON: &[&str] = &[
+        "unix", "linux", "amd64", "x86", "x86_64", "64bit", "generic",
+    ];
+    let file = path.rsplit('/').next().unwrap_or(path);
+    let stem = file.split('.').next().unwrap_or(file);
+    stem.split('_')
+        .skip(1)
+        .filter(|w| !w.is_empty() && !COMMON.contains(w))
+        .count()
+}
+
+/// Whether files of `lang` in one directory define a name in turn, one for
+/// each platform or build: Go by build constraints, Rust by `cfg`.
+fn has_alternates(lang: Option<Lang>) -> bool {
+    matches!(lang, Some(Lang::Go | Lang::Rust))
 }
 
 /// The [`mentions::relative_path`] a file at `from` imports the file at `to`
@@ -551,7 +600,27 @@ fn uses_of(
         };
     }
     if owner == unit.module_owner() {
-        if !unit.is_used_by(mentions, own, path) {
+        // Outside its Go package, a definition is named with the package,
+        // `pkg.Name`; a Python one with its module, or imported from it.
+        let qualified = match unit.lang {
+            Some(Lang::Go) => !unit.scope.reaches(path),
+            Some(Lang::Python) => true,
+            _ => false,
+        };
+        if qualified {
+            let named = mentions.count(mentions::qualified_hash(unit.module, h));
+            let all = unit.lang == Some(Lang::Python)
+                && mentions.contains(mentions::qualified_hash(unit.module, mentions::hash("*")));
+            // (A Python value may share its name with a module, `parser`.)
+            let imported = unit.lang == Some(Lang::Go)
+                || mentions.contains(mentions::import_hash_of(unit.module));
+            if (named == 0 && !all) || !imported {
+                return (0, 1.0);
+            }
+            if unit.lang == Some(Lang::Go) {
+                return (uses.min(named), 1.0);
+            }
+        } else if !unit.is_used_by(mentions, own, path) {
             return (0, 1.0);
         }
         // `copy.copy(x)` names the module of `copy` as well as it, while
@@ -1084,7 +1153,7 @@ impl Graph {
                             let near = if used == 1 && defs.len() > 1 && checked.len() > 1 {
                                 only
                             } else {
-                                nearest(defs, paths, path)
+                                nearest(defs, paths, path, has_alternates(first.lang))
                             };
                             let w = term_weight(uses) * multiplier[id] * factor;
                             found_here.push(((id as u32, w as f32, near), factor == 1.0));
@@ -2058,6 +2127,82 @@ mod tests {
         assert!(to(20).is_empty(), "a method not called on a value");
         assert!(to(22).is_empty(), "a method of some value");
         assert_eq!(to(23), only("py/copy.py"), "named with its module");
+    }
+
+    #[test]
+    fn a_package_or_module_names_what_it_defines() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = [
+            (
+                "go/unsafe/unsafe.go",
+                "package unsafe\n\nfunc String() {}\n",
+            ),
+            (
+                "go/a/a.go",
+                "package a\n\nimport \"unsafe\"\n\nfunc f() { unsafe.Pointer(x); x.String() }\n",
+            ),
+            (
+                "go/b/b.go",
+                "package b\n\nimport u \"unsafe\"\n\nfunc f() { u.String(p) }\n",
+            ),
+            ("py/types.py", "GenericAlias = type(list[int])\n"),
+            ("py/os.py", "GenericAlias = type(list[int])\n"),
+            (
+                "py/user.py",
+                "import os\nfrom types import GenericAlias\nx = GenericAlias\n",
+            ),
+            ("py/parser.py", "def parse_args():\n    pass\n"),
+            (
+                "py/cli.py",
+                "import argparse\nparser = argparse.ArgumentParser()\nparser.parse_args()\n",
+            ),
+            ("py/star.py", "from parser import *\nparse_args()\n"),
+        ];
+        let (graph, _) = graph_of(dir.path(), &files);
+        let only = |path: &str| BTreeSet::from([path.to_string()]);
+        assert!(
+            targets(&graph, &files, 1).is_empty(),
+            "a method, not the package's"
+        );
+        assert_eq!(targets(&graph, &files, 2), only("go/unsafe/unsafe.go"));
+        assert_eq!(targets(&graph, &files, 5), only("py/types.py"));
+        assert!(
+            targets(&graph, &files, 7).is_empty(),
+            "a variable named parser"
+        );
+        assert_eq!(targets(&graph, &files, 8), only("py/parser.py"));
+    }
+
+    #[test]
+    fn build_alternatives_take_one_definition() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = [
+            (
+                "syscall/syscall_js.go",
+                "package syscall\n\ntype Errno uintptr\n",
+            ),
+            (
+                "syscall/syscall_unix.go",
+                "package syscall\n\ntype Errno uintptr\n",
+            ),
+            (
+                "syscall/syscall_windows.go",
+                "package syscall\n\ntype Errno uintptr\n",
+            ),
+            (
+                "os/error.go",
+                "package os\n\nimport \"syscall\"\n\nvar e syscall.Errno\n",
+            ),
+        ];
+        let (graph, _) = graph_of(dir.path(), &files);
+        let to = targets(&graph, &files, 3);
+        assert_eq!(
+            to.into_iter().collect::<Vec<_>>(),
+            ["syscall/syscall_unix.go"],
+            "the common build"
+        );
+        assert_eq!(build_rank("syscall/syscall_unix.go"), 0);
+        assert_eq!(build_rank("internal/cpu/cpu_no_name.go"), 2);
     }
 
     #[test]

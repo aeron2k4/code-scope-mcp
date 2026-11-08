@@ -112,7 +112,17 @@ impl SymbolNames {
                 }
                 open.push(s);
                 let (name, name_len) = push(&s.name);
-                let (parent, parent_len) = s.parent.as_deref().map_or((NONE, 0), &mut push);
+                let receiver = match (lang, s.kind) {
+                    (Some(Lang::Go), SymbolKind::Method) if s.parent.is_none() => {
+                        go_receiver(&s.signature)
+                    }
+                    _ => None,
+                };
+                let (parent, parent_len) = s
+                    .parent
+                    .as_deref()
+                    .or(receiver)
+                    .map_or((NONE, 0), &mut push);
                 NameRef {
                     name,
                     name_len,
@@ -404,6 +414,24 @@ fn go_package(source: &str) -> Option<&str> {
     })
 }
 
+/// The type of the receiver of a Go method from its `signature`, `T` in
+/// `func (t *T[K]) name()`.
+fn go_receiver(signature: &str) -> Option<&str> {
+    let rest = signature
+        .strip_prefix("func")?
+        .trim_start()
+        .strip_prefix('(')?;
+    let receiver = rest[..rest.find(')')?].trim();
+    // A receiver with no name, `(Pair[K, V])`, starts with its type.
+    let ty = match receiver.split_once(char::is_whitespace) {
+        Some((name, ty)) if !name.contains(['[', '*']) => ty.trim_start(),
+        _ => receiver,
+    }
+    .trim_start_matches('*');
+    let ty = ty.split('[').next().unwrap_or(ty);
+    mentions::is_token(ty).then_some(ty)
+}
+
 /// The name of the package in the first `declare module 'name'` at the
 /// start of a line of `source`.
 fn ambient_module(source: &str) -> Option<&str> {
@@ -692,6 +720,16 @@ mod tests {
         );
         assert_eq!(names.package(), Some(mentions::hash("p_q")));
         assert_eq!(names_of("a.rs", "fn f() {}\n").package(), None);
+    }
+
+    #[test]
+    fn a_go_method_belongs_to_its_receiver() {
+        let names = names_of(
+            "a.go",
+            "package p\n\nfunc (l *logWriter) byte(x byte) {}\nfunc (Pair[K, V]) Key() K {}\nfunc (*T) M() {}\nfunc F() {}\n",
+        );
+        let parents: Vec<_> = (0..names.len()).map(|s| names.parent(s)).collect();
+        assert_eq!(parents, [Some("logWriter"), Some("Pair"), Some("T"), None]);
     }
 
     #[test]
