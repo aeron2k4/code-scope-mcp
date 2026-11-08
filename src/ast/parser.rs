@@ -540,6 +540,42 @@ pub fn parse_path(path: &Path, source: &str) -> Result<ParsedFile, ParseError> {
     Ok(if better { cpp } else { parsed })
 }
 
+/// Where the first syntax error in `source` is, as tree-sitter sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyntaxError {
+    /// 1-based line.
+    pub line: usize,
+    /// The token tree-sitter had to make up, for a missing one, such as `}`.
+    pub missing: Option<String>,
+}
+
+/// The first ERROR or MISSING node of `source` parsed as `lang`, in source
+/// order, or None when it parses cleanly.
+pub fn first_syntax_error(lang: Lang, source: &str) -> Option<SyntaxError> {
+    let mut parser = Parser::new();
+    parser.set_language(&lang.grammar()).ok()?;
+    let tree = parser.parse(source, None)?;
+    let mut cursor = tree.walk();
+    loop {
+        let node = cursor.node();
+        if node.is_error() || node.is_missing() {
+            return Some(SyntaxError {
+                line: node.start_position().row + 1,
+                missing: node.is_missing().then(|| node.kind().to_string()),
+            });
+        }
+        // Only a subtree holding an error is worth entering.
+        if node.has_error() && cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return None;
+            }
+        }
+    }
+}
+
 /// Time allowed for the symbol query on one file. Ordinary files need far less,
 /// even a 2 MB data table about 6 s, but the query is quadratic on some broken
 /// input: 2 MB of `[` would take most of an hour.
@@ -1227,6 +1263,23 @@ macro_rules! m { () => {} }
                 ("App::Handler".into(), SymbolKind::Type),
             ]
         );
+    }
+
+    #[test]
+    fn first_syntax_error_finds_the_earliest() {
+        assert_eq!(first_syntax_error(Lang::Rust, "fn a() {}\n"), None);
+        let err = first_syntax_error(Lang::Rust, "fn a() {}\nfn b() { let = 1; }\nfn c( {}\n");
+        assert_eq!(err.map(|e| e.line), Some(2));
+        let err = first_syntax_error(Lang::Rust, "fn a() {}\nfn c(x: u8 {}\n");
+        assert_eq!(
+            err,
+            Some(SyntaxError {
+                line: 2,
+                missing: Some(")".into()),
+            })
+        );
+        let err = first_syntax_error(Lang::Go, "package p\n\nfunc f() {\n\tx := (1\n}\n");
+        assert_eq!(err.map(|e| e.line), Some(4));
     }
 
     #[test]

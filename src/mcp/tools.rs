@@ -642,7 +642,17 @@ impl Workspace {
     ) -> Result<()> {
         let reparsed = parser::parse_path(path, updated)?;
         if reparsed.has_errors && !original.has_errors {
-            bail!("not written: {} has syntax errors", what());
+            let mut msg = format!("not written: {} has syntax errors", what());
+            if let Some(err) = parser::first_syntax_error(reparsed.lang, updated) {
+                let _ = write!(msg, ", the first at line {}", err.line);
+                if let Some(token) = err.missing {
+                    let _ = write!(msg, " (missing `{token}`)");
+                }
+                if let Some(text) = updated.lines().nth(err.line - 1) {
+                    let _ = write!(msg, ": {}", index::line_excerpt(text, 0));
+                }
+            }
+            bail!(msg);
         }
         write_atomic(path, updated)
             .with_context(|| format!("cannot write {}", self.display(path)))?;
@@ -1904,6 +1914,38 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("syntax errors"), "{err}");
         assert_eq!(fs::read_to_string(&file).unwrap(), "fn a() {}\nfn b() {}\n");
+    }
+
+    #[test]
+    fn syntax_errors_say_where_the_first_one_is() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.rs"), "fn a() {}\n\nfn b() {}\n").unwrap();
+        fs::write(dir.path().join("b.py"), "x = 1\ny = 2\n").unwrap();
+        let ws = Workspace::new(dir.path()).unwrap();
+
+        let err = ws
+            .replace_lines("a.rs", 3, 3, "fn b() {}", "fn b() { let x = 1 }")
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .ends_with("the first at line 3 (missing `;`): fn b() { let x = 1 }"),
+            "{err}"
+        );
+        let err = ws
+            .replace_lines("a.rs", 3, 3, "fn b() {}", "fn b() { let x = 1;")
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .ends_with("the first at line 3: fn b() { let x = 1;"),
+            "{err}"
+        );
+        let err = ws
+            .replace_lines("b.py", 2, 2, "y = 2", "y = = 2")
+            .unwrap_err();
+        assert!(
+            err.to_string().ends_with("the first at line 2: y = = 2"),
+            "{err}"
+        );
     }
 
     #[test]

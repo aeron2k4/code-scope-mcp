@@ -113,7 +113,7 @@ fn enclosing_symbol(symbols: &[Symbol], byte: usize) -> Option<&Symbol> {
 }
 
 /// The trimmed line containing `byte`, cut to [`MAX_EXCERPT_CHARS`].
-fn line_excerpt(source: &str, byte: usize) -> String {
+pub(crate) fn line_excerpt(source: &str, byte: usize) -> String {
     let start = source[..byte].rfind('\n').map_or(0, |i| i + 1);
     let end = source[byte..].find('\n').map_or(source.len(), |i| byte + i);
     let line = source[start..end].trim();
