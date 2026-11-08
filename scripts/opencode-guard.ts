@@ -57,9 +57,21 @@ function rejected(tool: string, input: Record<string, unknown>, cwd: string): st
   }
 }
 
+const ACTION_PREFIX = "astlens_guard_"
+
 export default Plugin.define({
   id: "astlens-guard",
   async setup(ctx) {
+    // Our own permission is always denied, whatever the user's rules say: an
+    // allow rule such as "*" would let the call through, and the default
+    // "ask" would prompt the user on every blocked read.
+    await ctx.permission.hook("evaluate", async (event) => {
+      if (!event.action.startsWith(ACTION_PREFIX)) return
+      event.effect = "deny"
+      const reason = event.metadata?.reason
+      event.message = typeof reason === "string" ? reason : "Blocked by astlens."
+    })
+
     await ctx.tool.hook("execute.before", async (event) => {
       const input =
         typeof event.input === "object" && event.input !== null
@@ -67,16 +79,16 @@ export default Plugin.define({
           : {}
       const reason = rejected(event.tool, input, ctx.location.directory)
       if (!reason) return
-      // V2 leaves a failed call to the agent, which can retry it; asking for
-      // a permission that no rule allows ends the step with the reason, as a
-      // deny rule does. Nothing is saved, so later calls are judged afresh.
+      // V2 leaves a failed call to the agent, which can retry it; a denied
+      // permission ends the step with the reason instead. Nothing is saved,
+      // so later calls are judged afresh.
       await ctx.permission.assert({
         sessionID: event.sessionID,
         agent: event.agent,
         source: { type: "tool", messageID: event.messageID, id: event.id },
-        action: `astlens_guard_${event.tool}`,
+        action: `${ACTION_PREFIX}${event.tool}`,
         resources: ["*"],
-        message: reason,
+        metadata: { reason },
       })
       throw new Error(reason)
     })
