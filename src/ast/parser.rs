@@ -40,10 +40,11 @@ pub enum Lang {
     Cpp,
     Java,
     CSharp,
+    GdScript,
 }
 
 impl Lang {
-    pub const ALL: [Lang; 10] = [
+    pub const ALL: [Lang; 11] = [
         Lang::Rust,
         Lang::Python,
         Lang::JavaScript,
@@ -54,6 +55,7 @@ impl Lang {
         Lang::Cpp,
         Lang::Java,
         Lang::CSharp,
+        Lang::GdScript,
     ];
 
     pub fn from_path(path: &Path) -> Option<Lang> {
@@ -72,6 +74,7 @@ impl Lang {
             }
             "java" => Lang::Java,
             "cs" => Lang::CSharp,
+            "gd" => Lang::GdScript,
             _ => return None,
         })
     }
@@ -90,6 +93,7 @@ impl Lang {
             Lang::Cpp => 7,
             Lang::Java => 8,
             Lang::CSharp => 9,
+            Lang::GdScript => 10,
         }
     }
 
@@ -110,6 +114,7 @@ impl Lang {
             Lang::Cpp => "cpp",
             Lang::Java => "java",
             Lang::CSharp => "csharp",
+            Lang::GdScript => "gdscript",
         }
     }
 
@@ -125,6 +130,7 @@ impl Lang {
             Lang::Cpp => tree_sitter_cpp::LANGUAGE.into(),
             Lang::Java => tree_sitter_java::LANGUAGE.into(),
             Lang::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
+            Lang::GdScript => tree_sitter_gdscript::LANGUAGE.into(),
         }
     }
 
@@ -139,6 +145,7 @@ impl Lang {
             Lang::Cpp => format!("{CPP_QUERY}\n{C_FUNCTION_QUERY}\n{C_TYPE_QUERY}"),
             Lang::Java => JAVA_QUERY.to_string(),
             Lang::CSharp => CSHARP_QUERY.to_string(),
+            Lang::GdScript => GDSCRIPT_QUERY.to_string(),
         }
     }
 
@@ -157,6 +164,17 @@ impl Lang {
         })
     }
 }
+
+/// `class_name` names the file's own class but holds none of its members, so
+/// it is left out. Signals have no kind of their own; their signature shows
+/// `signal`.
+const GDSCRIPT_QUERY: &str = r#"
+(function_definition name: (_) @name) @function
+(class_definition name: (_) @name) @class
+(enum_definition name: (_) @name) @enum
+(const_statement name: (_) @name) @constant
+(signal_statement name: (_) @name) @function
+"#;
 
 const RUST_QUERY: &str = r#"
 (function_item name: (_) @name) @function
@@ -500,15 +518,16 @@ pub fn parse_source(lang: Lang, source: &str) -> Result<ParsedFile, ParseError> 
 }
 
 /// Start bytes of identifier leaves (identifier, type_identifier,
-/// field_identifier, property_identifier, ...), in source order. Comments
-/// and string literals are not identifiers, so they never appear here.
+/// field_identifier, property_identifier, ..., and GDScript's `name` for the
+/// name a definition declares), in source order. Comments and string literals
+/// are not identifiers, so they never appear here.
 fn collect_idents(root: Node<'_>) -> Vec<u32> {
     let mut out = Vec::new();
     let mut cursor = root.walk();
     'walk: loop {
         let node = cursor.node();
         if node.child_count() == 0
-            && node.kind().ends_with("identifier")
+            && (node.kind().ends_with("identifier") || node.kind() == "name")
             && let Ok(start) = u32::try_from(node.start_byte())
         {
             out.push(start);
@@ -623,7 +642,12 @@ fn extract_symbols(
             continue;
         }
         let node = own_declarator(node, name_node);
-        let body = find_body(node).map(|b| (b.start_byte(), b.end_byte()));
+        // GDScript's body begins at the line break after the colon.
+        let body = find_body(node).map(|b| {
+            let text = node_text(b, source);
+            let skipped = text.len() - text.trim_start().len();
+            (b.start_byte() + skipped, b.end_byte())
+        });
         found.push((
             m.pattern_index,
             Symbol {
@@ -836,7 +860,7 @@ fn attached_start(lang: Lang, source: &str, mut start: usize) -> usize {
     /// How far up a multi-line attribute's opening line is looked for.
     const MAX_ATTRIBUTE_LINES: usize = 30;
     let opens = |text: &str| match lang {
-        Lang::Python => text.starts_with('#') || text.starts_with('@'),
+        Lang::Python | Lang::GdScript => text.starts_with('#') || text.starts_with('@'),
         _ => ["//", "/*", "*", "#[", "@", "["]
             .iter()
             .any(|p| text.starts_with(p)),
@@ -944,6 +968,10 @@ mod tests {
         assert_eq!(Lang::from_path(Path::new("x.hpp")), Some(Lang::Cpp));
         assert_eq!(Lang::from_path(Path::new("X.java")), Some(Lang::Java));
         assert_eq!(Lang::from_path(Path::new("X.cs")), Some(Lang::CSharp));
+        assert_eq!(
+            Lang::from_path(Path::new("player.gd")),
+            Some(Lang::GdScript)
+        );
         assert_eq!(Lang::from_path(Path::new("Makefile")), None);
     }
 
@@ -1146,6 +1174,31 @@ macro_rules! m { () => {} }
     }
 
     #[test]
+    fn gdscript_symbols() {
+        let src = "class_name Player\nextends Node2D\n\nsignal hit(damage: int)\nconst SPEED := 300.0\nenum State { IDLE, RUN }\n@export var health := 10\n\n# Moves the player.\n@rpc\nfunc move(delta: float) -> void:\n\tposition.x += SPEED * delta\n\nclass Inventory:\n\tfunc add(item):\n\t\tpass\n";
+        let parsed = parse_source(Lang::GdScript, src).unwrap();
+        assert!(!parsed.has_errors);
+        assert_eq!(
+            names(&parsed),
+            vec![
+                ("hit".into(), SymbolKind::Function),
+                ("SPEED".into(), SymbolKind::Constant),
+                ("State".into(), SymbolKind::Enum),
+                ("move".into(), SymbolKind::Function),
+                ("Inventory".into(), SymbolKind::Class),
+                ("Inventory::add".into(), SymbolKind::Method),
+            ]
+        );
+        let mv = &parsed.symbols[3];
+        assert_eq!(mv.signature, "func move(delta: float) -> void");
+        assert!(mv.body.is_some());
+        assert_eq!(parsed.symbols[0].signature, "signal hit(damage: int)");
+        // The comment and annotation above `move` belong to it.
+        let start = symbol_start(&parsed, src, mv);
+        assert!(src[start..].starts_with("# Moves"), "{:?}", &src[start..]);
+    }
+
+    #[test]
     fn symbol_query_stops_when_out_of_time() {
         let source = format!("function early() {{}}\n{}", "[".repeat(50_000));
         let lang = Lang::JavaScript;
@@ -1229,6 +1282,7 @@ macro_rules! m { () => {} }
                 "class Good { void M() {} }\nclass {\n",
                 "Good",
             ),
+            (Lang::GdScript, "func good():\n\tpass\nfunc (:\n", "good"),
         ];
         for (lang, src, expected) in cases {
             let parsed = parse_source(lang, src).unwrap_or_else(|e| panic!("{}: {e}", lang.name()));
@@ -1295,6 +1349,11 @@ macro_rules! m { () => {} }
                 Lang::CSharp,
                 "class A {\n  // load\n  void load() {}\n  void F() { load(); var s = \"load\"; }\n}\n",
                 vec![3, 4],
+            ),
+            (
+                Lang::GdScript,
+                "# load\nfunc load():\n\tpass\nfunc f():\n\tload()\n\tobj.load()\n\tvar s = \"load\"\n",
+                vec![2, 5, 6],
             ),
         ];
         for (lang, src, expected) in cases {

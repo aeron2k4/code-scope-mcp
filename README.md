@@ -5,7 +5,7 @@ tree-sitter to find symbols and trims file contents to fit a token budget, so
 AI coding agents can explore large codebases without reading whole files.
 
 Supported languages: Rust, Python, JavaScript, TypeScript/TSX, Go, C, C++, Java,
-C#. `.h` headers are parsed as C, or as C++ when C fails.
+C#, GDScript. `.h` headers are parsed as C, or as C++ when C fails.
 
 ## Performance
 

@@ -32,14 +32,14 @@ done < <(jq -j '[.tool_name, .cwd] + (.tool_input | [.command, .workdir, .file_p
 
 # Same list as Lang::from_path, which ignores case: rs becomes [rR][sS]. Not
 # nocasematch, which would also make GREP count as grep.
-EXTS='rs|py|pyi|js|jsx|mjs|cjs|ts|mts|cts|tsx|go|c|h|cc|cpp|cxx|c\+\+|hh|hpp|hxx|h\+\+|ipp|tpp|java|cs'
-for pair in aA cC gG hH iI jJ mM oO pP rR sS tT vV xX yY; do
+EXTS='rs|py|pyi|js|jsx|mjs|cjs|ts|mts|cts|tsx|go|c|h|cc|cpp|cxx|c\+\+|hh|hpp|hxx|h\+\+|ipp|tpp|java|cs|gd'
+for pair in aA cC dD gG hH iI jJ mM oO pP rR sS tT vV xX yY; do
   EXTS=${EXTS//${pair:0:1}/[$pair]}
 done
 CODE_EXT="\\.($EXTS)\$"
 # A glob or extension list naming a source extension: *.rs, *.{ts,tsx}, rs,py
 CODE_GLOB="(^|[.,{])($EXTS)([,}]|\$)"
-CODE_TYPES='^(rust|py|python|js|jsx|ts|tsx|typescript|go|c|cpp|java|cs|csharp)$'
+CODE_TYPES='^(rust|py|python|js|jsx|ts|tsx|typescript|go|c|cpp|java|cs|csharp|gdscript)$'
 
 # Quick checks that spare most commands the word-by-word parse: a search or
 # reader program as a whole word and, for readers, a source path or a glob.

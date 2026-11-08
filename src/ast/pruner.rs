@@ -173,6 +173,7 @@ fn placeholder(lang: Lang, body: &str) -> String {
     let lines = body.lines().count().max(1);
     match lang {
         Lang::Python => format!("...  # {lines} lines elided"),
+        Lang::GdScript => format!("pass  # {lines} lines elided"),
         _ => format!("{{ /* {lines} lines elided */ }}"),
     }
 }
@@ -386,5 +387,19 @@ fn other() {
         let r = prune(Lang::Python, src, &parsed.symbols, &opts);
         assert_eq!(r.strategy, Strategy::ElidedBodies);
         assert_eq!(r.text, "def f():\n    ...  # 4 lines elided\n");
+    }
+
+    #[test]
+    fn gdscript_placeholder_still_parses() {
+        let src = "func f():\n\tvar a = 1\n\tvar b = 2\n\tvar c = 3\n\treturn a + b + c\n";
+        let parsed = parse_source(Lang::GdScript, src).unwrap();
+        let opts = PruneOptions {
+            max_tokens: estimate_tokens(src) - 5,
+            keep: vec![],
+        };
+        let r = prune(Lang::GdScript, src, &parsed.symbols, &opts);
+        assert_eq!(r.strategy, Strategy::ElidedBodies);
+        assert_eq!(r.text, "func f():\n\tpass  # 4 lines elided\n");
+        assert!(!parse_source(Lang::GdScript, &r.text).unwrap().has_errors);
     }
 }

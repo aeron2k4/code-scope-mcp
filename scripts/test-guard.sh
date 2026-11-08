@@ -15,6 +15,7 @@ echo 'int x;' >"$WS/src/x.c++"
 echo 'int y;' >"$WS/src/y.H++"
 echo 'int z;' >"$WS/src/z.ipp"
 echo 'int t;' >"$WS/src/t.tpp"
+echo 'func p():' >"$WS/src/player.GD"
 fail=0
 
 # verdict <tool> <json tool_input>
@@ -42,6 +43,8 @@ expect allow Read '{"file_path": "/etc/x.rs"}' 'Read outside workspace'
 expect deny Read "{\"file_path\": \"$WS/src/UP.RS\"}" 'Read upper-case extension'
 expect deny Read "{\"file_path\": \"$WS/src/x.c++\"}" 'Read .c++'
 expect deny Read "{\"file_path\": \"$WS/src/z.ipp\"}" 'Read .ipp'
+expect deny Read "{\"file_path\": \"$WS/src/player.GD\"}" 'Read .gd'
+expect deny Grep '{"pattern": "x", "type": "gdscript"}' 'Grep gdscript type'
 expect allow Read "{\"file_path\": \"$WS/NOTES.MD\"}" 'Read upper-case non-code'
 expect deny Grep '{"pattern": "x", "glob": "*.RS"}' 'Grep upper-case glob'
 expect deny Grep '{"pattern": "x", "glob": "*.c++"}' 'Grep .c++ glob'
