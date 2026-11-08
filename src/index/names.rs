@@ -51,6 +51,9 @@ pub struct SymbolNames {
     package: Option<u32>,
     /// Whether a JavaScript or TypeScript file is a module, not a script.
     module: bool,
+    /// The [`mentions::package_hash`] of the package a TypeScript script
+    /// declares, `declare module 'vscode' { .. }`.
+    ambient: Option<u32>,
     incomplete: bool,
     mentions: Mentions,
     lang: Option<Lang>,
@@ -128,6 +131,12 @@ impl SymbolNames {
             traits: traits.into_boxed_slice(),
             package: None,
             module: exports.is_some(),
+            ambient: match lang {
+                Some(Lang::TypeScript | Lang::Tsx) if exports.is_none() => {
+                    ambient_module(source).map(mentions::package_hash)
+                }
+                _ => None,
+            },
             incomplete: false,
             mentions: Mentions::default(),
             lang,
@@ -148,6 +157,13 @@ impl SymbolNames {
     /// definitions others import, not a script, whose are global.
     pub fn is_module(&self) -> bool {
         self.module
+    }
+
+    /// The [`mentions::package_hash`] of the package a TypeScript script
+    /// declares with `declare module 'name'` at the start of a line, whose
+    /// declarations are for the files importing it.
+    pub fn ambient(&self) -> Option<u32> {
+        self.ambient
     }
 
     /// For an item of a Rust `impl Trait for Type`, the hash of the
@@ -388,8 +404,33 @@ fn go_package(source: &str) -> Option<&str> {
     })
 }
 
+/// The name of the package in the first `declare module 'name'` at the
+/// start of a line of `source`.
+fn ambient_module(source: &str) -> Option<&str> {
+    source.lines().find_map(|line| {
+        let rest = line.strip_prefix("declare module")?.trim_start();
+        let quote = rest.chars().next().filter(|&c| c == '\'' || c == '"')?;
+        let body = &rest[1..];
+        body.find(quote).map(|end| &body[..end])
+    })
+}
+
+/// Whether `source` is a CommonJS module: it calls `require(...)` or sets
+/// `module.exports` or `exports.name`. Its top-level declarations, like an
+/// ES module's, are its own unless exported.
+fn is_commonjs(source: &str) -> bool {
+    let word_at = |at: usize| {
+        source[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_ident_char(c) && c != '.')
+    };
+    let calls = |key: &str| source.match_indices(key).any(|(at, _)| word_at(at));
+    calls("require(") || calls("module.exports") || calls("exports.")
+}
+
 /// What a JavaScript or TypeScript module exports. A file with an `import`
-/// or `export` at the start of a line is a module, whose top-level
+/// or `export` at the start of a line, or a CommonJS one, is a module, whose top-level
 /// declarations stay in it unless exported; a script's are global.
 struct JsExports<'a> {
     /// The words in `export { a, b as c }` lists and after `export default`.
@@ -403,9 +444,11 @@ impl<'a> JsExports<'a> {
             line.strip_prefix(word)
                 .is_some_and(|rest| rest.starts_with([' ', '{', '*', '\t', '"', '\'']))
         };
-        if !source
-            .lines()
-            .any(|l| starts(l, "import") || starts(l, "export"))
+        let commonjs = is_commonjs(source);
+        if !commonjs
+            && !source
+                .lines()
+                .any(|l| starts(l, "import") || starts(l, "export"))
         {
             return None;
         }
@@ -426,6 +469,25 @@ impl<'a> JsExports<'a> {
                 listed.extend(words(name).next());
             }
             rest = &rest[at + 6..];
+        }
+        if commonjs {
+            // `module.exports = { a, b }`, `module.exports = a`,
+            // `exports.a = ...` and `module.exports.a = ...`.
+            let mut rest = source;
+            while let Some(at) = rest.find("exports") {
+                let after = rest[at + 7..].trim_start();
+                if let Some(value) = after.strip_prefix('=').map(str::trim_start) {
+                    if let Some(list) = value.strip_prefix('{') {
+                        let end = list.find('}').unwrap_or(list.len());
+                        listed.extend(words(&list[..end]));
+                    } else {
+                        listed.extend(words(value).next());
+                    }
+                } else if let Some(member) = after.strip_prefix('.') {
+                    listed.extend(words(member).next());
+                }
+                rest = &rest[at + 7..];
+            }
         }
         listed.sort_unstable();
         listed.dedup();
@@ -599,6 +661,16 @@ mod tests {
             )
             .is_empty()
         );
+        // So are a CommonJS module's, unless exported.
+        let commonjs = "const path = require('path');\nconst root = 1;\nfunction a() {}\n\
+                        function b() {}\nfunction c() {}\nmodule.exports = { a };\n\
+                        exports.b = b;\n";
+        assert_eq!(private("a.js", commonjs), ["root", "c"]);
+        let single = "const fs = require('fs');\nconst v = 1;\nfunction main() {}\n\
+                      module.exports = main;\n";
+        assert_eq!(private("b.js", single), ["v"]);
+        // `x.require(...)` is no CommonJS call.
+        assert!(private("c.js", "var v = loader.require('x');\n").is_empty());
     }
 
     #[test]

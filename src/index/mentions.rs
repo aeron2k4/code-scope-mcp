@@ -43,6 +43,58 @@ pub fn import_hash(stem: &str) -> u32 {
     (hash(stem) ^ u32::from(b'/')).wrapping_mul(0x0100_0193)
 }
 
+/// Hash of the [`module_stem`] of a relative path, `./a/state`, a
+/// JavaScript or TypeScript file imports, recorded with the
+/// [`import_hash`] of the whole [`relative_path`] in place of the stem's
+/// own: which `state.ts` such a path names depends on the importing file's
+/// directory. It is the hash of `stem~`, which no token has.
+pub fn relative_hash(stem: &str) -> u32 {
+    (hash(stem) ^ u32::from(b'~')).wrapping_mul(0x0100_0193)
+}
+
+/// The canonical form of a relative import path given by its `/`-separated
+/// `parts`: `.` and `name/..` resolved, the extensions of the last part and
+/// a last `index` dropped, as `./a/state` or `../state` (`./` for the
+/// directory itself), so that `./a/../state.js` and `./state` are one.
+pub fn relative_path<'a>(parts: impl IntoIterator<Item = &'a str>) -> String {
+    let mut stack: Vec<&str> = Vec::new();
+    for part in parts {
+        match part {
+            "" | "." => {}
+            ".." if stack.last().is_some_and(|&last| last != "..") => {
+                stack.pop();
+            }
+            part => stack.push(part),
+        }
+    }
+    if let Some(last) = stack.last_mut()
+        && *last != ".."
+    {
+        *last = last.split('.').next().unwrap_or(last);
+    }
+    if stack.last() == Some(&"index") {
+        stack.pop();
+    }
+    let joined = stack.join("/");
+    if stack.first() == Some(&"..") {
+        joined
+    } else {
+        format!("./{joined}")
+    }
+}
+
+/// Hash of the name of a package, `vscode` or `node:path`, a JavaScript or
+/// TypeScript file imports, which a declaration file may declare in
+/// `declare module 'vscode'`. It is the hash of `name@`, which no token has.
+pub fn package_hash(name: &str) -> u32 {
+    (hash(name) ^ u32::from(b'@')).wrapping_mul(0x0100_0193)
+}
+
+/// Whether an import path is relative to the importing file, `./x` or `../x`.
+fn is_relative(path: &str) -> bool {
+    path == "." || path == ".." || path.starts_with("./") || path.starts_with("../")
+}
+
 /// Hash of a C `struct`, `union` or `enum` tag `name` written after its
 /// keyword, `struct name`, recorded beside the token's own: tags have a
 /// namespace of their own, so a variable or field `name` is no use of one.
@@ -142,11 +194,10 @@ pub fn module_stem(path: &str) -> Option<&str> {
     (!stem.is_empty()).then_some(stem)
 }
 
-/// The [`module_stem`]s of the paths a JavaScript or TypeScript file imports
-/// in `from '...'`, `import '...'`, `import('...')` and `require('...')`.
+/// The paths a JavaScript or TypeScript file imports in `from '...'`, `import '...'`, `import('...')` and `require('...')`.
 /// They are strings, which hold no mentions, yet they name the modules whose
 /// exports the file uses.
-fn imported_modules(source: &str) -> Vec<&str> {
+fn imported_paths(source: &str) -> Vec<&str> {
     let mut out = Vec::new();
     for line in source.lines() {
         for key in ["from", "import", "require"] {
@@ -170,12 +221,21 @@ fn imported_modules(source: &str) -> Vec<&str> {
                 if let Some(end) = body.find(quote)
                     && word_start
                 {
-                    out.extend(module_stem(&body[..end]));
+                    out.push(&body[..end]);
                 }
             }
         }
     }
     out
+}
+
+/// Whether an import path names a package or a builtin module, `lodash`,
+/// `@scope/name` or `node:path`, rather than a file of the tree: the stem of
+/// `import * as path from 'path'` is no use of a `path.ts` of its own.
+fn names_a_package(path: &str) -> bool {
+    let slashes = path.matches('/').count();
+    !is_relative(path)
+        && (path.contains(':') || slashes == 0 || (path.starts_with('@') && slashes == 1))
 }
 
 /// The stems of the headers a C or C++ file includes, `list` for
@@ -220,7 +280,10 @@ impl Mentions {
     /// also counts as [`member_hash`]. Java, C# and GDScript have no free
     /// functions, so they leave that out. The name of a Go file's `package`
     /// clause is no mention. A JavaScript or TypeScript file mentions the
-    /// [`import_hash`] of each path it imports, and a C or C++ file that of
+    /// [`import_hash`] of the stem of each path it imports, or for a
+    /// relative path the [`relative_hash`] of its stem and the
+    /// [`import_hash`] of its [`relative_path`], or for a package the
+    /// [`package_hash`] of its name, and a C or C++ file that of
     /// each header it includes. In C, a token after `struct`, `union` or
     /// `enum` also counts as [`tag_hash`].
     pub fn of(parsed: &ParsedFile, source: &str) -> Self {
@@ -253,7 +316,21 @@ impl Mentions {
             }
         }
         if matches!(parsed.lang, Lang::JavaScript | Lang::TypeScript | Lang::Tsx) {
-            all.extend(imported_modules(source).into_iter().map(import_hash));
+            for path in imported_paths(source) {
+                if names_a_package(path) {
+                    all.push(package_hash(path));
+                    continue;
+                }
+                let Some(stem) = module_stem(path) else {
+                    continue;
+                };
+                if is_relative(path) {
+                    all.push(relative_hash(stem));
+                    all.push(import_hash(&relative_path(path.split('/'))));
+                } else {
+                    all.push(import_hash(stem));
+                }
+            }
         }
         if matches!(parsed.lang, Lang::C | Lang::Cpp) {
             all.extend(included_headers(source).into_iter().map(import_hash));
@@ -465,16 +542,37 @@ mod tests {
         let m = mentions(
             "a.ts",
             "import { a } from './util/strings.js';\nimport '../polyfill';\n\
-             import {\n  b,\n} from \"vs/base/index\";\nconst c = require('lodash');\n\
+             import {\n  b,\n} from \"vs/base/index\";\nconst c = require('lodash/fp');\n\
              const d = await import(`./lazy`);\nconst e = 'from ./not_a_module';\n\
-             const g = transform('./skipped');\n",
+             const g = transform('./skipped');\nimport * as path from 'path';\n\
+             import * as os from 'node:os';\nimport { x } from '@scope/pkg';\n",
         );
-        for name in ["strings", "polyfill", "base", "lodash", "lazy"] {
+        for name in ["base", "fp"] {
             assert!(m.contains(import_hash(name)), "{name}");
         }
+        // A relative path names one file, by where the importer is.
+        for (stem, path) in [
+            ("strings", "./util/strings"),
+            ("polyfill", "../polyfill"),
+            ("lazy", "./lazy"),
+        ] {
+            assert!(m.contains(relative_hash(stem)), "{stem}");
+            assert!(!m.contains(import_hash(stem)), "{stem}");
+            assert!(m.contains(import_hash(path)), "{path}");
+        }
         assert!(!m.contains(hash("strings")), "no token");
-        assert!(!m.contains(import_hash("skipped")));
-        assert!(!m.contains(import_hash("not_a_module")));
+        assert!(!m.contains(relative_hash("skipped")));
+        assert!(!m.contains(relative_hash("not_a_module")));
+        assert_eq!(relative_path("./a/../state.js".split('/')), "./state");
+        assert_eq!(relative_path("../../x/index.ts".split('/')), "../../x");
+        assert_eq!(relative_path(".".split('/')), "./");
+        assert_eq!(relative_path("..".split('/')), "..");
+        for package in ["path", "os", "pkg"] {
+            assert!(!m.contains(import_hash(package)), "{package}");
+        }
+        for package in ["path", "node:os", "@scope/pkg"] {
+            assert!(m.contains(package_hash(package)), "{package}");
+        }
         // Only JavaScript and TypeScript import by path.
         let python = mentions("a.py", "from strings import x\ny = 'from ./strings'\n");
         assert!(!python.contains(import_hash("strings")));

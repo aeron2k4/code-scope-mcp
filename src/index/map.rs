@@ -475,6 +475,23 @@ fn nearest(definers: &[u32], paths: &[String], path: &str) -> u32 {
     }
 }
 
+/// The [`mentions::relative_path`] a file at `from` imports the file at `to`
+/// by.
+fn import_path(from: &str, to: &str) -> String {
+    let dir: Vec<&str> = from
+        .rsplit_once('/')
+        .map_or(Vec::new(), |(dir, _)| dir.split('/').collect());
+    let target: Vec<&str> = to.split('/').collect();
+    let shared = dir
+        .iter()
+        .zip(&target)
+        .take_while(|(a, b)| a == b)
+        .count()
+        .min(target.len() - 1);
+    let ups = std::iter::repeat_n("..", dir.len() - shared);
+    mentions::relative_path(ups.chain(target[shared..].iter().copied()))
+}
+
 /// How many leading directories the paths `a` and `b` share.
 fn shared_dirs(a: &str, b: &str) -> usize {
     a.bytes()
@@ -486,9 +503,11 @@ fn shared_dirs(a: &str, b: &str) -> usize {
 
 /// How many of the `uses` of name `h` (mentions besides the file's own
 /// definitions of it, at `path`, whose mentions are `mentions`) are uses of
-/// the definitions of `unit` owned by `owner`, and a factor on their weight.
+/// the definitions owned by `owner` of `unit`, the file at `own`, and a
+/// factor on their weight.
 fn uses_of(
-    unit: &Unit,
+    (unit, own): (&Unit, &str),
+    user: &Unit,
     mentions: &Mentions,
     path: &str,
     h: u32,
@@ -514,10 +533,11 @@ fn uses_of(
         }
         // A JavaScript module's export is used by importing the module by
         // its path, also as `module.name`. A global of a script needs no
-        // import, yet counts less without one.
-        return if mentions.contains(unit.module) {
+        // import, yet counts less without one, and a module sees only those
+        // a declaration file declares.
+        return if unit.imported_by(mentions, own, path) {
             (uses, 1.0)
-        } else if unit.js_module {
+        } else if unit.js_module || ((user.js_module || user.declaration) && !unit.declaration) {
             (0, 1.0)
         } else {
             (
@@ -531,7 +551,7 @@ fn uses_of(
         };
     }
     if owner == unit.module_owner() {
-        if !unit.is_used_by(mentions, path) {
+        if !unit.is_used_by(mentions, own, path) {
             return (0, 1.0);
         }
         // `copy.copy(x)` names the module of `copy` as well as it, while
@@ -587,6 +607,26 @@ fn include_root(dir: &str) -> String {
     parts[..end].iter().map(|p| format!("{p}/")).collect()
 }
 
+/// Whether `path` is that of a TypeScript declaration file.
+fn is_declaration(path: &str) -> bool {
+    [".d.ts", ".d.mts", ".d.cts"]
+        .iter()
+        .any(|ext| path.ends_with(ext))
+}
+
+/// The prefix of the files a declaration file in `dir` declares globals for,
+/// those of the project holding its `typings`, `types` or `@types` directory
+/// (`ext/src/` for `ext/src/typings`), or `None` outside such a directory.
+fn typings_root(dir: &str) -> Option<String> {
+    let parts: Vec<&str> = dir.split('/').filter(|p| !p.is_empty()).collect();
+    let end = parts.iter().rposition(|p| {
+        ["typings", "types", "@types"]
+            .iter()
+            .any(|t| p.eq_ignore_ascii_case(t))
+    })?;
+    Some(parts[..end].iter().map(|p| format!("{p}/")).collect())
+}
+
 fn is_public(scope: u32) -> bool {
     scope < PUBLIC_END
 }
@@ -636,12 +676,47 @@ struct Unit {
     /// For a C or C++ header, the [`mentions::import_hash`] of its stem,
     /// which the files including it mention; [`NO_OWNER`] for other files.
     header: u32,
+    /// For a JavaScript module, the [`mentions::relative_hash`] of its stem,
+    /// which the files importing it by a relative path mention;
+    /// [`NO_OWNER`] for other files.
+    relative: u32,
+    /// Whether it is a TypeScript declaration file, `x.d.ts`, whose globals
+    /// are declared for modules too.
+    declaration: bool,
+    /// Whether its public definitions reach only its `scope`, as those of a
+    /// header or of a declaration file in a `typings` directory do.
+    confined: bool,
 }
 
 impl Unit {
     fn of(n: &SymbolNames, path: &str) -> Self {
         let lang = n.lang();
-        let scope = Scope::of(lang, path);
+        let (dir, file) = path.rsplit_once('/').unwrap_or(("", path));
+        let js = matches!(lang, Some(Lang::JavaScript | Lang::TypeScript | Lang::Tsx));
+        let declaration = js && is_declaration(path);
+        // A script declaring a package's module is that module.
+        let ambient = n.ambient().filter(|_| js);
+        let js_module = n.is_module() || ambient.is_some();
+        // A declaration file's globals are for the project holding it.
+        let typings = if declaration && !js_module {
+            typings_root(dir)
+        } else {
+            None
+        };
+        let header = if matches!(lang, Some(Lang::C | Lang::Cpp)) && is_header(path) {
+            let stem = file.split('.').next().unwrap_or(file);
+            mentions::import_hash(stem)
+        } else {
+            NO_OWNER
+        };
+        let confined = header != NO_OWNER || typings.is_some();
+        let scope = match typings {
+            Some(prefix) => Scope::Within {
+                prefix,
+                nested: true,
+            },
+            None => Scope::of(lang, path),
+        };
         let public_key = family(lang);
         let private_key = match &scope {
             Scope::Public => public_key,
@@ -651,7 +726,6 @@ impl Unit {
                     .clamp(PUBLIC_END, FILE_ONLY - 1)
             }
         };
-        let (dir, file) = path.rsplit_once('/').unwrap_or(("", path));
         fn base(dir: &str) -> &str {
             dir.rsplit('/').next().unwrap_or(dir)
         }
@@ -669,15 +743,12 @@ impl Unit {
             Some(Lang::Python) if stem == "__init__" => (token(base(dir)), token(base(parent))),
             Some(Lang::Python) => (token(stem), token(base(dir))),
             Some(Lang::JavaScript | Lang::TypeScript | Lang::Tsx) => (
-                mentions::module_stem(path).map_or(NO_OWNER, mentions::import_hash),
+                ambient.unwrap_or_else(|| {
+                    mentions::module_stem(path).map_or(NO_OWNER, mentions::import_hash)
+                }),
                 NO_OWNER,
             ),
             _ => (NO_OWNER, NO_OWNER),
-        };
-        let header = if matches!(lang, Some(Lang::C | Lang::Cpp)) && is_header(path) {
-            mentions::import_hash(stem)
-        } else {
-            NO_OWNER
         };
         Unit {
             lang,
@@ -686,8 +757,15 @@ impl Unit {
             private_key,
             module,
             package,
-            js_module: n.is_module(),
+            js_module,
             header,
+            relative: if js && ambient.is_none() {
+                mentions::module_stem(path).map_or(NO_OWNER, mentions::relative_hash)
+            } else {
+                NO_OWNER
+            },
+            declaration,
+            confined,
         }
     }
 
@@ -696,7 +774,7 @@ impl Unit {
     /// private ones, the files including it.
     fn key(&self, reach: Reach) -> Option<u32> {
         match reach {
-            Reach::Public if self.header == NO_OWNER => Some(self.public_key),
+            Reach::Public if !self.confined => Some(self.public_key),
             Reach::Public | Reach::Private => {
                 (self.private_key != FILE_ONLY).then_some(self.private_key)
             }
@@ -727,10 +805,20 @@ impl Unit {
     /// Whether a file whose mentions are `mentions`, at `path`, uses the
     /// definitions this file's module owns: it names the module (or the
     /// Python package holding it), or is in the same Go package.
-    fn is_used_by(&self, mentions: &Mentions, path: &str) -> bool {
-        mentions.contains(self.module)
+    fn is_used_by(&self, mentions: &Mentions, own: &str, path: &str) -> bool {
+        self.imported_by(mentions, own, path)
             || (self.package != NO_OWNER && mentions.contains(self.package))
             || (self.lang == Some(Lang::Go) && self.scope.reaches(path))
+    }
+
+    /// Whether a file whose mentions are `mentions`, at `path`, names the
+    /// module of this file, at `own`: a JavaScript one by the stem of a path
+    /// from some base directory, or by its path relative to the importer.
+    fn imported_by(&self, mentions: &Mentions, own: &str, path: &str) -> bool {
+        mentions.contains(self.module)
+            || (self.relative != NO_OWNER
+                && mentions.contains(self.relative)
+                && mentions.contains(mentions::import_hash(&import_path(path, own))))
     }
 }
 
@@ -919,6 +1007,7 @@ impl Graph {
                         .collect();
                     defined.sort_unstable();
                     let mut out = Vec::new();
+                    let mut found_here = Vec::new();
                     for (h, count) in mentions.iter() {
                         // (A saturated count may hide uses, so it stays.)
                         let saturated = count == u8::MAX;
@@ -935,26 +1024,80 @@ impl Graph {
                         for id in variants(h) {
                             let owner = ident_owner[id];
                             let scope = ident_scope[id];
+                            let defs = definers(id);
                             // The definers of an ident share their language
-                            // family, scope and module, but not their header.
-                            let unit = &units[definers(id)[0] as usize];
-                            if unit.public_key != units[f].public_key
+                            // family, scope and module stem, but not their
+                            // header or path, so each is checked apart, up to
+                            // a point.
+                            let first = &units[defs[0] as usize];
+                            if first.public_key != units[f].public_key
                                 || own.binary_search(&(h, owner)).is_ok()
-                                || (!is_public(scope)
-                                    && !definers(id)
-                                        .iter()
-                                        .any(|&d| units[d as usize].reaches(mentions, path)))
                             {
                                 continue;
                             }
-                            let (uses, factor) = uses_of(unit, mentions, path, h, owner, uses);
+                            let checked = if defs.len() > NEAREST_OF {
+                                &defs[..1]
+                            } else {
+                                defs
+                            };
+                            let mut found = (0, 1.0);
+                            let mut used = 0;
+                            let mut only = ALL;
+                            for (k, &d) in (0u32..).zip(checked) {
+                                let unit = &units[d as usize];
+                                if !is_public(scope)
+                                    && defs.len() <= NEAREST_OF
+                                    && !unit.reaches(mentions, path)
+                                {
+                                    continue;
+                                }
+                                let got = uses_of(
+                                    (unit, &paths[d as usize]),
+                                    &units[f],
+                                    mentions,
+                                    path,
+                                    h,
+                                    owner,
+                                    uses,
+                                );
+                                if got.0 > 0 {
+                                    if used == 0 {
+                                        found = got;
+                                    }
+                                    used += 1;
+                                    only = k;
+                                }
+                            }
+                            if defs.len() > NEAREST_OF
+                                && !is_public(scope)
+                                && !defs
+                                    .iter()
+                                    .any(|&d| units[d as usize].reaches(mentions, path))
+                            {
+                                continue;
+                            }
+                            let (uses, factor) = found;
                             if uses == 0 {
                                 continue;
                             }
+                            // The one definer the file uses, else the nearest.
+                            let near = if used == 1 && defs.len() > 1 && checked.len() > 1 {
+                                only
+                            } else {
+                                nearest(defs, paths, path)
+                            };
                             let w = term_weight(uses) * multiplier[id] * factor;
-                            let near = nearest(definers(id), paths, path);
-                            out.push((id as u32, w as f32, near));
+                            found_here.push(((id as u32, w as f32, near), factor == 1.0));
                         }
+                        // A name the file imports, or otherwise names the
+                        // owner of, hides a global of the same name.
+                        let owned = found_here.iter().any(|&(_, owned)| owned);
+                        out.extend(
+                            found_here
+                                .drain(..)
+                                .filter(|&(_, o)| o || !owned)
+                                .map(|(edge, _)| edge),
+                        );
                     }
                     out
                 })
@@ -1921,14 +2064,18 @@ mod tests {
     fn an_export_counts_where_its_module_is_imported() {
         let dir = tempfile::tempdir().unwrap();
         let files = [
-            ("web/schemes.ts", "const fileScheme = 'file';\n"),
+            (
+                "web/schemes.d.ts",
+                "declare const fileScheme: string;\ndeclare const otherScheme: string;\n",
+            ),
             ("web/other.ts", "export const otherScheme = 'other';\n"),
             (
                 "web/user.ts",
                 "import { otherScheme } from './other';\n\n\
-                 f(otherScheme, fileScheme, modScheme);\n",
+                 f(otherScheme, fileScheme, modScheme, pageScheme);\n",
             ),
             ("web/mod-scheme.ts", "export const modScheme = 1;\n"),
+            ("web/page.js", "const pageScheme = 'page';\n"),
         ];
         let (graph, _) = graph_of(dir.path(), &files);
         let js = family(Some(Lang::TypeScript));
@@ -1944,8 +2091,8 @@ mod tests {
                 .map(|k| graph.ref_w[k])
                 .sum::<f32>()
         };
-        // A script's global counts less unimported, a module's export not
-        // at all.
+        // A declared global counts less unimported; a module's export, or
+        // the global of a script that declares nothing, not at all.
         let imported = weight_of("otherScheme", "other");
         let global = weight_of("fileScheme", "");
         assert!(
@@ -1953,6 +2100,8 @@ mod tests {
             "{imported} vs {global}"
         );
         assert_eq!(weight_of("modScheme", "mod-scheme"), 0.0);
+        assert_eq!(weight_of("pageScheme", ""), 0.0);
+        assert_eq!(weight_of("otherScheme", ""), 0.0, "hidden by the import");
     }
 
     #[test]
@@ -1970,6 +2119,56 @@ mod tests {
         assert_eq!(
             targets(&graph, &files, 2),
             BTreeSet::from(["base/uri.ts".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_relative_import_names_one_of_the_modules_with_its_stem() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = [
+            ("p/v1/state.ts", "export interface State {}\n"),
+            ("p/v2/state.ts", "export interface State {}\n"),
+            (
+                "p/v1/user.ts",
+                "import { State } from '../v2/state.js';\nlet s: State;\n",
+            ),
+            ("p/v3/state.ts", "export interface State {}\n"),
+            (
+                "p/v3/other.ts",
+                "import { x } from './a/state';\nlet s: State;\n",
+            ),
+        ];
+        let (graph, _) = graph_of(dir.path(), &files);
+        let only = |path: &str| BTreeSet::from([path.to_string()]);
+        assert_eq!(targets(&graph, &files, 2), only("p/v2/state.ts"));
+        assert!(targets(&graph, &files, 4).is_empty(), "another state.ts");
+        assert_eq!(import_path("p/v1/user.ts", "p/v2/state.ts"), "../v2/state");
+        assert_eq!(import_path("p/user.ts", "p/a/index.ts"), "./a");
+        assert_eq!(import_path("user.ts", "state.ts"), "./state");
+    }
+
+    #[test]
+    fn a_declared_module_is_used_where_its_package_is_imported() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = [
+            (
+                "dts/vscode.d.ts",
+                "declare module 'vscode' {\n\texport interface Variable {}\n}\n",
+            ),
+            (
+                "ext/a.ts",
+                "import * as vscode from 'vscode';\nlet v: vscode.Variable;\n",
+            ),
+            ("src/b.ts", "import { x } from './x';\nlet v: Variable;\n"),
+            ("src/c.ts", "let v: Variable;\n"),
+        ];
+        let (graph, _) = graph_of(dir.path(), &files);
+        let only = |path: &str| BTreeSet::from([path.to_string()]);
+        assert_eq!(targets(&graph, &files, 1), only("dts/vscode.d.ts"));
+        assert!(targets(&graph, &files, 2).is_empty(), "not imported");
+        assert!(
+            targets(&graph, &files, 3).is_empty(),
+            "a script, not imported"
         );
     }
 
@@ -1995,6 +2194,28 @@ mod tests {
             set(&["src/base/uri.rs", "vendor/copy/base/uri.rs"]),
             "as near to both"
         );
+    }
+
+    #[test]
+    fn typings_declare_globals_for_their_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = [
+            (
+                "ext/src/typings/node.d.ts",
+                "declare interface Property {}\n",
+            ),
+            ("ext/src/a.ts", "export const a = (p: Property) => p;\n"),
+            ("other/b.ts", "export const b = (p: Property) => p;\n"),
+            ("other/c.js", "var c = new Property();\n"),
+        ];
+        let (graph, _) = graph_of(dir.path(), &files);
+        let only = BTreeSet::from(["ext/src/typings/node.d.ts".to_string()]);
+        assert_eq!(targets(&graph, &files, 1), only);
+        assert!(targets(&graph, &files, 2).is_empty());
+        assert!(targets(&graph, &files, 3).is_empty());
+        assert_eq!(typings_root("ext/src/typings"), Some("ext/src/".into()));
+        assert_eq!(typings_root("@types/node"), Some(String::new()));
+        assert_eq!(typings_root("src/vscode-dts"), None);
     }
 
     #[test]

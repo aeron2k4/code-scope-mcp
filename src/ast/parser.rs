@@ -257,6 +257,24 @@ const TS_EXTRA_QUERY: &str = r#"
 (method_signature name: (_) @name) @method
 (abstract_method_signature name: (_) @name) @method
 (internal_module name: (_) @name) @module
+; `declare const x: T;`, a global declared for other files.
+(program
+  (ambient_declaration
+    (lexical_declaration kind: "const"
+      (variable_declarator name: (identifier) @name))) @constant)
+(program
+  (ambient_declaration
+    (lexical_declaration kind: "let"
+      (variable_declarator name: (identifier) @name))) @variable)
+(program
+  (ambient_declaration
+    (variable_declaration
+      (variable_declarator name: (identifier) @name))) @variable)
+(program
+  (export_statement
+    (ambient_declaration
+      (lexical_declaration kind: "const"
+        (variable_declarator name: (identifier) @name))) @constant))
 "#;
 
 const GO_QUERY: &str = r#"
@@ -1155,6 +1173,23 @@ macro_rules! m { () => {} }
                 ("K".into(), SymbolKind::Class),
                 ("K::m".into(), SymbolKind::Method),
                 ("E".into(), SymbolKind::Enum),
+            ]
+        );
+    }
+
+    #[test]
+    fn typescript_declared_globals() {
+        let src = "declare const A: string;\ndeclare let b: number;\ndeclare var c: number;\n\
+                   export declare const D: string;\nfunction f() { const local = 1; }\n";
+        let parsed = parse_source(Lang::TypeScript, src).unwrap();
+        assert_eq!(
+            names(&parsed),
+            vec![
+                ("A".into(), SymbolKind::Constant),
+                ("b".into(), SymbolKind::Variable),
+                ("c".into(), SymbolKind::Variable),
+                ("D".into(), SymbolKind::Constant),
+                ("f".into(), SymbolKind::Function),
             ]
         );
     }
