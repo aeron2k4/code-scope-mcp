@@ -670,8 +670,8 @@ impl Workspace {
         Ok(out)
     }
 
-    /// Resolve an optional sub-directory, defaulting to the root. A directory
-    /// inside the root comes back relative to it, as the file walkers expect:
+    /// Resolve an optional sub-directory or file, defaulting to the root. A
+    /// path inside the root comes back relative to it, as the file walkers expect:
     /// an absolute path makes their results absolute too, and the cache,
     /// which is keyed by `root.join(rel)`, then misses every file. A library
     /// directory comes back absolute, and so do the files found under it.
@@ -680,8 +680,8 @@ impl Workspace {
             Some(d) if !d.trim().is_empty() => self.resolve_read(d)?,
             _ => self.root.clone(),
         };
-        if !base.is_dir() {
-            bail!("not a directory: {}", self.display(&base));
+        if !base.exists() {
+            bail!("no such file or directory: {}", self.display(&base));
         }
         Ok(base
             .strip_prefix(&self.root)
@@ -790,6 +790,9 @@ impl Workspace {
 
     pub fn list_files(&self, dir: Option<&str>, limit: usize) -> Result<String> {
         let base = self.root.join(self.resolve_dir(dir)?);
+        if base.is_file() {
+            return Ok(format!("{}\n", self.display(&base)));
+        }
         let files = git::list_files(&base, limit);
         let mut out = String::new();
         for f in &files {
@@ -1183,8 +1186,8 @@ pub struct FindReferencesParams {
     /// Symbol name, plain (`load`) or qualified (`Config::load`): the last segment is
     /// matched, and uses provably on another owner (`Other::load`) are dropped.
     pub name: String,
-    /// Sub-directory relative to the workspace root to search in, or the
-    /// absolute path of a dependency source directory. Default: the root.
+    /// Sub-directory or file relative to the workspace root to search in, or
+    /// the absolute path of a dependency source. Default: the root.
     #[serde(default)]
     pub dir: Option<String>,
     /// Also list the definitions themselves (default false).
@@ -1205,8 +1208,8 @@ pub struct SearchTextParams {
     /// Ignore case (default false).
     #[serde(default)]
     pub case_insensitive: Option<bool>,
-    /// Sub-directory relative to the workspace root to search in, or the
-    /// absolute path of a dependency source directory. Default: the root.
+    /// Sub-directory or file relative to the workspace root to search in, or
+    /// the absolute path of a dependency source. Default: the root.
     #[serde(default)]
     pub dir: Option<String>,
     /// Maximum number of matching lines (default 100).
@@ -1615,6 +1618,29 @@ mod tests {
         }
         // Parsed once: neither search re-reads or re-parses it.
         assert_eq!(ws.cache.stats().parses, 1);
+    }
+
+    #[test]
+    fn a_file_can_be_searched_as_dir() {
+        let (dir, ws) = workspace();
+        fs::write(dir.path().join("src/a.rs"), "fn run() {\n    load;\n}\n").unwrap();
+        fs::write(dir.path().join(".hidden.rs"), "fn h() { load; }\n").unwrap();
+        for sub in ["src/a.rs", "./src/a.rs"] {
+            let text = ws.search_text("load", false, false, Some(sub), 10).unwrap();
+            assert_eq!(text, "src/a.rs:2: load;  [in run]\n", "dir = {sub}");
+            let refs = ws.find_references("load", Some(sub), false, 10).unwrap();
+            assert_eq!(refs, "src/a.rs:2:5: load;  [in run]\n", "dir = {sub}");
+            assert_eq!(ws.list_files(Some(sub), 10).unwrap(), "src/a.rs\n");
+        }
+        // Named on its own, a hidden file is searched.
+        let text = ws
+            .search_text("load", false, false, Some(".hidden.rs"), 10)
+            .unwrap();
+        assert_eq!(text, ".hidden.rs:1: fn h() { load; }  [in h]\n");
+        let err = ws
+            .search_text("load", false, false, Some("src/nope.rs"), 10)
+            .unwrap_err();
+        assert!(err.to_string().contains("src/nope.rs"), "{err}");
     }
 
     #[test]
