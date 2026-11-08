@@ -160,7 +160,9 @@ absolute or `~/` path of a dependency source. They look under these
 directories, when they exist:
 - `~/.cargo/registry/src`, `~/.cargo/git/checkouts` (`CARGO_HOME`)
 - `~/.rustup/toolchains` (`RUSTUP_HOME`)
-- the Go module cache (`GOMODCACHE`, `GOPATH`)
+- the Go module cache (`GOMODCACHE`, `GOPATH`) and standard library
+  (`GOROOT/src`, else `/usr/local/go`, `/usr/lib/go`, Homebrew's or
+  `~/sdk/go*`)
 - `/usr/include`, `/usr/local/include`
 - `node_modules` and the `python3*` directories in `/usr/lib` and
   `/usr/local/lib`, and the `python3*` directories in `~/.local/lib`
