@@ -69,7 +69,6 @@ struct Paths {
     claude_hook: PathBuf,
     claude_settings: PathBuf,
     claude_memory: PathBuf,
-    opencode_config: PathBuf,
     opencode_memory: PathBuf,
     opencode_plugin: PathBuf,
     opencode_guard: PathBuf,
@@ -94,7 +93,6 @@ impl Paths {
             claude_hook: claude.join("hooks").join(GUARD_NAME),
             claude_settings: claude.join("settings.json"),
             claude_memory: claude.join("CLAUDE.md"),
-            opencode_config: opencode::config_path(&opencode),
             opencode_memory: opencode.join("AGENTS.md"),
             opencode_plugin: plugin.join(OPENCODE_PLUGIN_NAME),
             opencode_guard: plugin.join(GUARD_NAME),
@@ -108,6 +106,12 @@ impl Paths {
                 .unwrap_or_else(|| home.join(".cargo"))
                 .join("bin"),
         })
+    }
+
+    /// The OpenCode file that gets the server entry, chosen from what is on
+    /// disk when it is needed.
+    fn opencode_config(&self) -> PathBuf {
+        opencode::config_path(&self.config_dir)
     }
 }
 
@@ -178,7 +182,7 @@ fn claude_available() -> bool {
 
 fn opencode_available(paths: &Paths) -> bool {
     opencode(&["--version"]).is_ok_and(|output| output.status.success())
-        || paths.opencode_config.parent().is_some_and(Path::exists)
+        || paths.config_dir.exists()
 }
 
 pub fn install(enforce: bool, client: Client) -> Result<()> {
@@ -268,21 +272,21 @@ fn install_opencode(paths: &Paths, enforce: bool) -> Result<()> {
     setup_opencode(paths, &native_path(&exe), enforce)
 }
 
-/// Everything between locating the binary and the final message, so that tests
-/// can drive it with a fake home.
 fn setup_opencode(paths: &Paths, exe: &str, enforce: bool) -> Result<()> {
-    if let Some(config) = opencode::superseded_config(&paths.opencode_config, &paths.config_dir) {
-        log(format_args!(
-            "Skipping {}: OpenCode would let it replace the astlens entry in {}",
-            config.display(),
-            paths.opencode_config.display()
-        ));
-    }
+    let config = paths.opencode_config();
     log(format_args!(
         "Registering MCP server 'astlens' with OpenCode ({})",
-        paths.opencode_config.display()
+        config.display()
     ));
-    opencode::add_server(&paths.opencode_config, exe)?;
+    opencode::add_server(&config, exe)?;
+    // An entry an earlier install left in the other file would only confuse.
+    for other in opencode::global_configs(&paths.config_dir) {
+        if other != config
+            && let Err(err) = opencode::remove_server(&other)
+        {
+            log(format_args!("{err}; remove astlens from it by hand"));
+        }
+    }
 
     if enforce {
         log(format_args!(
@@ -344,16 +348,10 @@ pub fn uninstall() -> Result<()> {
     }
     log(format_args!(
         "Removing MCP server registration from OpenCode ({})",
-        paths.opencode_config.display()
+        paths.config_dir.display()
     ));
-    for config in [
-        Some(&paths.opencode_config),
-        opencode::superseded_config(&paths.opencode_config, &paths.config_dir).as_ref(),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if let Err(err) = opencode::remove_server(config) {
+    for config in opencode::global_configs(&paths.config_dir) {
+        if let Err(err) = opencode::remove_server(&config) {
             log(format_args!(
                 "{err}; if astlens is still listed, remove it from the OpenCode config by hand"
             ));
@@ -646,7 +644,6 @@ mod tests {
             claude_hook: dir.join(".claude/hooks").join(GUARD_NAME),
             claude_settings: dir.join(".claude/settings.json"),
             claude_memory: dir.join(".claude/CLAUDE.md"),
-            opencode_config: opencode.join("opencode.json"),
             opencode_memory: opencode.join("AGENTS.md"),
             opencode_plugin: plugin.join(OPENCODE_PLUGIN_NAME),
             opencode_guard: plugin.join(GUARD_NAME),
@@ -877,7 +874,7 @@ mod tests {
         let paths = paths(dir.path());
         setup_opencode(&paths, "/bin/astlens", true).unwrap();
 
-        let config = fs::read_to_string(&paths.opencode_config).unwrap();
+        let config = fs::read_to_string(paths.opencode_config()).unwrap();
         assert_eq!(
             config,
             "{\n  \"mcp\": {\n    \"servers\": {\n      \"astlens\": {\n        \"type\": \"local\",\n        \"command\": [\"/bin/astlens\", \"--serve\"],\n        \"codemode\": false\n      }\n    }\n  }\n}\n"
@@ -903,10 +900,31 @@ mod tests {
         let memory = fs::read_to_string(&paths.opencode_memory).unwrap();
         assert!(!memory.contains(MEMORY_BEGIN));
         assert!(
-            fs::read_to_string(&paths.opencode_config)
+            fs::read_to_string(paths.opencode_config())
                 .unwrap()
                 .contains("\"astlens\"")
         );
+    }
+
+    #[test]
+    fn opencode_setup_writes_where_the_servers_take_effect() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths(dir.path());
+        let json = paths.config_dir.join("opencode.json");
+        let jsonc = paths.config_dir.join("opencode.jsonc");
+        fs::create_dir_all(&paths.config_dir).unwrap();
+        // An entry from an earlier install, shadowed by the jsonc servers.
+        setup_opencode(&paths, "/bin/astlens", false).unwrap();
+        fs::write(
+            &jsonc,
+            "{\"mcp\": {\"servers\": {\"other\": {\"type\": \"remote\"}}}}\n",
+        )
+        .unwrap();
+
+        setup_opencode(&paths, "/bin/astlens", false).unwrap();
+        let text = fs::read_to_string(&jsonc).unwrap();
+        assert!(text.contains("\"astlens\"") && text.contains("\"other\""));
+        assert!(!fs::read_to_string(&json).unwrap().contains("\"astlens\""));
     }
 
     #[test]
