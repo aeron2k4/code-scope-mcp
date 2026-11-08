@@ -99,7 +99,8 @@ impl Workspace {
         self
     }
 
-    /// Keep parsed files within about `max_bytes` of memory.
+    /// Keep parsed files and their symbol names within about `max_bytes` of
+    /// memory.
     pub fn with_cache_bytes(mut self, max_bytes: usize) -> Self {
         self.cache = std::mem::take(&mut self.cache).with_max_bytes(max_bytes);
         self

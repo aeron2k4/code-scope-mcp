@@ -2,11 +2,11 @@
 
 pub mod cache;
 pub mod changes;
+pub mod names;
 pub mod refs;
 pub mod store_format;
 pub mod text;
 
-use std::cmp::Ordering;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering as SeqOrdering};
@@ -16,6 +16,7 @@ use serde::Serialize;
 use crate::ast::parser::{Lang, Symbol, SymbolKind};
 use crate::git;
 use cache::ParseCache;
+use names::Query;
 
 /// `path` with `/` separators on every platform, so tool output and the
 /// paths a client sends back look the same on Windows.
@@ -77,20 +78,41 @@ where
 const MIN_FILES_PER_WORKER: usize = 32;
 
 /// Like [`par_flat_map`], but keeping each file's results apart.
+///
+/// Workers take [`MIN_FILES_PER_WORKER`] files at a time from a shared
+/// counter rather than one fixed slice each: files that cost far more than
+/// the rest, such as the generated register headers of the Linux kernel,
+/// tend to sit together in one directory and would leave a single worker
+/// busy while the others wait.
 fn par_groups<T, F>(files: &[PathBuf], f: F) -> Vec<Vec<T>>
 where
     T: Send,
     F: Fn(&Path) -> Vec<T> + Sync,
 {
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
-    let workers = cores.min(files.len().div_ceil(MIN_FILES_PER_WORKER)).max(1);
-    let chunk = files.len().div_ceil(workers).max(1);
-    std::thread::scope(|s| {
-        let handles: Vec<_> = files
-            .chunks(chunk)
-            .map(|chunk| {
-                let f = &f;
-                s.spawn(move || chunk.iter().map(|p| f(p)).collect::<Vec<_>>())
+    let batches = files.len().div_ceil(MIN_FILES_PER_WORKER);
+    let workers = cores.min(batches).max(1);
+    let next = AtomicUsize::new(0);
+    let mut done: Vec<(usize, Vec<Vec<T>>)> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                let (f, next) = (&f, &next);
+                s.spawn(move || {
+                    let mut mine = Vec::new();
+                    loop {
+                        let batch = next.fetch_add(1, SeqOrdering::Relaxed);
+                        let start = batch * MIN_FILES_PER_WORKER;
+                        let Some(chunk) =
+                            files.get(start..files.len().min(start + MIN_FILES_PER_WORKER))
+                        else {
+                            break mine;
+                        };
+                        if chunk.is_empty() {
+                            break mine;
+                        }
+                        mine.push((batch, chunk.iter().map(|p| f(p)).collect::<Vec<_>>()));
+                    }
+                })
             })
             .collect();
         handles
@@ -101,7 +123,9 @@ where
                     .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
             })
             .collect()
-    })
+    });
+    done.sort_unstable_by_key(|(batch, _)| *batch);
+    done.into_iter().flat_map(|(_, results)| results).collect()
 }
 
 /// Innermost symbol whose byte range contains `byte`.
@@ -148,8 +172,6 @@ pub struct SymbolHit {
     pub signature: String,
     pub start_line: usize,
     pub end_line: usize,
-    #[serde(skip)]
-    score: u8,
 }
 
 #[derive(Debug, Clone)]
@@ -170,27 +192,19 @@ impl Default for SearchOptions {
     }
 }
 
-/// Lower is better; `None` means no match.
-fn score(query: &str, query_lower: &str, name: &str, qualified: &str) -> Option<u8> {
-    if name == query || qualified == query {
-        return Some(0);
-    }
-    let name_lower = name.to_lowercase();
-    if name_lower == query_lower {
-        Some(1)
-    } else if name_lower.starts_with(query_lower) {
-        Some(2)
-    } else if name_lower.contains(query_lower) {
-        Some(3)
-    } else if qualified.to_lowercase().contains(query_lower) {
-        Some(4)
-    } else {
-        None
-    }
+/// A match before its details are looked up: only the best `limit` of them
+/// get a signature and end line, from the parsed file.
+struct Candidate {
+    score: u8,
+    file: usize,
+    start_line: usize,
+    index: usize,
 }
 
 /// Search symbol names across all supported files under `root`. Files are
-/// parsed lazily through `cache`, in parallel, on first search.
+/// parsed lazily through `cache`, in parallel, on first search; later
+/// searches score the compact names it keeps and read back only the files
+/// of the hits they return.
 pub fn search_symbols(
     root: &Path,
     cache: &ParseCache,
@@ -205,7 +219,7 @@ pub fn search_symbols(
             incomplete: 0,
         };
     }
-    let query_lower = query.to_lowercase();
+    let query = Query::new(query);
     let (files, truncated) = files_under(root, root, opts.max_files);
     let files: Vec<PathBuf> = files
         .into_iter()
@@ -213,64 +227,93 @@ pub fn search_symbols(
         .collect();
 
     let incomplete = AtomicUsize::new(0);
-    let per_file: Vec<Vec<SymbolHit>> = par_groups(&files, |rel| {
+    let per_file: Vec<Vec<(u8, usize, usize)>> = par_groups(&files, |rel| {
         // The cache is keyed by absolute paths: a relative one would miss
         // and parse the file again.
-        let file = match cache.get(&root.join(rel)) {
-            Ok(f) => f,
+        let names = match cache.symbol_names(&root.join(rel)) {
+            Ok(n) => n,
             Err(err) => {
                 tracing::debug!(%err, "skipping file in search");
                 return Vec::new();
             }
         };
-        if file.parsed.incomplete {
+        if names.incomplete() {
             incomplete.fetch_add(1, SeqOrdering::Relaxed);
         }
-        let mut local = Vec::new();
-        for sym in &file.parsed.symbols {
-            if opts.kind.is_some_and(|k| k != sym.kind) {
-                continue;
-            }
-            let qualified = sym.qualified_name();
-            if let Some(score) = score(query, &query_lower, &sym.name, &qualified) {
-                local.push(SymbolHit {
-                    path: slash_path(rel),
-                    name: sym.name.clone(),
-                    qualified_name: qualified,
-                    kind: sym.kind,
-                    signature: sym.signature.clone(),
-                    start_line: sym.start_line,
-                    end_line: sym.end_line,
-                    score,
-                });
-            }
-        }
-        local
+        names
+            .matches(&query, opts.kind)
+            .map(|(index, score, line)| (score, line, index))
+            .collect()
     });
 
-    // Every hit is already in memory here, so the best `limit` are picked in
-    // linear time and only those are sorted.
-    let mut hits: Vec<SymbolHit> = per_file.into_iter().flatten().collect();
-    if hits.len() > opts.limit {
-        if opts.limit > 0 {
-            hits.select_nth_unstable_by(opts.limit - 1, rank);
+    // Paths only of the files with a match, to rank by.
+    let mut paths: Vec<Option<String>> = vec![None; files.len()];
+    let mut candidates = Vec::new();
+    for (file, matches) in per_file.into_iter().enumerate() {
+        if matches.is_empty() {
+            continue;
         }
-        hits.truncate(opts.limit);
+        paths[file] = Some(slash_path(&files[file]));
+        candidates.extend(
+            matches
+                .into_iter()
+                .map(|(score, start_line, index)| Candidate {
+                    score,
+                    file,
+                    start_line,
+                    index,
+                }),
+        );
     }
-    hits.sort_by(rank);
+    let rank = |a: &Candidate, b: &Candidate| {
+        a.score
+            .cmp(&b.score)
+            .then_with(|| paths[a.file].cmp(&paths[b.file]))
+            .then(a.start_line.cmp(&b.start_line))
+    };
+    // The best `limit` are picked in linear time and only those are sorted.
+    if candidates.len() > opts.limit {
+        if opts.limit > 0 {
+            candidates.select_nth_unstable_by(opts.limit - 1, rank);
+        }
+        candidates.truncate(opts.limit);
+    }
+    candidates.sort_by(rank);
+
+    let mut hits = Vec::with_capacity(candidates.len());
+    let mut current: Option<(usize, std::sync::Arc<cache::CachedFile>)> = None;
+    for c in &candidates {
+        if current.as_ref().is_none_or(|(file, _)| *file != c.file) {
+            current = cache
+                .get(&root.join(&files[c.file]))
+                .ok()
+                .map(|f| (c.file, f));
+        }
+        // A file that changed since its names were read may no longer hold
+        // the symbol at that index; it is left out rather than misreported.
+        let Some(sym) = current
+            .as_ref()
+            .filter(|(file, _)| *file == c.file)
+            .and_then(|(_, f)| f.parsed.symbols.get(c.index))
+            .filter(|s| s.start_line == c.start_line)
+        else {
+            continue;
+        };
+        hits.push(SymbolHit {
+            path: paths[c.file].clone().unwrap_or_default(),
+            name: sym.name.clone(),
+            qualified_name: sym.qualified_name(),
+            kind: sym.kind,
+            signature: sym.signature.clone(),
+            start_line: sym.start_line,
+            end_line: sym.end_line,
+        });
+    }
     Found {
         hits,
         truncated,
         incomplete: incomplete.into_inner(),
     }
-}
-
-/// The order `search_symbols` returns hits in.
-fn rank(a: &SymbolHit, b: &SymbolHit) -> Ordering {
-    a.score
-        .cmp(&b.score)
-        .then_with(|| a.path.cmp(&b.path))
-        .then(a.start_line.cmp(&b.start_line))
 }
 
 #[cfg(test)]

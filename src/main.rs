@@ -10,7 +10,8 @@
 //! `$XDG_CACHE_HOME/astlens` or `~/.cache/astlens`. Set
 //! `ASTLENS_NO_CACHE=1` to keep the cache in memory only, and
 //! `ASTLENS_MAX_FILES` to change how many files a search walks (20000), and
-//! `ASTLENS_CACHE_MB` to change the memory kept for parsed files (512).
+//! `ASTLENS_CACHE_MB` to change the memory kept for parsed files and their
+//! symbol names (512).
 //! `ASTLENS_LIBRARY_PATHS` adds directories, separated like `PATH`, to the
 //! dependency sources the read-only tools may open (see [`libraries`]).
 

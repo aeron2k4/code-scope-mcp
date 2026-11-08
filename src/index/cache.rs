@@ -9,6 +9,10 @@
 //!
 //! Writes to the store are buffered and committed in one transaction by
 //! [`ParseCache::flush`], so a project-wide search costs a single fsync.
+//!
+//! Beside the parsed files, the cache keeps each file's [`SymbolNames`] under
+//! a budget of their own, a fraction of the size, so symbol search over a
+//! tree too large for the file budget still runs from memory.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -22,6 +26,7 @@ use serde::Serialize;
 
 use crate::ast::parser::{self, Lang, ParseError, ParsedFile};
 use crate::git;
+use crate::index::names::SymbolNames;
 use crate::index::store_format;
 
 /// Changes with the crate version so stale formats or grammar changes never
@@ -318,6 +323,13 @@ struct Entry {
     file: Arc<CachedFile>,
 }
 
+struct NamesEntry {
+    mtime: SystemTime,
+    len: u64,
+    weight: usize,
+    names: Arc<SymbolNames>,
+}
+
 /// Default memory budget for cached files: enough for the 82 MB Go standard
 /// library, so a workspace-wide search does not evict what it just parsed.
 pub const DEFAULT_MAX_BYTES: usize = 512 << 20;
@@ -333,6 +345,9 @@ pub struct ParseCache {
     store: Option<PersistentStore>,
     pending: Mutex<Vec<(PathBuf, String, Arc<CachedFile>)>>,
     counters: Counters,
+    names: RwLock<HashMap<PathBuf, NamesEntry>>,
+    /// Sum of the weights of `names`; changed only under its write lock.
+    names_bytes: AtomicU64,
 }
 
 impl Default for ParseCache {
@@ -353,11 +368,26 @@ impl ParseCache {
             store: None,
             pending: Mutex::new(Vec::new()),
             counters: Counters::default(),
+            names: RwLock::new(HashMap::new()),
+            names_bytes: AtomicU64::new(0),
         }
     }
 
-    /// Keep cached files within about `max_bytes` of memory, evicting the
-    /// least recently used beyond that.
+    /// Memory [`SymbolNames`] may take out of the budget: half of it, which
+    /// holds the names of a tree about ten times larger than the files that
+    /// fit in the other half.
+    fn max_names_bytes(&self) -> usize {
+        self.max_bytes / 2
+    }
+
+    /// Memory left for cached files once the names have theirs.
+    fn max_file_cache_bytes(&self) -> usize {
+        self.max_bytes
+            .saturating_sub(self.names_bytes.load(Ordering::Relaxed) as usize)
+    }
+
+    /// Keep cached files and symbol names within about `max_bytes` of memory,
+    /// evicting the least recently used files beyond that.
     pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
         self.max_bytes = max_bytes;
         self
@@ -430,6 +460,52 @@ impl ParseCache {
             self.used_bytes
                 .fetch_sub(old.weight as u64, Ordering::Relaxed);
         }
+        if let Ok(mut names) = self.names.write()
+            && let Some(old) = names.remove(path)
+        {
+            self.names_bytes
+                .fetch_sub(old.weight as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// The symbol names of `path`, from memory while its modification time
+    /// and size are unchanged, otherwise from [`Self::get`]. Once the names
+    /// budget is full, the names of further files are not kept: a search that
+    /// walks more files than fit then still finds the first ones in memory,
+    /// where evicting the oldest would leave it none.
+    pub fn symbol_names(&self, path: &Path) -> Result<Arc<SymbolNames>, CacheError> {
+        let (len, mtime) = stat(path)?;
+        if let Ok(names) = self.names.read()
+            && let Some(entry) = names.get(path)
+            && entry.mtime == mtime
+            && entry.len == len
+        {
+            self.counters.memory_hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(Arc::clone(&entry.names));
+        }
+        let file = self.get(path)?;
+        let names = Arc::new(SymbolNames::new(&file.parsed));
+        if let Ok(mut map) = self.names.write() {
+            if let Some(old) = map.remove(path) {
+                self.names_bytes
+                    .fetch_sub(old.weight as u64, Ordering::Relaxed);
+            }
+            let weight = names.weight();
+            let used = self.names_bytes.load(Ordering::Relaxed) as usize;
+            if used + weight <= self.max_names_bytes() {
+                self.names_bytes.fetch_add(weight as u64, Ordering::Relaxed);
+                map.insert(
+                    path.to_path_buf(),
+                    NamesEntry {
+                        mtime,
+                        len,
+                        weight,
+                        names: Arc::clone(&names),
+                    },
+                );
+            }
+        }
+        Ok(names)
     }
 
     fn tick(&self) -> u64 {
@@ -442,13 +518,7 @@ impl ParseCache {
             path: path.to_path_buf(),
             source,
         };
-        let meta = std::fs::metadata(path).map_err(io_err)?;
-        let len = meta.len();
-        let mtime = meta.modified().map_err(io_err)?;
-        // Reading a FIFO would block until something writes to it.
-        if !meta.is_file() {
-            return Err(CacheError::NotAFile(path.to_path_buf()));
-        }
+        let (len, mtime) = stat(path)?;
 
         if let Ok(entries) = self.entries.read()
             && let Some(entry) = entries.get(path)
@@ -504,15 +574,7 @@ impl ParseCache {
                 self.used_bytes
                     .fetch_sub(old.weight as u64, Ordering::Relaxed);
             }
-            while !entries.is_empty()
-                && (entries.len() >= self.max_entries
-                    || self.used_bytes() + weight > self.max_bytes)
-            {
-                if let Some(old) = evict_oldest(&mut entries) {
-                    self.used_bytes
-                        .fetch_sub(old.weight as u64, Ordering::Relaxed);
-                }
-            }
+            self.make_room(&mut entries, weight);
             self.used_bytes.fetch_add(weight as u64, Ordering::Relaxed);
             entries.insert(
                 path.to_path_buf(),
@@ -535,12 +597,51 @@ impl Drop for ParseCache {
     }
 }
 
-fn evict_oldest(entries: &mut HashMap<PathBuf, Entry>) -> Option<Entry> {
-    let oldest = entries
-        .iter()
-        .min_by_key(|(_, e)| e.last_used.load(Ordering::Relaxed))
-        .map(|(p, _)| p.clone())?;
-    entries.remove(&oldest)
+/// Size and modification time of `path`, which must be a regular file:
+/// reading a FIFO would block until something writes to it.
+fn stat(path: &Path) -> Result<(u64, SystemTime), CacheError> {
+    let io_err = |source| CacheError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    let meta = std::fs::metadata(path).map_err(io_err)?;
+    let mtime = meta.modified().map_err(io_err)?;
+    if !meta.is_file() {
+        return Err(CacheError::NotAFile(path.to_path_buf()));
+    }
+    Ok((meta.len(), mtime))
+}
+
+impl ParseCache {
+    /// Evict the least recently used entries until one of `incoming` bytes
+    /// fits. Past the budget, it evicts down to 7/8 of it at once: a search
+    /// walking more files than fit would otherwise scan the whole map for
+    /// every file it adds, under the write lock.
+    fn make_room(&self, entries: &mut HashMap<PathBuf, Entry>, incoming: usize) {
+        let over = |entries: &HashMap<PathBuf, Entry>, max_entries: usize, max_bytes: usize| {
+            entries.len() >= max_entries || self.used_bytes() + incoming > max_bytes
+        };
+        let budget = self.max_file_cache_bytes();
+        if entries.is_empty() || !over(entries, self.max_entries, budget) {
+            return;
+        }
+        let max_entries = self.max_entries - self.max_entries / 8;
+        let max_bytes = budget - budget / 8;
+        let mut by_age: Vec<(u64, PathBuf)> = entries
+            .iter()
+            .map(|(p, e)| (e.last_used.load(Ordering::Relaxed), p.clone()))
+            .collect();
+        by_age.sort_unstable_by_key(|(used, _)| *used);
+        for (_, path) in by_age {
+            if entries.is_empty() || !over(entries, max_entries, max_bytes) {
+                break;
+            }
+            if let Some(old) = entries.remove(&path) {
+                self.used_bytes
+                    .fetch_sub(old.weight as u64, Ordering::Relaxed);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -795,5 +896,41 @@ mod tests {
             Err(CacheError::Io { .. })
         ));
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn symbol_names_keep_the_first_files_that_fit() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..4)
+            .map(|i| {
+                let p = dir.path().join(format!("f{i}.py"));
+                fs::write(&p, format!("def f{i}(): pass\n")).unwrap();
+                p
+            })
+            .collect();
+        let weight =
+            SymbolNames::new(&ParseCache::default().get(&paths[0]).unwrap().parsed).weight();
+        // Half the budget goes to names: room for two files' names.
+        let cache = ParseCache::default().with_max_bytes(4 * weight + 4);
+        let names_bytes = || cache.names_bytes.load(Ordering::Relaxed) as usize;
+        let first: Vec<_> = paths
+            .iter()
+            .map(|p| cache.symbol_names(p).unwrap())
+            .collect();
+        assert_eq!(first[3].name(0), Some("f3"));
+        // A second scan finds the first two in memory, rather than each file
+        // evicting the one the scan needs next.
+        for (i, p) in paths.iter().enumerate() {
+            let again = cache.symbol_names(p).unwrap();
+            assert_eq!(Arc::ptr_eq(&first[i], &again), i < 2, "file {i}");
+        }
+        assert_eq!(names_bytes(), 2 * weight);
+
+        // A changed file gets new names in place of the old ones.
+        fs::write(&paths[0], "def gg0(): pass\n").unwrap();
+        assert_eq!(cache.symbol_names(&paths[0]).unwrap().name(0), Some("gg0"));
+        assert_eq!(names_bytes(), 2 * weight + 1);
+        cache.invalidate(&paths[0]);
+        assert_eq!(names_bytes(), weight);
     }
 }

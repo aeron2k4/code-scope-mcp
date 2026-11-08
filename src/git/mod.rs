@@ -2,36 +2,136 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, PoisonError};
 
 use anyhow::{Context, Result, bail};
-use ignore::WalkBuilder;
+use ignore::{DirEntry, ParallelVisitor, ParallelVisitorBuilder, WalkBuilder, WalkState};
 use serde::Serialize;
 
 /// List files under `root`, honouring `.gitignore`, `.ignore` and git
 /// excludes. Paths are relative to `root` and sorted. Stops after `limit`.
+///
+/// The tree is walked on all cores. When it holds more than `limit` files,
+/// which of them a parallel walk reaches first varies from run to run, so it
+/// is walked again in order: the result is always the first `limit` files.
 pub fn list_files(root: &Path, limit: usize) -> Vec<PathBuf> {
-    let mut files: Vec<PathBuf> = WalkBuilder::new(root)
+    if let Some(mut files) = list_all_in_parallel(root, limit) {
+        files.sort_by_cached_key(|p| sort_key(p));
+        return files;
+    }
+    let mut files: Vec<PathBuf> = walker(root)
+        .sort_by_file_path(|a, b| a.cmp(b))
+        .build()
+        .filter_map(|entry| file_path(root, entry))
+        .take(limit)
+        .collect();
+    files.sort();
+    files
+}
+
+/// A key whose byte order is the order of `Path::cmp`, component by
+/// component, for the clean relative paths a walk gives: the bytes, with each
+/// separator as the lowest. Comparing those is several times faster than
+/// splitting both paths into components at every comparison.
+fn sort_key(path: &Path) -> Vec<u8> {
+    let mut key = path.as_os_str().as_encoded_bytes().to_vec();
+    for c in &mut key {
+        if *c == b'/' || *c == std::path::MAIN_SEPARATOR as u8 {
+            *c = 0;
+        }
+    }
+    key
+}
+
+fn walker(root: &Path) -> WalkBuilder {
+    let mut builder = WalkBuilder::new(root);
+    builder
         .hidden(true)
         .git_ignore(true)
         .git_exclude(true)
         .git_global(true)
         // Respect .gitignore even outside a git repository.
-        .require_git(false)
-        .sort_by_file_path(|a, b| a.cmp(b))
-        .build()
-        .filter_map(|entry| match entry {
-            Ok(e) => Some(e),
-            Err(err) => {
-                tracing::debug!(%err, "skipping unreadable entry");
-                None
-            }
+        .require_git(false);
+    builder
+}
+
+/// The path relative to `root` of a walked entry that is a file.
+fn file_path(root: &Path, entry: Result<DirEntry, ignore::Error>) -> Option<PathBuf> {
+    let entry = entry
+        .inspect_err(|err| tracing::debug!(%err, "skipping unreadable entry"))
+        .ok()?;
+    if !entry.file_type().is_some_and(|t| t.is_file()) {
+        return None;
+    }
+    entry.path().strip_prefix(root).ok().map(Path::to_path_buf)
+}
+
+/// Every file under `root`, unsorted, or `None` once there are more than
+/// `limit`.
+fn list_all_in_parallel(root: &Path, limit: usize) -> Option<Vec<PathBuf>> {
+    let shared = Collected {
+        root,
+        limit,
+        count: AtomicUsize::new(0),
+        files: Mutex::new(Vec::new()),
+    };
+    walker(root).build_parallel().visit(&mut &shared);
+    if shared.count.into_inner() > limit {
+        return None;
+    }
+    Some(
+        shared
+            .files
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner),
+    )
+}
+
+struct Collected<'a> {
+    root: &'a Path,
+    limit: usize,
+    count: AtomicUsize,
+    files: Mutex<Vec<PathBuf>>,
+}
+
+impl<'s> ParallelVisitorBuilder<'s> for &'s Collected<'s> {
+    fn build(&mut self) -> Box<dyn ParallelVisitor + 's> {
+        Box::new(Collector {
+            shared: self,
+            local: Vec::new(),
         })
-        .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
-        .filter_map(|e| e.path().strip_prefix(root).ok().map(Path::to_path_buf))
-        .take(limit)
-        .collect();
-    files.sort();
-    files
+    }
+}
+
+/// One walker thread's files, handed over when the thread is done.
+struct Collector<'s> {
+    shared: &'s Collected<'s>,
+    local: Vec<PathBuf>,
+}
+
+impl ParallelVisitor for Collector<'_> {
+    fn visit(&mut self, entry: Result<DirEntry, ignore::Error>) -> WalkState {
+        let Some(path) = file_path(self.shared.root, entry) else {
+            return WalkState::Continue;
+        };
+        if self.shared.count.fetch_add(1, Ordering::Relaxed) >= self.shared.limit {
+            return WalkState::Quit;
+        }
+        self.local.push(path);
+        WalkState::Continue
+    }
+}
+
+impl Drop for Collector<'_> {
+    fn drop(&mut self) {
+        let mut files = self
+            .shared
+            .files
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        files.append(&mut self.local);
+    }
 }
 
 /// Git blob object id of `content`, identical to `git hash-object`.
@@ -310,6 +410,28 @@ mod tests {
             vec![PathBuf::from("README.md"), PathBuf::from("src/main.rs")]
         );
         assert_eq!(list_files(root, 1).len(), 1);
+    }
+
+    #[test]
+    fn a_limited_walk_keeps_the_first_files_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // `a/z` sorts before `a-b` by component, after it by bytes.
+        for name in ["a-b", "a/z", "a/b/c", "b", "a.x", "ab"] {
+            let path = root.join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "").unwrap();
+        }
+        let all = list_files(root, 100);
+        let mut expected = all.clone();
+        expected.sort();
+        assert_eq!(all, expected);
+        assert_eq!(all[..2], [PathBuf::from("a/b/c"), PathBuf::from("a/z")]);
+        // Past the limit the walk is redone in order, not cut where the
+        // parallel threads happened to be.
+        for limit in 1..all.len() {
+            assert_eq!(list_files(root, limit), all[..limit], "limit {limit}");
+        }
     }
 
     #[test]

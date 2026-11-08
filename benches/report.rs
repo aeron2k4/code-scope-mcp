@@ -23,7 +23,8 @@ use astlens::index::text::{self, TextOptions};
 use astlens::index::{self, SearchOptions};
 use regex::Regex;
 
-const MAX_FILES: usize = 50_000;
+/// High enough for the Linux kernel's ~97,000 files.
+const MAX_FILES: usize = 200_000;
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const PRUNE_BUDGET: usize = 2_000;
 const QUERIES: [&str; 6] = ["new", "parse", "read", "error", "close", "test"];
