@@ -69,12 +69,14 @@ pub fn encode(parsed: &ParsedFile) -> Vec<u8> {
         previous = start as usize;
     }
 
-    let table_bytes: usize = strings.table.iter().map(|s| s.len() + 1).sum();
+    // Each string is written after its length, since a name or signature may
+    // hold any byte, NUL included.
+    let table_bytes: usize = strings.table.iter().map(|s| s.len() + 2).sum();
     let mut out = Vec::with_capacity(table_bytes + body.len() + 8);
     put(&mut out, strings.table.len());
     for string in &strings.table {
+        put(&mut out, string.len());
         out.extend_from_slice(string);
-        out.push(0);
     }
     out.extend_from_slice(&body);
     out
@@ -88,13 +90,13 @@ pub fn decode(bytes: &[u8], lang: Lang, has_errors: bool, incomplete: bool) -> R
     // without a parent.
     let mut table: Vec<&str> = Vec::with_capacity(count.min(1024));
     for _ in 0..count {
-        let end = bytes[at..]
-            .iter()
-            .position(|&b| b == 0)
+        let len = take(&mut at, bytes)?;
+        let raw = at
+            .checked_add(len)
+            .and_then(|end| bytes.get(at..end))
             .ok_or(DecodeError::Truncated)?;
-        let text = std::str::from_utf8(&bytes[at..at + end]).map_err(|_| DecodeError::NotText)?;
-        table.push(text);
-        at += end + 1;
+        table.push(std::str::from_utf8(raw).map_err(|_| DecodeError::NotText)?);
+        at += len;
     }
     let string = |at: &mut usize| -> Result<&str> {
         let index = take(at, bytes)?;
@@ -230,6 +232,17 @@ mod tests {
         let back = decode(&bytes, parsed.lang, false, false).unwrap();
         assert_eq!(back.symbols[0].parent, None);
         assert_eq!(back.symbols[0].name, "a");
+    }
+
+    #[test]
+    fn a_nul_inside_a_signature_survives() {
+        let mut parsed = parser::parse_path(std::path::Path::new("a.rs"), SOURCE).unwrap();
+        parsed.symbols[0].signature = "fn f(sep = \"\0\")".to_string();
+        parsed.symbols[0].name = "\0".to_string();
+        let bytes = encode(&parsed);
+        let back = decode(&bytes, parsed.lang, false, false).unwrap();
+        assert_eq!(back.symbols, parsed.symbols);
+        assert_eq!(back.idents, parsed.idents);
     }
 
     #[test]
