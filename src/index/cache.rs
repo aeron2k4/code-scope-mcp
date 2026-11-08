@@ -64,68 +64,49 @@ pub enum StoreError {
 
 /// What the store keeps per file: the blob hash that validates it, a header
 /// for the flags JSON would otherwise have to hold, and the compact parse.
+/// It borrows its bytes, so a read can check the hash in place and only
+/// decode an entry that is still valid.
 #[derive(Debug, PartialEq, Eq)]
-struct Stored {
-    blob: String,
+struct Stored<'a> {
+    blob: &'a str,
     lang: Lang,
     has_errors: bool,
     incomplete: bool,
-    parsed: Vec<u8>,
+    parsed: &'a [u8],
 }
 
-/// The bytes of the header that come before the blob hash: the language and
-/// a byte of flags.
-const HEADER_BYTES: usize = 2;
+/// The bytes of the header: the language, a byte of flags and the length of
+/// the blob hash that follows it.
+const HEADER_BYTES: usize = 3;
 
-impl Stored {
-    /// The header, then the length and bytes of the blob hash, then the bytes
-    /// of [`store_format`].
+impl<'a> Stored<'a> {
+    /// The header, then the bytes of the blob hash, then the bytes of
+    /// [`store_format`].
     fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(2 * HEADER_BYTES + 40 + self.parsed.len());
-        out.push(self.lang.index() as u8);
-        out.push(u8::from(self.has_errors) | u8::from(self.incomplete) << 1);
         // A blob hash is 40 or 64 bytes. A longer one is cut, which can only
         // make the entry miss, never match another blob.
         let blob = &self.blob.as_bytes()[..self.blob.len().min(u8::MAX as usize)];
+        let mut out = Vec::with_capacity(HEADER_BYTES + blob.len() + self.parsed.len());
+        out.push(self.lang.index() as u8);
+        out.push(u8::from(self.has_errors) | u8::from(self.incomplete) << 1);
         out.push(blob.len() as u8);
         out.extend_from_slice(blob);
-        out.extend_from_slice(&self.parsed);
+        out.extend_from_slice(self.parsed);
         out
     }
 
-    /// Anything that cannot be read back leaves empty fields, which the
-    /// caller then treats as a miss.
-    fn decode(bytes: &[u8]) -> Self {
-        let mut stored = Stored {
-            blob: String::new(),
-            lang: Lang::C,
-            has_errors: true,
-            incomplete: true,
-            parsed: Vec::new(),
-        };
-        let Some((&lang, rest)) = bytes.split_first() else {
-            return stored;
-        };
-        let Some((&flags, rest)) = rest.split_first() else {
-            return stored;
-        };
-        let Some((&hash_len, rest)) = rest.split_first() else {
-            return stored;
-        };
-        let hash_len = hash_len as usize;
-        if rest.len() < hash_len {
-            return stored;
-        }
-        let (hash, parsed) = rest.split_at(hash_len);
-        let Ok(hash) = std::str::from_utf8(hash) else {
-            return stored;
-        };
-        stored.blob = hash.to_string();
-        stored.lang = Lang::from_index(lang as usize).unwrap_or(Lang::C);
-        stored.has_errors = flags & 1 != 0;
-        stored.incomplete = flags & 2 != 0;
-        stored.parsed = parsed.to_vec();
-        stored
+    /// None when `bytes` is too short or holds an unknown language or a
+    /// hash that is not text, which the caller treats as a miss.
+    fn decode(bytes: &'a [u8]) -> Option<Self> {
+        let (&[lang, flags, hash_len], rest) = bytes.split_first_chunk::<HEADER_BYTES>()?;
+        let (hash, parsed) = rest.split_at_checked(hash_len as usize)?;
+        Some(Stored {
+            blob: std::str::from_utf8(hash).ok()?,
+            lang: Lang::from_index(lang as usize)?,
+            has_errors: flags & 1 != 0,
+            incomplete: flags & 2 != 0,
+            parsed,
+        })
     }
 }
 
@@ -193,31 +174,35 @@ impl PersistentStore {
     /// Stored parse for `path` if its blob hash still matches. Any storage
     /// or decoding problem is treated as a miss.
     fn load(&self, path: &Path, blob: &str) -> Option<ParsedFile> {
-        let read = || -> Result<Option<Stored>, StoreError> {
+        let read = || -> Result<Option<ParsedFile>, StoreError> {
             let rtxn = self.env.read_txn()?;
-            Ok(self.db.get(&rtxn, Self::key(path))?.map(Stored::decode))
-        };
-        match read() {
-            Ok(Some(stored)) if stored.blob == blob => {
-                match store_format::decode(
-                    &stored.parsed,
-                    stored.lang,
-                    stored.has_errors,
-                    stored.incomplete,
-                ) {
-                    Ok(parsed) => Some(parsed),
-                    Err(err) => {
-                        tracing::debug!(%err, path = %path.display(), "ignoring stored parse");
-                        None
-                    }
+            // The hash is compared on the mapped bytes, so a stale entry is
+            // neither copied nor decoded.
+            let Some(stored) = self
+                .db
+                .get(&rtxn, Self::key(path))?
+                .and_then(Stored::decode)
+                .filter(|stored| stored.blob == blob)
+            else {
+                return Ok(None);
+            };
+            match store_format::decode(
+                stored.parsed,
+                stored.lang,
+                stored.has_errors,
+                stored.incomplete,
+            ) {
+                Ok(parsed) => Ok(Some(parsed)),
+                Err(err) => {
+                    tracing::debug!(%err, path = %path.display(), "ignoring stored parse");
+                    Ok(None)
                 }
             }
-            Ok(_) => None,
-            Err(err) => {
-                tracing::warn!(%err, "parse store read failed");
-                None
-            }
-        }
+        };
+        read().unwrap_or_else(|err| {
+            tracing::warn!(%err, "parse store read failed");
+            None
+        })
     }
 
     /// Persist a batch. The store is only a cache, so once real usage passes
@@ -276,12 +261,13 @@ impl PersistentStore {
     fn write_batch(&self, items: &[(PathBuf, String, Arc<CachedFile>)]) -> Result<(), StoreError> {
         let mut wtxn = self.env.write_txn()?;
         for (path, blob, file) in items {
+            let parsed = store_format::encode(&file.parsed);
             let stored = Stored {
-                blob: blob.clone(),
+                blob,
                 lang: file.parsed.lang,
                 has_errors: file.parsed.has_errors,
                 incomplete: file.parsed.incomplete,
-                parsed: store_format::encode(&file.parsed),
+                parsed: &parsed,
             };
             self.db.put(&mut wtxn, Self::key(path), &stored.encode())?;
         }
@@ -630,7 +616,8 @@ mod tests {
     #[test]
     fn a_stored_file_round_trips_through_its_header() {
         let parsed = parser::parse_source(parser::Lang::Rust, "struct S;\nfn f() {}\n").unwrap();
-        let blob = "ce013625030ba8dba906f756967f9e9ca394464a".to_string();
+        let blob = "ce013625030ba8dba906f756967f9e9ca394464a";
+        let encoded = store_format::encode(&parsed);
         for (lang, has_errors, incomplete) in [
             (parser::Lang::Rust, false, false),
             (parser::Lang::Tsx, true, false),
@@ -638,21 +625,24 @@ mod tests {
             (parser::Lang::Cpp, true, true),
         ] {
             let stored = Stored {
-                blob: blob.clone(),
+                blob,
                 lang,
                 has_errors,
                 incomplete,
-                parsed: store_format::encode(&parsed),
+                parsed: &encoded,
             };
-            assert_eq!(Stored::decode(&stored.encode()), stored);
+            assert_eq!(Stored::decode(&stored.encode()), Some(stored));
         }
 
-        // Too short for a header, and a hash length longer than the record:
-        // both are a miss, never a partial file.
-        for damaged in [&[0x01][..], &[0x01, 0x02], &[0x01, 0x00, 0xff, 0x00]] {
-            let miss = Stored::decode(damaged);
-            assert!(miss.blob.is_empty() && miss.parsed.is_empty());
-            assert!(miss.has_errors && miss.incomplete);
+        // Too short for a header, a hash length longer than the record, and
+        // an unknown language: all are a miss, never a partial file.
+        for damaged in [
+            &[0x01][..],
+            &[0x01, 0x02],
+            &[0x01, 0x00, 0xff, 0x00],
+            &[0xff, 0x00, 0x01, b'a'],
+        ] {
+            assert_eq!(Stored::decode(damaged), None);
         }
     }
 
