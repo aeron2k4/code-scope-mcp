@@ -38,6 +38,23 @@ fn candidates(var: impl Fn(&str) -> Option<OsString>) -> Vec<PathBuf> {
             .or_else(|| go_path.map(|p| p.join("pkg").join("mod")))
             .or_else(|| in_home("go/pkg/mod")),
     );
+    // The Go standard library, in GOROOT/src: where GOROOT says, else where
+    // the official tarball, distribution packages, Homebrew and `go install
+    // golang.org/dl/goX` put it. `go env` is not run, to keep startup fast.
+    let mut go_roots: Vec<PathBuf> = path("GOROOT").into_iter().collect();
+    if cfg!(unix) {
+        for dir in [
+            "/usr/local/go",
+            "/usr/lib/go",
+            "/opt/homebrew/opt/go/libexec",
+            "/usr/local/opt/go/libexec",
+        ] {
+            go_roots.push(PathBuf::from(dir));
+        }
+        go_roots.extend(prefixed(Path::new("/usr/lib"), "go-"));
+    }
+    go_roots.extend(in_home("sdk").iter().flat_map(|sdk| prefixed(sdk, "go")));
+    dirs.extend(go_roots.into_iter().map(|root| root.join("src")));
     if cfg!(unix) {
         for dir in ["/usr/include", "/usr/local/include"] {
             dirs.push(PathBuf::from(dir));
@@ -57,12 +74,17 @@ fn candidates(var: impl Fn(&str) -> Option<OsString>) -> Vec<PathBuf> {
 /// The `python3*` directories in `lib`, which hold the standard library and
 /// `site-packages`.
 fn pythons(lib: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(lib) else {
+    prefixed(lib, "python3")
+}
+
+/// The entries of `dir` whose name starts with `prefix`.
+fn prefixed(dir: &Path, prefix: &str) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
     entries
         .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_name().to_string_lossy().starts_with("python3"))
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(prefix))
         .map(|entry| entry.path())
         .collect()
 }
@@ -99,6 +121,7 @@ mod tests {
             match name {
                 "HOME" => Some(base.join("home").into()),
                 "CARGO_HOME" => Some(base.join("cargo").into()),
+                "GOROOT" => Some(base.join("goroot").into()),
                 "GOPATH" => {
                     Some(std::env::join_paths([base.join("go1"), base.join("go2")]).unwrap())
                 }
@@ -114,6 +137,7 @@ mod tests {
             base.join("cargo/git/checkouts"),
             base.join("home/.rustup/toolchains"),
             base.join("go1/pkg/mod"),
+            base.join("goroot/src"),
             base.join("extra"),
         ] {
             assert!(dirs.contains(&want), "{want:?} not in {dirs:?}");

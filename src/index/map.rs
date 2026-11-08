@@ -1425,6 +1425,8 @@ impl Graph {
                     } else {
                         1.0
                     };
+                    // A focus file's own symbols count in full, private or not.
+                    let own = if own < 1.0 { own * narrow } else { own };
                     let score = referenced + own * ranks[f] * kind_weight(kind) * nested * test;
                     out.push(Candidate {
                         score,
