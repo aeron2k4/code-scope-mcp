@@ -83,6 +83,15 @@ pub fn prune(lang: Lang, source: &str, symbols: &[Symbol], opts: &PruneOptions) 
     PruneResult::new(truncate_lines(&top, budget), Strategy::Truncated, 0)
 }
 
+/// [`prune`] for a file in no supported language: the text as-is, or its
+/// first lines when it does not fit.
+pub fn prune_plain(source: &str, max_tokens: usize) -> PruneResult {
+    if estimate_tokens(source) <= max_tokens {
+        return PruneResult::new(source.to_string(), Strategy::Full, 0);
+    }
+    PruneResult::new(truncate_lines(source, max_tokens), Strategy::Truncated, 0)
+}
+
 struct Candidate {
     start: usize,
     end: usize,

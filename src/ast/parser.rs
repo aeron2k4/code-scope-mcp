@@ -17,7 +17,10 @@ use tree_sitter::{Node, Parser, Query, QueryCursor, QueryCursorOptions};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
-    #[error("unsupported language for file: {0}")]
+    #[error(
+        "unsupported language for file: {0}; without symbols, use read_lines, \
+         read_file_pruned, replace_text or replace_lines"
+    )]
     UnsupportedLanguage(String),
     #[error("failed to load grammar: {0}")]
     Grammar(#[from] tree_sitter::LanguageError),

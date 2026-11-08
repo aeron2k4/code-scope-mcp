@@ -127,6 +127,10 @@ directory as the workspace root.
 | `changed_symbols`  | Symbols added/modified/removed by uncommitted changes or since a revision        |
 | `git_status`       | Working-tree status                                                              |
 
+Files in other languages are plain text: `read_lines`, `read_file_pruned` (the
+text, cut at `max_tokens`), `replace_text`, `replace_lines` and `insert_symbol`
+at the end of the file work on them, without the syntax check.
+
 Paths are relative to the workspace root. The tools that only read
 (`get_file_outline`, `read_symbol`, `read_lines`, `read_file_pruned`, and
 `search_text`, `list_files`, `find_references` through `dir`) also take the

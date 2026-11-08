@@ -15,7 +15,9 @@ use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
 use rmcp::{ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::Deserialize;
 
-use crate::ast::parser::{self, ParsedFile, Symbol, SymbolKind, line_number, symbol_start};
+use crate::ast::parser::{
+    self, ParseError, ParsedFile, Symbol, SymbolKind, line_number, symbol_start,
+};
 use crate::ast::pruner::{self, PruneOptions};
 use crate::atomic::write_atomic;
 use crate::git;
@@ -294,6 +296,7 @@ impl Workspace {
     ) -> Result<String> {
         let path = self.resolve(rel)?;
         let (source, parsed) = self.read_fresh(&path)?;
+        let parsed = self.symbols_needed(&path, parsed)?;
         let sym = unique_symbol(&parsed, rel, name, line)?;
 
         let start = symbol_start(&parsed, &source, sym);
@@ -311,7 +314,7 @@ impl Workspace {
                 &source[sym.end_byte..]
             )
         };
-        self.write_checked(&path, &parsed, &updated, || {
+        self.write_checked(&path, Some(&parsed), &updated, || {
             format!("the new source of {}", sym.qualified_name())
         })?;
 
@@ -374,7 +377,7 @@ impl Workspace {
         let kept = starts.len() - (end - start + 1);
         if new_source.is_empty() {
             let updated = format!("{}{}", &source[..offset], &source[after..]);
-            self.write_checked(&path, &parsed, &updated, || {
+            self.write_checked(&path, parsed.as_ref(), &updated, || {
                 format!("deleting lines {start}-{end}")
             })?;
             return Ok(format!(
@@ -394,7 +397,7 @@ impl Workspace {
             replacement.push_str(eol);
         }
         let updated = format!("{}{replacement}{}", &source[..offset], &source[after..]);
-        self.write_checked(&path, &parsed, &updated, || {
+        self.write_checked(&path, parsed.as_ref(), &updated, || {
             format!("the new lines {start}-{end}")
         })?;
 
@@ -473,7 +476,7 @@ impl Workspace {
             }
             placed.push(at);
         }
-        self.write_checked(&path, &parsed, &updated, || match edits.len() {
+        self.write_checked(&path, parsed.as_ref(), &updated, || match edits.len() {
             1 => "the edit".to_string(),
             n => format!("the {n} edits"),
         })?;
@@ -558,6 +561,7 @@ impl Workspace {
 
         let (pos, text, place) = match anchor {
             Some(Anchor::After(name)) => {
+                let parsed = self.symbols_needed(&path, parsed.clone())?;
                 let sym = unique_symbol(&parsed, rel, name, line)?;
                 // A symbol that follows, or the closing of its parent, keeps
                 // the rest of the line from being part of this symbol.
@@ -577,6 +581,7 @@ impl Workspace {
                 (pos, text, format!("after {}", sym.qualified_name()))
             }
             Some(Anchor::Before(name)) => {
+                let parsed = self.symbols_needed(&path, parsed.clone())?;
                 let sym = unique_symbol(&parsed, rel, name, line)?;
                 let pos = symbol_start(&parsed, &source, sym);
                 // Other code precedes the symbol on its line: start a new one.
@@ -606,7 +611,7 @@ impl Workspace {
         };
         let text = with_line_ending(&text, line_ending(&source));
         let updated = format!("{}{text}{}", &source[..pos], &source[pos..]);
-        self.write_checked(&path, &parsed, &updated, || {
+        self.write_checked(&path, parsed.as_ref(), &updated, || {
             "the inserted source".to_string()
         })?;
 
@@ -622,26 +627,41 @@ impl Workspace {
     }
 
     /// Read and parse a file from disk, bypassing the cache, before a write.
-    fn read_fresh(&self, path: &Path) -> Result<(String, ParsedFile)> {
+    /// A file in no supported language comes back unparsed.
+    fn read_fresh(&self, path: &Path) -> Result<(String, Option<ParsedFile>)> {
         if !path.is_file() {
             bail!("{} is not a regular file", self.display(path));
         }
         let source = std::fs::read_to_string(path)
             .with_context(|| format!("cannot read {}", self.display(path)))?;
-        let parsed = parser::parse_path(path, &source)?;
+        let parsed = match parser::parse_path(path, &source) {
+            Ok(parsed) => Some(parsed),
+            Err(ParseError::UnsupportedLanguage(_)) => None,
+            Err(err) => return Err(err.into()),
+        };
         Ok((source, parsed))
     }
 
-    /// Write `updated` unless it has syntax errors the original did not.
+    /// The parse of a file whose symbols an edit needs: an error for a file
+    /// in no supported language.
+    fn symbols_needed(&self, path: &Path, parsed: Option<ParsedFile>) -> Result<ParsedFile> {
+        parsed.ok_or_else(|| ParseError::UnsupportedLanguage(self.display(path)).into())
+    }
+
+    /// Write `updated` unless it has syntax errors the original did not. A
+    /// file in no supported language (`original` None) is not checked.
     fn write_checked(
         &self,
         path: &Path,
-        original: &ParsedFile,
+        original: Option<&ParsedFile>,
         updated: &str,
         what: impl FnOnce() -> String,
     ) -> Result<()> {
-        let reparsed = parser::parse_path(path, updated)?;
-        if reparsed.has_errors && !original.has_errors {
+        let reparsed = match original {
+            Some(original) if !original.has_errors => Some(parser::parse_path(path, updated)?),
+            _ => None,
+        };
+        if let Some(reparsed) = reparsed.filter(|r| r.has_errors) {
             let mut msg = format!("not written: {} has syntax errors", what());
             if let Some(err) = parser::first_syntax_error(reparsed.lang, updated) {
                 let _ = write!(msg, ", the first at line {}", err.line);
@@ -662,9 +682,18 @@ impl Workspace {
 
     pub fn read_pruned(&self, rel: &str, max_tokens: usize, keep: Vec<String>) -> Result<String> {
         let path = self.resolve_read(rel)?;
-        let file = self.cache.get(&path)?;
-        let opts = PruneOptions { max_tokens, keep };
-        let result = pruner::prune(file.parsed.lang, &file.source, &file.parsed.symbols, &opts);
+        let result = if parser::Lang::from_path(&path).is_some() {
+            let file = self.cache.get(&path)?;
+            let opts = PruneOptions { max_tokens, keep };
+            pruner::prune(file.parsed.lang, &file.source, &file.parsed.symbols, &opts)
+        } else {
+            if !path.is_file() {
+                bail!("{} is not a regular file", self.display(&path));
+            }
+            let source = std::fs::read_to_string(&path)
+                .with_context(|| format!("cannot read {}", self.display(&path)))?;
+            pruner::prune_plain(&source, max_tokens)
+        };
         let mut out = format!(
             "// {} | strategy={} | ~{}/{} tokens",
             self.display(&path),
@@ -1946,6 +1975,45 @@ mod tests {
             err.to_string().ends_with("the first at line 2: y = = 2"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn files_in_no_supported_language_are_plain_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("run.sh");
+        fs::write(&file, "echo a\necho b\n").unwrap();
+        fs::write(dir.path().join("big.txt"), "word\n".repeat(400)).unwrap();
+        let ws = Workspace::new(dir.path()).unwrap();
+
+        let out = ws.read_pruned("run.sh", 100, Vec::new()).unwrap();
+        assert!(out.starts_with("// run.sh | strategy=full |"), "{out}");
+        assert!(out.ends_with("\necho a\necho b\n"), "{out}");
+        let out = ws.read_pruned("big.txt", 50, Vec::new()).unwrap();
+        assert!(
+            out.starts_with("// big.txt | strategy=truncated |"),
+            "{out}"
+        );
+        assert!(out.len() < 400, "{out}");
+
+        // Edits that need no symbols apply, unchecked.
+        let edit = TextEdit {
+            old_text: "echo b".into(),
+            new_text: "echo (".into(),
+        };
+        ws.replace_text("run.sh", &[edit]).unwrap();
+        ws.replace_lines("run.sh", 1, 1, "echo a", "echo z")
+            .unwrap();
+        ws.insert_symbol("run.sh", "echo end", None, None).unwrap();
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "echo z\necho (\n\necho end\n"
+        );
+        let err = ws.replace_symbol("run.sh", "a", None, "x").unwrap_err();
+        assert!(err.to_string().contains("unsupported language"), "{err}");
+        let err = ws
+            .insert_symbol("run.sh", "x", Some(Anchor::After("a")), None)
+            .unwrap_err();
+        assert!(err.to_string().contains("unsupported language"), "{err}");
     }
 
     #[test]
