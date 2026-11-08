@@ -32,6 +32,8 @@ const DEFAULT_HIT_LIMIT: usize = 100;
 /// Compiled-regex size cap, so a pathological pattern fails fast.
 const MAX_REGEX_BYTES: usize = 1 << 20;
 const MAX_SYMBOL_MATCHES: usize = 5;
+/// Most lines one `read_lines` call returns.
+const MAX_READ_LINES: usize = 400;
 /// Says what an empty result of a symbol search did not cover.
 const UNSEARCHED_NOTE: &str = "… not searched: hidden files, non-UTF-8 files, files over 2 MB\n";
 
@@ -345,6 +347,135 @@ impl Workspace {
             "{}: lines {start}-{end} are now {added} {counted}\n",
             self.display(&path)
         ))
+    }
+
+    /// Apply exact text replacements to one file, in order: each `old_text`
+    /// must occur exactly once in the file as the earlier edits left it.
+    /// Line breaks in the edits follow the file's. All or nothing: an edit
+    /// that does not apply leaves the file as it was, and so does a result
+    /// with syntax errors the file did not have. The file is re-read rather
+    /// than taken from the cache.
+    pub fn replace_text(&self, rel: &str, edits: &[TextEdit]) -> Result<String> {
+        let path = self.resolve(rel)?;
+        if edits.is_empty() {
+            bail!("no edits given");
+        }
+        let (source, parsed) = self.read_fresh(&path)?;
+        let eol = line_ending(&source);
+        let mut updated = source.clone();
+        // Where each edit's new text starts, kept current as later edits
+        // shift the text after them.
+        let mut placed: Vec<usize> = Vec::with_capacity(edits.len());
+        for (i, edit) in edits.iter().enumerate() {
+            let n = i + 1;
+            let old = with_line_ending(&edit.old_text, eol);
+            let new = with_line_ending(&edit.new_text, eol);
+            if old.is_empty() {
+                bail!(
+                    "not written: edit {n} has an empty old_text; add code with insert_symbol \
+                     or replace_lines"
+                );
+            }
+            if old == new {
+                bail!("not written: edit {n} has the same old_text and new_text");
+            }
+            let found: Vec<usize> = updated.match_indices(&old).map(|(at, _)| at).collect();
+            let at = match found[..] {
+                [at] => at,
+                [] => bail!(
+                    "not written: edit {n}: old_text is not in {}{}",
+                    self.display(&path),
+                    near_miss(&updated, &old)
+                ),
+                _ => {
+                    let lines: Vec<String> = found
+                        .iter()
+                        .take(MAX_SYMBOL_MATCHES)
+                        .map(|&at| line_number(&updated, at).to_string())
+                        .collect();
+                    let more = if found.len() > MAX_SYMBOL_MATCHES {
+                        ", …"
+                    } else {
+                        ""
+                    };
+                    bail!(
+                        "not written: edit {n}: old_text occurs {} times in {}, at lines {}{more}; \
+                         include surrounding text to pick one",
+                        found.len(),
+                        self.display(&path),
+                        lines.join(", ")
+                    )
+                }
+            };
+            updated.replace_range(at..at + old.len(), &new);
+            for start in &mut placed {
+                if *start > at {
+                    // An edit inside an earlier one's text moves it to `at`.
+                    *start = (*start + new.len()).saturating_sub(old.len()).max(at);
+                }
+            }
+            placed.push(at);
+        }
+        self.write_checked(&path, &parsed, &updated, || match edits.len() {
+            1 => "the edit".to_string(),
+            n => format!("the {n} edits"),
+        })?;
+
+        let lines: Vec<String> = placed
+            .iter()
+            .map(|&at| line_number(&updated, at).to_string())
+            .collect();
+        let (edited, at) = match edits.len() {
+            1 => ("1 edit".to_string(), "line"),
+            n => (format!("{n} edits"), "lines"),
+        };
+        Ok(format!(
+            "{}: applied {edited}, at {at} {}\n",
+            self.display(&path),
+            lines.join(", ")
+        ))
+    }
+
+    /// Lines `start..=end` of a file, numbered: at most [`MAX_READ_LINES`],
+    /// which is also how many come when `end` is not given.
+    pub fn read_lines(&self, rel: &str, start: usize, end: Option<usize>) -> Result<String> {
+        let path = self.resolve(rel)?;
+        if !path.is_file() {
+            bail!("{} is not a regular file", self.display(&path));
+        }
+        let source = std::fs::read_to_string(&path)
+            .with_context(|| format!("cannot read {}", self.display(&path)))?;
+        if start == 0 || end.is_some_and(|end| end < start) {
+            bail!(
+                "{start}-{} is not a range of lines; they start at 1",
+                end.unwrap_or(start)
+            );
+        }
+        let total = source.lines().count();
+        if start > total {
+            bail!(
+                "{} has {total} lines; asked for line {start}",
+                self.display(&path)
+            );
+        }
+        let wanted = end.unwrap_or(usize::MAX).min(total);
+        let last = wanted.min(start + MAX_READ_LINES - 1);
+        let mut out = format!(
+            "// {}:{start}-{last} of {total} lines\n",
+            self.display(&path)
+        );
+        for (i, line) in source.lines().enumerate().take(last).skip(start - 1) {
+            let _ = writeln!(out, "{}\t{line}", i + 1);
+        }
+        if last < wanted {
+            let _ = writeln!(
+                out,
+                "… {} more lines; at most {MAX_READ_LINES} per call, continue from line {}",
+                wanted - last,
+                last + 1
+            );
+        }
+        Ok(out)
     }
 
     /// Insert `new_source` as a new definition after or before an existing
@@ -766,6 +897,26 @@ fn excerpt(text: &str, first_line: usize) -> String {
     out
 }
 
+/// What the file holds where `old` was probably meant: the lines from the
+/// first one containing the first non-blank line of `old`, ignoring
+/// indentation, so a refused edit can be corrected without a read.
+fn near_miss(source: &str, old: &str) -> String {
+    let Some(first) = old.lines().map(str::trim).find(|line| !line.is_empty()) else {
+        return String::new();
+    };
+    let lines: Vec<&str> = source.lines().collect();
+    match lines.iter().position(|line| line.contains(first)) {
+        Some(i) => {
+            let end = (i + old.lines().count()).min(lines.len());
+            format!(
+                "; its first line is there, followed by:\n{}",
+                excerpt(&lines[i..end].join("\n"), i + 1)
+            )
+        }
+        None => format!("; no line contains {first:?}"),
+    }
+}
+
 /// `text` without one final line break, `\n` or `\r\n`.
 fn without_final_break(text: &str) -> &str {
     text.strip_suffix('\n')
@@ -887,6 +1038,34 @@ pub struct ReplaceLinesParams {
     /// Replacement for those lines, without line numbers and with
     /// indentation. Empty deletes them.
     pub new_source: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TextEdit {
+    /// Text exactly as it is in the file, indentation and line breaks
+    /// included. It must occur exactly once.
+    pub old_text: String,
+    /// Replacement text. Empty deletes `old_text`.
+    pub new_text: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReplaceTextParams {
+    /// File path relative to the workspace root.
+    pub path: String,
+    /// Replacements applied in order, each to the text the earlier ones left.
+    pub edits: Vec<TextEdit>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReadLinesParams {
+    /// File path relative to the workspace root.
+    pub path: String,
+    /// First line to return, 1-based.
+    pub start: usize,
+    /// Last line to return, inclusive. Default and maximum: 400 lines from `start`.
+    #[serde(default)]
+    pub end: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1063,6 +1242,27 @@ impl AstLens {
     }
 
     #[tool(
+        description = "Replace exact text in a file without reading it first, for changes that are not a whole definition: an import, a few lines, several spots in one file. Each edit's old_text must occur exactly once, whitespace included, in the file as the earlier edits left it. All edits apply or none; refused if the result has syntax errors. Empty new_text deletes."
+    )]
+    async fn replace_text(
+        &self,
+        Parameters(p): Parameters<ReplaceTextParams>,
+    ) -> Result<String, String> {
+        self.run(move |ws| ws.replace_text(&p.path, &p.edits)).await
+    }
+
+    #[tool(
+        description = "Return lines start..end of a file, numbered, at most 400 per call: for code that is not one definition, such as the line of a compiler error or a search hit. Prefer read_symbol for a whole function or class."
+    )]
+    async fn read_lines(
+        &self,
+        Parameters(p): Parameters<ReadLinesParams>,
+    ) -> Result<String, String> {
+        self.run(move |ws| ws.read_lines(&p.path, p.start, p.end))
+            .await
+    }
+
+    #[tool(
         description = "Insert a new function, class, method, ... into a file without reading it first: after or before a named symbol (a blank line apart), or at the end of the file when neither is given. Indent new_source for its place, e.g. inside a class. Refused if the result has syntax errors."
     )]
     async fn insert_symbol(
@@ -1172,13 +1372,14 @@ impl ServerHandler for AstLens {
             ))
             .with_instructions(
                 "AST-aware code navigation. Prefer get_file_outline and search_symbols to locate \
-                 code, read_symbol to read exactly one definition, and read_file_pruned to read \
-                 a whole file within a token budget. Use find_references to see where a symbol \
-                 is used and search_text instead of grep. To rewrite a whole function or class, \
-                 use replace_symbol, and insert_symbol to add one, instead of reading and \
-                 editing the file. For a few lines that are not a whole definition, use \
-                 replace_lines with the lines as they are now. changed_symbols summarises a \
-                 git diff by symbol.",
+                 code, read_symbol to read exactly one definition, read_lines for a range of \
+                 lines such as a compiler error's, and read_file_pruned to read a whole file \
+                 within a token budget. Use find_references to see where a symbol is used and \
+                 search_text instead of grep. To rewrite a whole function or class, use \
+                 replace_symbol, and insert_symbol to add one, instead of reading and editing \
+                 the file. For other changes (an import, a few lines, several spots in a file) \
+                 use replace_text with the exact text to replace, or replace_lines with the \
+                 lines as they are now. changed_symbols summarises a git diff by symbol.",
             )
     }
 }
@@ -1547,6 +1748,147 @@ mod tests {
         .unwrap();
         let after = ws.cache.get(&dir.path().join("src/lib.rs")).unwrap();
         assert!(after.source.contains("-> Cfg {"), "{}", after.source);
+    }
+
+    fn text_edit(old_text: &str, new_text: &str) -> TextEdit {
+        TextEdit {
+            old_text: old_text.into(),
+            new_text: new_text.into(),
+        }
+    }
+
+    #[test]
+    fn replace_text_applies_edits_in_order() {
+        let (dir, ws) = workspace();
+        let path = dir.path().join("src/lib.rs");
+        let warm = ws.cache.get(&path).unwrap();
+        assert!(warm.source.contains("Self"));
+
+        let out = ws
+            .replace_text(
+                "src/lib.rs",
+                &[
+                    text_edit("        Cfg\n", "        Cfg::default()\n"),
+                    text_edit("pub struct Cfg;\n", "#[derive(Default)]\npub struct Cfg;\n"),
+                    // Sees the text the first edit left.
+                    text_edit("Cfg::default()", "Self::default()"),
+                ],
+            )
+            .unwrap();
+        // Lines in the file as written: the second edit added one above.
+        assert_eq!(out, "src/lib.rs: applied 3 edits, at lines 6, 1, 6\n");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "#[derive(Default)]\npub struct Cfg;\n\nimpl Cfg {\n    pub fn load() -> Self {\n        Self::default()\n    }\n}\n"
+        );
+        assert!(
+            ws.cache
+                .get(&path)
+                .unwrap()
+                .source
+                .contains("Self::default()")
+        );
+
+        let out = ws
+            .replace_text("src/lib.rs", &[text_edit("#[derive(Default)]\n", "")])
+            .unwrap();
+        assert_eq!(out, "src/lib.rs: applied 1 edit, at line 1\n");
+    }
+
+    #[test]
+    fn replace_text_refuses_and_leaves_the_file_alone() {
+        let (dir, ws) = workspace();
+        let path = dir.path().join("src/lib.rs");
+        let before = fs::read_to_string(&path).unwrap();
+
+        // The first edit applies, the second does not: nothing is written.
+        let err = ws
+            .replace_text(
+                "src/lib.rs",
+                &[
+                    text_edit("pub struct Cfg;", "pub struct Config;"),
+                    // Indented too little.
+                    text_edit("  pub fn load() -> Self {\n      Cfg", "x"),
+                ],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("not written: edit 2: old_text is not in src/lib.rs"),
+            "{err}"
+        );
+        // The near miss shows the line as it is, to copy into the next call.
+        assert!(err.contains("4\t    pub fn load() -> Self {"), "{err}");
+
+        let err = ws
+            .replace_text("src/lib.rs", &[text_edit("Cfg", "Config")])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("occurs 3 times in src/lib.rs, at lines 1, 3, 5"),
+            "{err}"
+        );
+
+        let err = ws
+            .replace_text("src/lib.rs", &[text_edit("missing()", "x")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.ends_with("no line contains \"missing()\""), "{err}");
+
+        for edits in [
+            vec![],
+            vec![text_edit("", "x")],
+            vec![text_edit("Cfg;", "Cfg;")],
+            vec![text_edit("    }\n}", "    }")],
+        ] {
+            assert!(ws.replace_text("src/lib.rs", &edits).is_err(), "{edits:?}");
+        }
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn replace_text_follows_crlf_line_endings() {
+        let (dir, ws) = workspace();
+        fs::write(dir.path().join("a.py"), "a = 1\r\nb = 2\r\n").unwrap();
+        ws.replace_text("a.py", &[text_edit("a = 1\nb = 2\n", "a = 1\nb = 20\n")])
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("a.py")).unwrap(),
+            "a = 1\r\nb = 20\r\n"
+        );
+    }
+
+    #[test]
+    fn read_lines_returns_a_numbered_range() {
+        let (dir, ws) = workspace();
+        assert_eq!(
+            ws.read_lines("src/lib.rs", 3, Some(4)).unwrap(),
+            "// src/lib.rs:3-4 of 7 lines\n3\timpl Cfg {\n4\t    pub fn load() -> Self {\n"
+        );
+        // Past the end stops at the last line.
+        assert_eq!(
+            ws.read_lines("src/lib.rs", 7, Some(99)).unwrap(),
+            "// src/lib.rs:7-7 of 7 lines\n7\t}\n"
+        );
+        for (start, end) in [(0, None), (8, None), (4, Some(3))] {
+            assert!(ws.read_lines("src/lib.rs", start, end).is_err());
+        }
+
+        let long: String = (1..=1000).map(|i| format!("x{i} = {i}\n")).collect();
+        fs::write(dir.path().join("long.py"), long).unwrap();
+        let out = ws.read_lines("long.py", 2, None).unwrap();
+        assert!(
+            out.starts_with("// long.py:2-401 of 1000 lines\n2\tx2 = 2\n"),
+            "{out}"
+        );
+        assert!(
+            out.ends_with(
+                "401\tx401 = 401\n… 599 more lines; at most 400 per call, continue from line 402\n"
+            ),
+            "{out}"
+        );
+        let out = ws.read_lines("long.py", 990, Some(1000)).unwrap();
+        assert!(out.ends_with("1000\tx1000 = 1000\n"), "{out}");
     }
 
     #[test]

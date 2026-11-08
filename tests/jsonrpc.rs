@@ -107,9 +107,11 @@ async fn mcp_session_over_jsonrpc() {
             "insert_symbol",
             "list_files",
             "read_file_pruned",
+            "read_lines",
             "read_symbol",
             "replace_lines",
             "replace_symbol",
+            "replace_text",
             "search_symbols",
             "search_text"
         ]

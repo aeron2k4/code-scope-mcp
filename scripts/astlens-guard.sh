@@ -51,13 +51,13 @@ CODE_HINT="[*?[{]|\\.($EXTS)($BOUND|\$)"
 MAX_LINES=${ASTLENS_MAX_READ_LINES:-300}
 [[ "$MAX_LINES" =~ ^[0-9]+$ ]] || MAX_LINES=300
 
-READ_HINT='Use astlens MCP tools instead (load with ToolSearch "select:mcp__astlens__get_file_outline,mcp__astlens__read_symbol,mcp__astlens__search_symbols,mcp__astlens__read_file_pruned"): get_file_outline / read_symbol / read_file_pruned. To rewrite a whole function or class use replace_symbol, to add one use insert_symbol, and to repair a few lines use replace_lines (it takes the lines as they are now and refuses if they changed).'
+READ_HINT='Use astlens MCP tools instead (load with ToolSearch "select:mcp__astlens__get_file_outline,mcp__astlens__read_symbol,mcp__astlens__read_lines,mcp__astlens__read_file_pruned,mcp__astlens__replace_text"): get_file_outline / read_symbol / read_lines (a line range) / read_file_pruned. To rewrite a whole function or class use replace_symbol, to add one use insert_symbol, and for any other change use replace_text (exact old text and its replacement; no read needed) or replace_lines.'
 
 GREP_HINT='Use astlens MCP tools instead (load with ToolSearch "select:mcp__astlens__search_text,mcp__astlens__find_references"): search_text for a literal or regex (.gitignore-aware, shows the enclosing symbol; takes dir), find_references for uses of a symbol. Searching non-code files stays allowed: pass a non-code path, or a filter such as --include="*.md" / -g "*.md" / type md.'
 
 # OpenCode reaches the same tools as astlens_<tool>, without ToolSearch.
 if [ "${ASTLENS_OPENCODE:-}" = 1 ]; then
-  READ_HINT='Use astlens MCP tools instead: astlens_get_file_outline / astlens_read_symbol / astlens_read_file_pruned. To rewrite a whole function or class use astlens_replace_symbol, to add one use astlens_insert_symbol, and to repair a few lines use astlens_replace_lines (it takes the lines as they are now and refuses if they changed).'
+  READ_HINT='Use astlens MCP tools instead: astlens_get_file_outline / astlens_read_symbol / astlens_read_lines (a line range) / astlens_read_file_pruned. To rewrite a whole function or class use astlens_replace_symbol, to add one use astlens_insert_symbol, and for any other change use astlens_replace_text (exact old text and its replacement; no read needed) or astlens_replace_lines.'
   GREP_HINT='Use astlens MCP tools instead: astlens_search_text for a literal or regex (.gitignore-aware, shows the enclosing symbol; takes dir), astlens_find_references for uses of a symbol. Searching non-code files stays allowed: pass a non-code path, or a filter such as include "*.md".'
 fi
 
