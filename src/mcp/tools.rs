@@ -2557,6 +2557,15 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("escapes the workspace root"), "{err}");
-        assert!(err.contains(&*base), "{err}");
+        let open = index::slash_path(&lib.path().canonicalize().unwrap());
+        assert!(err.contains(&open), "{err}");
+        // Paths are shown as a client can send them back, without the
+        // verbatim prefix that canonicalize adds on Windows.
+        assert!(
+            !open.contains('?') && !shown.contains('?'),
+            "{open} {shown}"
+        );
+        let again = ws.read_lines(&shown, 3, Some(3)).unwrap();
+        assert!(again.ends_with("3\t    7\n"), "{again}");
     }
 }

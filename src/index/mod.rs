@@ -22,10 +22,18 @@ use cache::ParseCache;
 pub fn slash_path(path: &Path) -> String {
     let text = path.to_string_lossy();
     if std::path::MAIN_SEPARATOR == '/' {
-        text.into_owned()
-    } else {
-        text.replace(std::path::MAIN_SEPARATOR, "/")
+        return text.into_owned();
     }
+    // `canonicalize` returns verbatim paths (\\?\C:\x, \\?\UNC\host\share\x),
+    // whose prefix stops meaning anything once its separators change.
+    let text = match text.strip_prefix(r"\\?\") {
+        Some(rest) => match rest.strip_prefix(r"UNC\") {
+            Some(unc) => format!(r"\\{unc}"),
+            None => rest.to_owned(),
+        },
+        None => text.into_owned(),
+    };
+    text.replace(std::path::MAIN_SEPARATOR, "/")
 }
 
 /// Longest line excerpt returned by reference and text search.
