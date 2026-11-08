@@ -304,11 +304,7 @@ impl Workspace {
         let after = starts.get(end).copied().unwrap_or(source.len());
         let offset = starts[start - 1];
         let current = &source[offset..after];
-        if !current
-            .lines()
-            .map(str::trim_end)
-            .eq(expect.lines().map(str::trim_end))
-        {
+        if !lines_match(current, expect) {
             bail!(
                 "not written: {} lines {start}-{end} are not what `expect` says; they are:\n{}",
                 self.display(&path),
@@ -316,11 +312,26 @@ impl Workspace {
             );
         }
 
+        let kept = starts.len() - (end - start + 1);
+        if new_source.is_empty() {
+            let updated = format!("{}{}", &source[..offset], &source[after..]);
+            self.write_checked(&path, &parsed, &updated, || {
+                format!("deleting lines {start}-{end}")
+            })?;
+            return Ok(format!(
+                "{}: deleted lines {start}-{end}; {kept} lines left\n",
+                self.display(&path)
+            ));
+        }
+
+        // Only the final break is dropped, so "\n" is one blank line and
+        // trailing blank lines stay.
+        let body = without_final_break(new_source);
         let eol = line_ending(&source);
-        let mut replacement = with_line_ending(new_source.trim_end_matches(['\r', '\n']), eol);
+        let mut replacement = with_line_ending(body, eol);
         // A break is needed before the next line, and kept at the end of a
         // file that already ended with one.
-        if !replacement.is_empty() && (after < source.len() || source.ends_with('\n')) {
+        if after < source.len() || source.ends_with('\n') {
             replacement.push_str(eol);
         }
         let updated = format!("{}{replacement}{}", &source[..offset], &source[after..]);
@@ -328,20 +339,12 @@ impl Workspace {
             format!("the new lines {start}-{end}")
         })?;
 
-        let kept = starts.len() - (end - start + 1);
-        if replacement.is_empty() {
-            Ok(format!(
-                "{}: deleted lines {start}-{end}; {kept} lines left\n",
-                self.display(&path)
-            ))
-        } else {
-            let added = replacement.trim_end_matches(['\r', '\n']).lines().count();
-            let counted = if added == 1 { "line" } else { "lines" };
-            Ok(format!(
-                "{}: lines {start}-{end} are now {added} {counted}\n",
-                self.display(&path)
-            ))
-        }
+        let added = body.split('\n').count();
+        let counted = if added == 1 { "line" } else { "lines" };
+        Ok(format!(
+            "{}: lines {start}-{end} are now {added} {counted}\n",
+            self.display(&path)
+        ))
     }
 
     /// Insert `new_source` as a new definition after or before an existing
@@ -761,6 +764,27 @@ fn excerpt(text: &str, first_line: usize) -> String {
         let _ = writeln!(out, "… {} more lines", lines.len() - 10);
     }
     out
+}
+
+/// `text` without one final line break, `\n` or `\r\n`.
+fn without_final_break(text: &str) -> &str {
+    text.strip_suffix('\n')
+        .map(|text| text.strip_suffix('\r').unwrap_or(text))
+        .unwrap_or(text)
+}
+
+/// The lines of `text` without trailing whitespace. Unlike `str::lines`, ""
+/// is one empty line, so a blank line compares equal to how it is written.
+fn text_lines(text: &str) -> impl Iterator<Item = &str> {
+    without_final_break(text).split('\n').map(str::trim_end)
+}
+
+/// Whether `expect` describes the lines `current`, ignoring trailing
+/// whitespace. A final break in `expect` may end the last line or stand for
+/// a blank line after it: "a\n" matches both `a` and `a` with a blank line.
+fn lines_match(current: &str, expect: &str) -> bool {
+    text_lines(current).eq(text_lines(expect))
+        || (expect.ends_with('\n') && text_lines(current).eq(expect.split('\n').map(str::trim_end)))
 }
 
 fn with_line_ending(text: &str, eol: &str) -> String {
@@ -1403,6 +1427,37 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&file).unwrap(),
             "class C {\n    void m() {\n        try {\n            run();\n        }\n        } catch (Exception e) {\n    }\n}\n"
+        );
+    }
+
+    #[test]
+    fn replace_lines_handles_blank_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.rs");
+        fs::write(&file, "fn a() {}\n\n\nfn b() {}\n").unwrap();
+        let ws = Workspace::new(dir.path()).unwrap();
+
+        // A blank line is expected as "", just as it is written.
+        ws.replace_lines("a.rs", 2, 2, "", "").unwrap();
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "fn a() {}\n\nfn b() {}\n"
+        );
+        // A range ending in a blank line, with and without the final break.
+        ws.replace_lines("a.rs", 1, 2, "fn a() {}\n", "fn a() {}\n\n\n")
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "fn a() {}\n\n\nfn b() {}\n",
+            "trailing blank lines of new_source are kept"
+        );
+        assert!(ws.replace_lines("a.rs", 1, 2, "fn a() {}", "x").is_err());
+        // "\n" is one blank line, not a deletion.
+        let out = ws.replace_lines("a.rs", 2, 3, "\n", "\n").unwrap();
+        assert_eq!(out, "a.rs: lines 2-3 are now 1 line\n");
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "fn a() {}\n\nfn b() {}\n"
         );
     }
 
