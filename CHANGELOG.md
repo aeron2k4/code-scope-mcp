@@ -8,7 +8,7 @@ Each entry ends with the commits that made it.
 ### Added
 
 - Ruby support: methods, singleton methods, classes, modules and constants
-  in `.rb`, `.rake` and `.gemspec` files.
+  in `.rb`, `.rake` and `.gemspec` files (5920650).
 
 ### Security
 
