@@ -906,9 +906,10 @@ pub fn line_number(source: &str, byte: usize) -> usize {
 
 /// Where the lines of `sym` begin: the start of its first line, moved up
 /// over the doc comments, attributes and decorators directly above it, but
-/// never into the lines of a symbol that ends before it. When other code
-/// precedes `sym` on its first line, that code is not part of the symbol, so
-/// it begins exactly at its own first byte.
+/// never into the lines of a symbol that ends before it, nor above the first
+/// line of the body of a symbol around it. When other code precedes `sym` on
+/// its first line, that code is not part of the symbol, so it begins exactly
+/// at its own first byte.
 pub fn symbol_start(parsed: &ParsedFile, source: &str, sym: &Symbol) -> usize {
     let line = line_start(source, sym.start_byte);
     if !source[line..sym.start_byte].trim().is_empty() {
@@ -917,15 +918,55 @@ pub fn symbol_start(parsed: &ParsedFile, source: &str, sym: &Symbol) -> usize {
     let floor = parsed
         .symbols
         .iter()
-        .filter(|s| s.end_byte <= sym.start_byte)
-        .map(|s| s.end_byte)
+        .filter_map(|s| {
+            if s.end_byte <= sym.start_byte {
+                Some(next_line(source, s.end_byte))
+            } else if s.start_byte <= sym.start_byte
+                && s.end_byte >= sym.end_byte
+                && (s.start_byte, s.end_byte) != (sym.start_byte, sym.end_byte)
+            {
+                Some(body_floor(source, s))
+            } else {
+                None
+            }
+        })
         .max()
-        .map_or(0, |end| {
-            source[end..]
-                .find('\n')
-                .map_or(source.len(), |i| end + i + 1)
-        });
+        .unwrap_or(0)
+        .min(line);
     attached_start(parsed.lang, source, line).max(floor)
+}
+
+/// Byte offset of the start of the line after the one holding `byte`.
+fn next_line(source: &str, byte: usize) -> usize {
+    source[byte..]
+        .find('\n')
+        .map_or(source.len(), |i| byte + i + 1)
+}
+
+/// The first line a member of `outer` can begin on: the line its body starts
+/// on when that line holds nothing else before it (an indented block), else
+/// the line after the one that opens the body or, without a body, the
+/// definition. An indented block starts at its first statement, so the
+/// comment lines right above that one count as inside it too.
+fn body_floor(source: &str, outer: &Symbol) -> usize {
+    match outer.body {
+        Some((body, _)) => {
+            let mut line = line_start(source, body);
+            let own_line = source[line..body].trim().is_empty();
+            if !own_line || source[body..].starts_with('{') {
+                return next_line(source, body);
+            }
+            while line > 0 {
+                let prev = line_start(source, line - 1);
+                if !source[prev..line].trim().starts_with('#') {
+                    break;
+                }
+                line = prev;
+            }
+            line
+        }
+        None => next_line(source, outer.start_byte),
+    }
 }
 
 /// The first byte of the declaration around `node`, taking in what the grammar
@@ -968,15 +1009,21 @@ fn declaration_start(node: Node<'_>) -> usize {
 /// Move `start` (a line start) up over the comment, attribute and decorator
 /// lines directly above it, so code inserted there does not split them from
 /// the definition they belong to. Attributes and decorators spanning several
-/// lines (`#[tool(\n  ...\n)]`, `@route(\n  ...\n)`) count as a whole.
+/// lines (`#[tool(\n  ...\n)]`, `@route(\n  ...\n)`) count as a whole, and so
+/// does a block comment. A line of code is never taken, whatever it starts or
+/// ends with: `*x = 1;`, `[a, b] = [b, a];`, or a call ending in `)` below a
+/// decorated definition.
 fn attached_start(lang: Lang, source: &str, mut start: usize) -> usize {
     /// How far up a multi-line attribute's opening line is looked for.
     const MAX_ATTRIBUTE_LINES: usize = 30;
-    let opens = |text: &str| match lang {
-        Lang::Python | Lang::GdScript => text.starts_with('#') || text.starts_with('@'),
-        _ => ["//", "/*", "*", "#[", "@", "["]
-            .iter()
-            .any(|p| text.starts_with(p)),
+    let hash_comments = matches!(lang, Lang::Python | Lang::GdScript);
+    // `[Test]` in C#, `[[nodiscard]]` in C and C++; elsewhere a line starting
+    // with `[` is code.
+    let bracket_attributes = matches!(lang, Lang::C | Lang::Cpp | Lang::CSharp);
+    let opens_attribute = |text: &str| {
+        text.starts_with('@')
+            || (!hash_comments && text.starts_with("#["))
+            || (bracket_attributes && text.starts_with('['))
     };
     while start > 0 {
         let prev = line_start(source, start - 1);
@@ -984,12 +1031,31 @@ fn attached_start(lang: Lang, source: &str, mut start: usize) -> usize {
         if text.is_empty() {
             break;
         }
-        if opens(text) {
+        let comment = if hash_comments {
+            text.starts_with('#')
+        } else {
+            text.starts_with("//")
+        };
+        // A whole attribute or decorator on one line.
+        let attribute = opens_attribute(text)
+            && brackets(lang, text).1
+            && (!text.starts_with('[') || text.ends_with(']'));
+        if comment || attribute {
             start = prev;
             continue;
         }
+        if !hash_comments && text.ends_with("*/") {
+            match block_comment_start(source, prev, start) {
+                Some(open) => {
+                    start = open;
+                    continue;
+                }
+                None => break,
+            }
+        }
         // The closing line of a multi-line attribute: find where it opens,
-        // without crossing a blank line.
+        // without crossing a blank line. The lines from there must be that
+        // one attribute, closing only here.
         if !(text.ends_with(']') || text.ends_with(')')) {
             break;
         }
@@ -1004,7 +1070,14 @@ fn attached_start(lang: Lang, source: &str, mut start: usize) -> usize {
             if text.is_empty() {
                 break;
             }
-            if text.starts_with("#[") || text.starts_with('@') || text.starts_with('[') {
+            let span = &source[line..start];
+            // It opens here only when this line leaves a bracket open.
+            if opens_attribute(text)
+                && !brackets(lang, text).1
+                && brackets(lang, span)
+                    .0
+                    .is_some_and(|end| span[end..].trim().is_empty())
+            {
                 opening = Some(line);
                 break;
             }
@@ -1015,6 +1088,83 @@ fn attached_start(lang: Lang, source: &str, mut start: usize) -> usize {
         }
     }
     start
+}
+
+/// Where the first bracket group of `text` closes, as the offset past its
+/// closing bracket, and whether every bracket of `text` is closed in order.
+/// Brackets inside quotes do not count.
+fn brackets(lang: Lang, text: &str) -> (Option<usize>, bool) {
+    let single_quotes = matches!(
+        lang,
+        Lang::Python | Lang::GdScript | Lang::JavaScript | Lang::TypeScript | Lang::Tsx
+    );
+    let mut depth = 0usize;
+    let mut first = None;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (i, c) in text.char_indices() {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '"' => quote = Some(c),
+            '\'' if single_quotes => quote = Some(c),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => {
+                let Some(left) = depth.checked_sub(1) else {
+                    return (first, false);
+                };
+                depth = left;
+                if depth == 0 && first.is_none() {
+                    first = Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    (first, depth == 0 && quote.is_none())
+}
+
+/// The start of the line opening the block comment that the line
+/// `close..end` closes with `*/`, when that comment has its lines to itself:
+/// None when code shares its first or last line, such as `f(); /* note */`.
+fn block_comment_start(source: &str, close: usize, end: usize) -> Option<usize> {
+    /// How far up the comment's opening line is looked for.
+    const MAX_COMMENT_LINES: usize = 500;
+    let text = source[close..end].trim();
+    let inner = text.strip_suffix("*/")?;
+    if text.starts_with("/*") {
+        // `/* a */ f(); /* b */` is code between two comments.
+        return (!inner.contains("*/")).then_some(close);
+    }
+    if inner.contains("/*") {
+        return None;
+    }
+    let mut line = close;
+    for _ in 0..MAX_COMMENT_LINES {
+        if line == 0 {
+            break;
+        }
+        line = line_start(source, line - 1);
+        let text = source[line..].lines().next().unwrap_or("").trim();
+        if text.contains("*/") {
+            break;
+        }
+        if text.starts_with("/*") {
+            return Some(line);
+        }
+        if text.contains("/*") {
+            break;
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1612,6 +1762,52 @@ macro_rules! m { () => {} }
         // Never reaches into the previous symbol, even without a blank line.
         let rust = "#[inline] fn a() {}\n#[cfg(test)]\nfn b() {}\n";
         assert_eq!(start_line(Lang::Rust, rust, "b"), 2);
+    }
+
+    #[test]
+    fn symbol_start_never_takes_code_above_a_nested_symbol() {
+        let start_line = |lang, src: &str, name: &str| {
+            let parsed = parse_source(lang, src).unwrap();
+            let sym = parsed.symbols.iter().find(|s| s.name == name).unwrap();
+            line_number(src, symbol_start(&parsed, src, sym))
+        };
+        // A line ending in `)` below a decorated definition is not the end of
+        // that decorator.
+        let py = "@dataclass\nclass A:\n    x: int = field(default=0)\n    def m(self):\n        return self.x\n";
+        assert_eq!(start_line(Lang::Python, py, "m"), 4);
+        let py = "@route(\"/\")\ndef handler():\n    data = load()\n    def inner():\n        return data\n";
+        assert_eq!(start_line(Lang::Python, py, "inner"), 4);
+        let ts =
+            "@Component({ selector: 'x' })\nclass Foo {\n  x = inject(Bar)\n  method() {}\n}\n";
+        assert_eq!(start_line(Lang::TypeScript, ts, "method"), 4);
+        // Code starting with `*` or `[` is neither a comment nor an attribute.
+        let rust = "fn outer(x: &mut i32) {\n    *x = 1;\n    fn inner() {}\n}\n";
+        assert_eq!(start_line(Lang::Rust, rust, "inner"), 3);
+        let js = "function outer(x, y) {\n  [x, y] = [y, x];\n  const helper = () => {\n    return x;\n  };\n}\n";
+        assert_eq!(start_line(Lang::JavaScript, js, "helper"), 3);
+        // What is attached to a nested symbol still is.
+        let py = "class A:\n    # About m.\n    @wraps(\n        f,\n    )\n    def m(self):\n        pass\n";
+        assert_eq!(start_line(Lang::Python, py, "m"), 2);
+        let rust = "impl A {\n    /// Doc.\n    #[inline]\n    fn m(&self) {}\n}\n";
+        assert_eq!(start_line(Lang::Rust, rust, "m"), 2);
+        let cs = "class A\n{\n    [Test]\n    void M() {}\n}\n";
+        assert_eq!(start_line(Lang::CSharp, cs, "M"), 3);
+    }
+
+    #[test]
+    fn symbol_start_takes_a_block_comment_whole() {
+        let start_line = |lang, src: &str, name: &str| {
+            let parsed = parse_source(lang, src).unwrap();
+            let sym = parsed.symbols.iter().find(|s| s.name == name).unwrap();
+            line_number(src, symbol_start(&parsed, src, sym))
+        };
+        let java = "class A {\n    int x = 1;\n    /**\n     * Doc.\n     */\n    void m() {}\n}\n";
+        assert_eq!(start_line(Lang::Java, java, "m"), 3);
+        let c = "int x;\n/* One line. */\nvoid f(void) {}\n";
+        assert_eq!(start_line(Lang::C, c, "f"), 2);
+        // A comment after code on its line belongs to that code.
+        let c = "/* Unrelated. */\nint x; /* note */\nvoid f(void) {}\n";
+        assert_eq!(start_line(Lang::C, c, "f"), 3);
     }
 
     #[test]
