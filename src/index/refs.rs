@@ -192,6 +192,14 @@ pub fn find_references(
         occurrences
             .iter()
             .filter_map(|o| {
+                // The name in a Go `package` clause is no use of anything, and
+                // is no mention either, so a file holding only that is skipped
+                // above: left out here too, it is never reported.
+                if file.parsed.lang == Lang::Go
+                    && mentions::is_package_clause(&file.source.as_bytes()[..o.start_byte])
+                {
+                    return None;
+                }
                 let def_kind = definitions
                     .iter()
                     .find(|(b, _)| *b == o.start_byte)
@@ -302,6 +310,23 @@ mod tests {
             ]
         );
         assert_eq!(hits[2].text, "load();");
+    }
+
+    #[test]
+    fn a_go_package_clause_is_no_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // One file only names the package, the other also uses the name.
+        fs::write(root.join("a.go"), "package store\n\nfunc A() {}\n").unwrap();
+        fs::write(
+            root.join("b.go"),
+            "package store\n\nfunc B() { store := 1; _ = store }\n",
+        )
+        .unwrap();
+        let cache = ParseCache::default();
+        let hits = find_references(root, root, &cache, "store", &RefOptions::default());
+        let found: Vec<_> = hits.iter().map(|h| (h.path.as_str(), h.line)).collect();
+        assert_eq!(found, [("b.go", 3), ("b.go", 3)]);
     }
 
     #[test]

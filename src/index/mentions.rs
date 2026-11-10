@@ -127,7 +127,7 @@ fn ends_in_keyword(before: &[u8], keywords: &[&[u8]]) -> bool {
 }
 
 /// Whether the Go source `before` a token ends in the keyword `package`.
-fn is_package_clause(before: &[u8]) -> bool {
+pub(crate) fn is_package_clause(before: &[u8]) -> bool {
     ends_in_keyword(before, &[b"package"])
 }
 
