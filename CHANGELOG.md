@@ -14,6 +14,11 @@ Each entry ends with the commits that made it.
 
 - Dependabot no longer opens update pull requests (b4e192e).
 
+### Fixed
+
+- `--install` names only the clients it set up in its closing message
+  (8244657).
+
 ## 0.5.1 (2026-11-08)
 
 ### Changed
