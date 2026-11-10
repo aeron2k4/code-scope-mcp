@@ -147,10 +147,15 @@ else
     base="https://github.com/$REPO/releases/download/$version"
   fi
   log "Downloading $asset ($version)"
-  curl -fsSL -o "$tmpdir/$asset" "$base/$asset" || die "download failed: $base/$asset"
+  # A release goes out with its Linux binary; the others are added to it when
+  # their builds finish, some minutes later.
+  building=
+  [ "$asset" = astlens-linux ] ||
+    building="; a new release may still be building this binary: retry in a few minutes, pass --version with an earlier tag, or use --from-source"
+  curl -fsSL -o "$tmpdir/$asset" "$base/$asset" || die "download failed: $base/$asset$building"
   curl -fsSL -o "$tmpdir/SHA256SUMS" "$base/SHA256SUMS" || die "download failed: $base/SHA256SUMS"
   want=$(awk -v f="$asset" '$2==f || $2=="*"f {print $1}' "$tmpdir/SHA256SUMS")
-  [ -n "$want" ] || die "$asset is not listed in SHA256SUMS"
+  [ -n "$want" ] || die "$asset is not listed in SHA256SUMS$building"
   [ "$(sha256 "$tmpdir/$asset")" = "$want" ] || die "checksum mismatch for $asset"
   BIN=$BIN_DIR/astlens$exe
   mkdir -p "$BIN_DIR"
