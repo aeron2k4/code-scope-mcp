@@ -250,6 +250,43 @@ async fn mcp_session_over_jsonrpc() {
         "// app.py:5-6 [method] App::stop\n5\t    def stop(self):\n6\t        return 0\n"
     );
 
+    // The other tools answer over the protocol too.
+    let calls = [
+        (
+            json!({"name": "search_symbols", "arguments": {"query": "stop"}}),
+            "app.py:5-6 [method] App::stop — def stop(self)\n",
+        ),
+        (json!({"name": "list_files", "arguments": {}}), "app.py\n"),
+        (
+            json!({"name": "read_lines", "arguments": {"path": "app.py", "start": 5, "end": 5}}),
+            "// app.py:5-5 of 6 lines\n5\t    def stop(self):\n",
+        ),
+        (
+            json!({"name": "replace_text", "arguments": {
+                "path": "app.py",
+                "edits": [{"old_text": "return 0", "new_text": "return 3"}]
+            }}),
+            "app.py: applied 1 edit, at line 6\n",
+        ),
+        (
+            json!({"name": "replace_lines", "arguments": {
+                "path": "app.py", "start": 6, "end": 6,
+                "expect": "        return 3", "new_source": "        return 4"
+            }}),
+            "app.py: lines 6-6 are now 1 line\n",
+        ),
+        (
+            json!({"name": "read_file_pruned", "arguments": {"path": "app.py"}}),
+            "// app.py | strategy=full | ~22/4000 tokens\n\
+             class App:\n    def run(self):\n        return 2\n\n    def stop(self):\n        return 4\n",
+        ),
+    ];
+    for (id, (params, expected)) in (40..).zip(calls) {
+        let resp = client.call(id, "tools/call", params.clone()).await;
+        assert_ne!(resp["result"]["isError"], true, "{params}: {resp}");
+        assert_eq!(tool_text(&resp), expected, "{params}");
+    }
+
     // Edit failures are tool errors and leave the file untouched.
     let before = fs::read_to_string(dir.path().join("app.py")).unwrap();
     let cases = [
@@ -281,6 +318,10 @@ async fn mcp_session_over_jsonrpc() {
         (
             json!({"name": "changed_symbols", "arguments": {}}),
             "git diff failed",
+        ),
+        (
+            json!({"name": "git_status", "arguments": {}}),
+            "git status failed",
         ),
     ];
     for (id, (params, expected)) in (13..).zip(cases) {
