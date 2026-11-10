@@ -3,7 +3,7 @@
 All notable changes to astlens. Versions follow [Semantic Versioning](https://semver.org/).
 Each entry ends with the commits that made it.
 
-## Unreleased
+## 0.5.2 (2026-11-10)
 
 ### Changed
 
