@@ -141,7 +141,7 @@ impl Lang {
         match self {
             Lang::Rust => RUST_QUERY.to_string(),
             Lang::Python => PYTHON_QUERY.to_string(),
-            Lang::JavaScript => JS_QUERY.to_string(),
+            Lang::JavaScript => format!("{JS_QUERY}\n{JS_FIELD_QUERY}"),
             Lang::TypeScript | Lang::Tsx => format!("{TS_EXTRA_QUERY}\n{JS_QUERY}"),
             Lang::Go => GO_QUERY.to_string(),
             Lang::C => format!("{C_FUNCTION_QUERY}\n{C_TYPE_QUERY}"),
@@ -246,6 +246,22 @@ const JS_QUERY: &str = r#"
   (export_statement
     declaration: (variable_declaration
       (variable_declarator name: (identifier) @name)) @variable))
+; `exports.f = function () {}` and `Foo.prototype.f = () => {}` at the top
+; level. `module.exports = function () {}` names nothing.
+(program
+  (expression_statement
+    (assignment_expression
+      left: (member_expression property: (property_identifier) @name)
+      right: [(arrow_function) (function_expression)])) @function
+  (#not-eq? @name "exports"))
+"#;
+
+/// A class field holding a function, `handle = () => {}`. The TypeScript
+/// grammar names the node differently, so each has its own pattern.
+const JS_FIELD_QUERY: &str = r#"
+(field_definition
+  property: (property_identifier) @name
+  value: [(arrow_function) (function_expression)]) @method
 "#;
 
 const TS_EXTRA_QUERY: &str = r#"
@@ -257,6 +273,9 @@ const TS_EXTRA_QUERY: &str = r#"
 (method_signature name: (_) @name) @method
 (abstract_method_signature name: (_) @name) @method
 (internal_module name: (_) @name) @module
+(public_field_definition
+  name: (property_identifier) @name
+  value: [(arrow_function) (function_expression)]) @method
 ; `declare const x: T;`, a global declared for other files.
 (program
   (ambient_declaration
@@ -291,15 +310,27 @@ const GO_QUERY: &str = r#"
 "#;
 
 /// C functions and prototypes, shared with C++. The name sits inside the
-/// declarator, under at most one pointer for pointer-returning functions.
+/// declarator, under one pointer declarator for each `*` of a returned
+/// pointer: up to two are looked through, `char **names(void)`.
 const C_FUNCTION_QUERY: &str = r#"
 (function_definition
   declarator: (function_declarator declarator: (identifier) @name)) @function
 (function_definition
   declarator: (pointer_declarator
     declarator: (function_declarator declarator: (identifier) @name))) @function
+(function_definition
+  declarator: (pointer_declarator
+    declarator: (pointer_declarator
+      declarator: (function_declarator declarator: (identifier) @name)))) @function
 (declaration
   declarator: (function_declarator declarator: (identifier) @name)) @function
+(declaration
+  declarator: (pointer_declarator
+    declarator: (function_declarator declarator: (identifier) @name))) @function
+(declaration
+  declarator: (pointer_declarator
+    declarator: (pointer_declarator
+      declarator: (function_declarator declarator: (identifier) @name)))) @function
 "#;
 
 const C_TYPE_QUERY: &str = r#"
@@ -332,6 +363,35 @@ const CPP_QUERY: &str = r#"
       declarator: (qualified_identifier name: (_) @name)))) @function
 (field_declaration
   declarator: (function_declarator declarator: (_) @name)) @function
+; Members returning a pointer or a reference, defined in the class or only
+; declared there, and prototypes returning a reference.
+(function_definition
+  declarator: (pointer_declarator
+    declarator: (function_declarator
+      declarator: [(field_identifier) (operator_name)] @name))) @function
+(function_definition
+  declarator: (pointer_declarator
+    declarator: (pointer_declarator
+      declarator: (function_declarator
+        declarator: [(field_identifier) (operator_name)] @name)))) @function
+(function_definition
+  declarator: (pointer_declarator
+    declarator: (pointer_declarator
+      declarator: (function_declarator
+        declarator: (qualified_identifier name: (_) @name))))) @function
+(field_declaration
+  declarator: (pointer_declarator
+    declarator: (function_declarator declarator: (_) @name))) @function
+(field_declaration
+  declarator: (pointer_declarator
+    declarator: (pointer_declarator
+      declarator: (function_declarator declarator: (_) @name)))) @function
+(field_declaration
+  declarator: (reference_declarator
+    (function_declarator declarator: (_) @name))) @function
+(declaration
+  declarator: (reference_declarator
+    (function_declarator declarator: (identifier) @name))) @function
 (class_specifier name: (_) @name body: (_)) @class
 (namespace_definition name: (_) @name) @module
 (alias_declaration name: (_) @name) @type
@@ -360,6 +420,7 @@ const CSHARP_QUERY: &str = r#"
 (method_declaration name: (_) @name) @method
 (constructor_declaration name: (_) @name) @method
 (local_function_statement name: (_) @name) @function
+(property_declaration name: (_) @name) @variable
 "#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -739,7 +800,12 @@ fn extract_symbols(
             continue;
         };
         let name = node_text(name_node, source).to_string();
-        if name.is_empty() || is_require(name_node, source) {
+        // `void (*cb)(int);` in a class is a field holding a pointer, which
+        // the member patterns take for a function named `(*cb)`.
+        if name.is_empty()
+            || is_require(name_node, source)
+            || name_node.kind() == "parenthesized_declarator"
+        {
             continue;
         }
         let node = own_declarator(node, name_node);
@@ -759,7 +825,7 @@ fn extract_symbols(
                 start_line: node.start_position().row + 1,
                 end_line: node.end_position().row + 1,
                 start_byte: declaration_start(node),
-                end_byte: node.end_byte(),
+                end_byte: definition_end(node),
                 body,
                 depth: 0,
             },
@@ -798,6 +864,17 @@ fn extract_symbols(
     Ok((symbols, timed_out.get()))
 }
 
+/// Where the definition `node` ends. A class field holding a function ends
+/// with the `;` after it when it has one, which the grammar keeps outside the
+/// field: replacing or deleting the field would otherwise leave that `;`.
+fn definition_end(node: Node<'_>) -> usize {
+    let is_field = matches!(node.kind(), "field_definition" | "public_field_definition");
+    match node.next_sibling() {
+        Some(next) if is_field && next.kind() == ";" => next.end_byte(),
+        _ => node.end_byte(),
+    }
+}
+
 /// `const fs = require("fs")` is an import, not a definition of the file.
 fn is_require(name: Node<'_>, source: &str) -> bool {
     name.parent()
@@ -832,10 +909,21 @@ fn find_body(node: Node<'_>) -> Option<Node<'_>> {
     if let Some(body) = node.child_by_field_name("body") {
         return Some(body);
     }
-    if node.kind() == "variable_declarator" {
-        return node
-            .child_by_field_name("value")?
-            .child_by_field_name("body");
+    match node.kind() {
+        // `f = () => {...}`, as a variable or a class field.
+        "variable_declarator" | "field_definition" | "public_field_definition" => {
+            return node
+                .child_by_field_name("value")?
+                .child_by_field_name("body");
+        }
+        // `exports.f = function () {...};`
+        "expression_statement" => {
+            return node
+                .named_child(0)?
+                .child_by_field_name("right")?
+                .child_by_field_name("body");
+        }
+        _ => {}
     }
     // `const f = () => {...}` keeps the body on the declarator's value.
     let mut cursor = node.walk();
@@ -1553,6 +1641,81 @@ macro_rules! m { () => {} }
         assert_eq!(&go[max.start_byte..max.end_byte], "const Max = 3");
         let a = &parsed.symbols[1];
         assert_eq!(&go[a.start_byte..a.end_byte], "A = iota");
+    }
+
+    /// `kind parent::name` of each symbol of `src`.
+    fn listed(lang: Lang, src: &str) -> Vec<String> {
+        let parsed = parse_source(lang, src).unwrap();
+        assert!(!parsed.has_errors, "{src}");
+        parsed
+            .symbols
+            .iter()
+            .map(|s| format!("{} {}", s.kind.as_str(), s.qualified_name()))
+            .collect()
+    }
+
+    #[test]
+    fn functions_returning_pointers_and_references_are_symbols() {
+        let c = "char *dup(const char *s);\nchar **split(const char *s);\nint (*handler)(int);\nstatic char **names(void) { return 0; }\n";
+        assert_eq!(
+            listed(Lang::C, c),
+            ["function dup", "function split", "function names"]
+        );
+        let cpp = "class Buf {\npublic:\n    char* data() { return p; }\n    const char** names() { return q; }\n    char* decl();\n    Buf& decl2();\n    void (*cb)(int);\n    char* (*alloc)(int);\n    char* p; const char** q;\n};\nBuf& make();\nconst char** Buf::all() { return q; }\n";
+        assert_eq!(
+            listed(Lang::Cpp, cpp),
+            [
+                "class Buf",
+                "method Buf::data",
+                "method Buf::names",
+                "method Buf::decl",
+                "method Buf::decl2",
+                "function make",
+                "function all",
+            ]
+        );
+    }
+
+    #[test]
+    fn functions_held_by_fields_and_members_are_symbols() {
+        let js = "class C {\n  state = {};\n  handle = () => { return 1; };\n  render() {}\n}\nexports.helper = function () { return 1; };\nC.prototype.extra = () => 1;\nmodule.exports = function () {};\nfunction f() { this.x = function () {}; }\n";
+        assert_eq!(
+            listed(Lang::JavaScript, js),
+            [
+                "class C",
+                "method C::handle",
+                "method C::render",
+                "function helper",
+                "function extra",
+                "function f",
+            ]
+        );
+        let ts = "class Svc {\n  private x = 1;\n  handle = async (e: Event): Promise<void> => {\n    return;\n  };\n  static make = function () { return 1; };\n}\n";
+        assert_eq!(
+            listed(Lang::TypeScript, ts),
+            ["class Svc", "method Svc::handle", "method Svc::make"]
+        );
+        // The field takes its `;`, so replacing it leaves none behind.
+        let parsed = parse_source(Lang::TypeScript, ts).unwrap();
+        let handle = &parsed.symbols[1];
+        assert!(ts[..handle.end_byte].ends_with("};"), "{handle:?}");
+        assert_eq!(handle.end_line, 5);
+        let body = handle.body.unwrap();
+        assert_eq!(&ts[body.0..body.1], "{\n    return;\n  }");
+    }
+
+    #[test]
+    fn csharp_properties_are_symbols() {
+        let cs = "class A {\n    public int Count { get; private set; }\n    public string Name => \"a\";\n    int field;\n    void M() {}\n}\n";
+        assert_eq!(
+            listed(Lang::CSharp, cs),
+            [
+                "class A",
+                "variable A::Count",
+                "variable A::Name",
+                "method A::M"
+            ]
+        );
     }
 
     #[test]

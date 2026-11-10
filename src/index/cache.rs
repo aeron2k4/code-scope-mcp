@@ -33,7 +33,7 @@ use crate::index::store_format;
 /// Changes with the crate version so stale formats or grammar changes never
 /// leak into results. Bump the `-s` suffix whenever [`ParsedFile`]'s stored
 /// format or a symbol query changes between releases.
-const DB_NAME: &str = concat!("parsed-v", env!("CARGO_PKG_VERSION"), "-s17");
+const DB_NAME: &str = concat!("parsed-v", env!("CARGO_PKG_VERSION"), "-s18");
 /// Every store directory starts with this prefix.
 const DB_PREFIX: &str = "parsed-v";
 /// The files of an LMDB environment.
