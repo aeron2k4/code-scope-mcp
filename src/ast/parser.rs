@@ -44,10 +44,11 @@ pub enum Lang {
     Java,
     CSharp,
     GdScript,
+    Ruby,
 }
 
 impl Lang {
-    pub const ALL: [Lang; 11] = [
+    pub const ALL: [Lang; 12] = [
         Lang::Rust,
         Lang::Python,
         Lang::JavaScript,
@@ -59,6 +60,7 @@ impl Lang {
         Lang::Java,
         Lang::CSharp,
         Lang::GdScript,
+        Lang::Ruby,
     ];
 
     pub fn from_path(path: &Path) -> Option<Lang> {
@@ -78,6 +80,7 @@ impl Lang {
             "java" => Lang::Java,
             "cs" => Lang::CSharp,
             "gd" => Lang::GdScript,
+            "rb" | "rake" | "gemspec" => Lang::Ruby,
             _ => return None,
         })
     }
@@ -97,6 +100,7 @@ impl Lang {
             Lang::Java => 8,
             Lang::CSharp => 9,
             Lang::GdScript => 10,
+            Lang::Ruby => 11,
         }
     }
 
@@ -118,6 +122,7 @@ impl Lang {
             Lang::Java => "java",
             Lang::CSharp => "csharp",
             Lang::GdScript => "gdscript",
+            Lang::Ruby => "ruby",
         }
     }
 
@@ -134,6 +139,7 @@ impl Lang {
             Lang::Java => tree_sitter_java::LANGUAGE.into(),
             Lang::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
             Lang::GdScript => tree_sitter_gdscript::LANGUAGE.into(),
+            Lang::Ruby => tree_sitter_ruby::LANGUAGE.into(),
         }
     }
 
@@ -149,6 +155,7 @@ impl Lang {
             Lang::Java => JAVA_QUERY.to_string(),
             Lang::CSharp => CSHARP_QUERY.to_string(),
             Lang::GdScript => GDSCRIPT_QUERY.to_string(),
+            Lang::Ruby => RUBY_QUERY.to_string(),
         }
     }
 
@@ -181,6 +188,20 @@ const GDSCRIPT_QUERY: &str = r#"
 (source (export_variable_statement name: (_) @name) @variable)
 (source (onready_variable_statement name: (_) @name) @variable)
 (class_body (variable_statement name: (_) @name) @variable)
+"#;
+
+/// `class Foo::Bar` is named `Bar`, nested in no symbol. A constant assigned
+/// in a method is an error in Ruby, so constants are taken anywhere. Methods
+/// defined with `define_method` or made by `attr_accessor` are calls, not
+/// definitions, and are left out.
+const RUBY_QUERY: &str = r#"
+(method name: (_) @name) @function
+(singleton_method name: (_) @name) @function
+(class name: (constant) @name) @class
+(class name: (scope_resolution name: (_) @name)) @class
+(module name: (constant) @name) @module
+(module name: (scope_resolution name: (_) @name)) @module
+(assignment left: (constant) @name) @constant
 "#;
 
 const RUST_QUERY: &str = r#"
@@ -630,21 +651,24 @@ pub fn parse_source(lang: Lang, source: &str) -> Result<ParsedFile, ParseError> 
         symbols,
         has_errors: root.has_error(),
         incomplete,
-        idents: collect_idents(root),
+        idents: collect_idents(lang, root),
     })
 }
 
 /// Start bytes of identifier leaves (identifier, type_identifier,
-/// field_identifier, property_identifier, ..., and GDScript's `name` for the
-/// name a definition declares), in source order. Comments and string literals
-/// are not identifiers, so they never appear here.
-fn collect_idents(root: Node<'_>) -> Vec<u32> {
+/// field_identifier, property_identifier, ..., GDScript's `name` for the name
+/// a definition declares, and Ruby's `constant` for a class, module or
+/// constant name), in source order. Comments and string literals are not
+/// identifiers, so they never appear here.
+fn collect_idents(lang: Lang, root: Node<'_>) -> Vec<u32> {
     let mut out = Vec::new();
     let mut cursor = root.walk();
     'walk: loop {
         let node = cursor.node();
         if node.child_count() == 0
-            && (node.kind().ends_with("identifier") || node.kind() == "name")
+            && (node.kind().ends_with("identifier")
+                || node.kind() == "name"
+                || (lang == Lang::Ruby && node.kind() == "constant"))
             && let Ok(start) = u32::try_from(node.start_byte())
         {
             out.push(start);
@@ -1107,12 +1131,13 @@ fn declaration_start(node: Node<'_>) -> usize {
 fn attached_start(lang: Lang, source: &str, mut start: usize) -> usize {
     /// How far up a multi-line attribute's opening line is looked for.
     const MAX_ATTRIBUTE_LINES: usize = 30;
-    let hash_comments = matches!(lang, Lang::Python | Lang::GdScript);
+    let hash_comments = matches!(lang, Lang::Python | Lang::GdScript | Lang::Ruby);
     // `[Test]` in C#, `[[nodiscard]]` in C and C++; elsewhere a line starting
     // with `[` is code.
     let bracket_attributes = matches!(lang, Lang::C | Lang::Cpp | Lang::CSharp);
+    // Ruby has neither; its `@name` is an instance variable.
     let opens_attribute = |text: &str| {
-        text.starts_with('@')
+        (lang != Lang::Ruby && text.starts_with('@'))
             || (!hash_comments && text.starts_with("#["))
             || (bracket_attributes && text.starts_with('['))
     };
@@ -1187,7 +1212,12 @@ fn attached_start(lang: Lang, source: &str, mut start: usize) -> usize {
 fn brackets(lang: Lang, text: &str) -> (Option<usize>, bool) {
     let single_quotes = matches!(
         lang,
-        Lang::Python | Lang::GdScript | Lang::JavaScript | Lang::TypeScript | Lang::Tsx
+        Lang::Python
+            | Lang::GdScript
+            | Lang::Ruby
+            | Lang::JavaScript
+            | Lang::TypeScript
+            | Lang::Tsx
     );
     let mut depth = 0usize;
     let mut first = None;
@@ -1317,6 +1347,9 @@ mod tests {
     #[test]
     fn detects_language_from_extension() {
         assert_eq!(Lang::from_path(Path::new("a/b.rs")), Some(Lang::Rust));
+        assert_eq!(Lang::from_path(Path::new("app/cart.rb")), Some(Lang::Ruby));
+        assert_eq!(Lang::from_path(Path::new("Rakefile")), None);
+        assert_eq!(Lang::from_path(Path::new("x.gemspec")), Some(Lang::Ruby));
         assert_eq!(Lang::from_path(Path::new("x.TSX")), Some(Lang::Tsx));
         assert_eq!(Lang::from_path(Path::new("x.mjs")), Some(Lang::JavaScript));
         assert_eq!(Lang::from_path(Path::new("x.h")), Some(Lang::C));
@@ -1560,6 +1593,41 @@ macro_rules! m { () => {} }
         );
         let err = first_syntax_error(Lang::Go, "package p\n\nfunc f() {\n\tx := (1\n}\n");
         assert_eq!(err.map(|e| e.line), Some(4));
+    }
+
+    #[test]
+    fn ruby_symbols() {
+        let src = "require \"json\"\nVERSION = \"1.0\"\n\nmodule Shop\n  class Cart < Base\n    attr_reader :items\n    MAX = 3\n\n    # Adds an item.\n    # Returns the total.\n    def add(item, qty = 1)\n      @items << item\n      total\n    end\n\n    def self.build = new\n    def total=(v); end\n  end\n\n  class Admin::User; end\nend\n\ndef helper; end\n";
+        let parsed = parse_source(Lang::Ruby, src).unwrap();
+        assert!(!parsed.has_errors);
+        assert_eq!(
+            names(&parsed),
+            vec![
+                ("VERSION".into(), SymbolKind::Constant),
+                ("Shop".into(), SymbolKind::Module),
+                ("Shop::Cart".into(), SymbolKind::Class),
+                ("Shop::Cart::MAX".into(), SymbolKind::Constant),
+                ("Shop::Cart::add".into(), SymbolKind::Method),
+                ("Shop::Cart::build".into(), SymbolKind::Method),
+                ("Shop::Cart::total=".into(), SymbolKind::Method),
+                ("Shop::User".into(), SymbolKind::Class),
+                ("helper".into(), SymbolKind::Function),
+            ]
+        );
+        let add = &parsed.symbols[4];
+        assert_eq!(add.signature, "def add(item, qty = 1)");
+        assert!(add.body.is_some());
+        // The comments above `add` belong to it, the blank line above them
+        // does not.
+        let start = symbol_start(&parsed, src, add);
+        assert!(
+            src[start..].starts_with("    # Adds"),
+            "{:?}",
+            &src[start..]
+        );
+        // A class name is an identifier, so its uses are found.
+        let cart = identifier_occurrences(&parsed, src, "Cart");
+        assert_eq!(cart.len(), 1);
     }
 
     #[test]
@@ -1812,6 +1880,7 @@ macro_rules! m { () => {} }
                 "Good",
             ),
             (Lang::GdScript, "func good():\n\tpass\nfunc (:\n", "good"),
+            (Lang::Ruby, "def good\nend\ndef bad(\n", "good"),
         ];
         for (lang, src, expected) in cases {
             let parsed = parse_source(lang, src).unwrap_or_else(|e| panic!("{}: {e}", lang.name()));
@@ -1883,6 +1952,11 @@ macro_rules! m { () => {} }
                 Lang::GdScript,
                 "# load\nfunc load():\n\tpass\nfunc f():\n\tload()\n\tobj.load()\n\tvar s = \"load\"\n",
                 vec![2, 5, 6],
+            ),
+            (
+                Lang::Ruby,
+                "# load\ndef load\nend\nload\nobj.load(1)\ns = \"load\"\nt = :load\n",
+                vec![2, 4, 5],
             ),
         ];
         for (lang, src, expected) in cases {
@@ -1964,6 +2038,9 @@ macro_rules! m { () => {} }
         assert_eq!(start_line(Lang::Rust, rust, "m"), 2);
         let cs = "class A\n{\n    [Test]\n    void M() {}\n}\n";
         assert_eq!(start_line(Lang::CSharp, cs, "M"), 3);
+        // Ruby's `@x` is an instance variable, not a decorator.
+        let rb = "class A\n  @x = g(1)\n  def h\n  end\nend\n";
+        assert_eq!(start_line(Lang::Ruby, rb, "h"), 3);
     }
 
     #[test]

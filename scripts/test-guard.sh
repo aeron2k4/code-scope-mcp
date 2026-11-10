@@ -16,6 +16,9 @@ echo 'int y;' >"$WS/src/y.H++"
 echo 'int z;' >"$WS/src/z.ipp"
 echo 'int t;' >"$WS/src/t.tpp"
 echo 'func p():' >"$WS/src/player.GD"
+echo 'def a; end' >"$WS/src/cart.rb"
+echo 'Gem::Specification.new' >"$WS/src/shop.GEMSPEC"
+echo 'robe' >"$WS/src/robe.txt"
 fail=0
 
 # verdict <tool> <json tool_input>
@@ -45,6 +48,11 @@ expect deny Read "{\"file_path\": \"$WS/src/x.c++\"}" 'Read .c++'
 expect deny Read "{\"file_path\": \"$WS/src/z.ipp\"}" 'Read .ipp'
 expect deny Read "{\"file_path\": \"$WS/src/player.GD\"}" 'Read .gd'
 expect deny Grep '{"pattern": "x", "type": "gdscript"}' 'Grep gdscript type'
+expect deny Read "{\"file_path\": \"$WS/src/cart.rb\"}" 'Read .rb'
+expect deny Read "{\"file_path\": \"$WS/src/shop.GEMSPEC\"}" 'Read .gemspec'
+expect deny Grep '{"pattern": "x", "type": "ruby"}' 'Grep ruby type'
+expect deny Grep '{"pattern": "x", "glob": "*.rake"}' 'Grep .rake glob'
+expect allow Read "{\"file_path\": \"$WS/src/robe.txt\"}" 'Read .txt with letters of rb'
 expect allow Read "{\"file_path\": \"$WS/NOTES.MD\"}" 'Read upper-case non-code'
 expect deny Grep '{"pattern": "x", "glob": "*.RS"}' 'Grep upper-case glob'
 expect deny Grep '{"pattern": "x", "glob": "*.c++"}' 'Grep .c++ glob'

@@ -110,7 +110,12 @@ pub fn tag_hash(name: &str) -> u32 {
 
 /// Whether [`Mentions::of`] counts the members of a file in `lang` apart.
 pub fn tracks_members(lang: Lang) -> bool {
-    !matches!(lang, Lang::Java | Lang::CSharp | Lang::GdScript)
+    // A Ruby method is called on `self` without naming it, as often as on
+    // another object.
+    !matches!(
+        lang,
+        Lang::Java | Lang::CSharp | Lang::GdScript | Lang::Ruby
+    )
 }
 
 /// Whether the source `before` a token ends in one of `keywords`, as a word
@@ -409,7 +414,8 @@ impl Mentions {
     /// method of a value, or a name in a Go package or Python or JavaScript
     /// module), or after `->` or a path through a type ([`is_member_access`]),
     /// also counts as [`member_hash`]. Java, C# and GDScript have no free
-    /// functions, so they leave that out. The name of a Go file's `package`
+    /// functions, and Ruby calls methods on `self` without naming it, so
+    /// they leave that out. The name of a Go file's `package`
     /// clause is no mention. In Go and Python, a token right after `name.`
     /// also counts as the [`qualified_hash`] of the two, `name` being
     /// unaliased as the imports say, and a Python file mentions that of

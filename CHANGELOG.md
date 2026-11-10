@@ -5,6 +5,11 @@ Each entry ends with the commits that made it.
 
 ## Unreleased
 
+### Added
+
+- Ruby support: methods, singleton methods, classes, modules and constants
+  in `.rb`, `.rake` and `.gemspec` files.
+
 ### Security
 
 - Updated `rmcp` to 3.9.0, which fixes RUSTSEC-2026-0462 (unbounded response

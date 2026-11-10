@@ -113,6 +113,13 @@ fn classify(found: Owner<'_>, owner: &str, enclosing: Option<&str>) -> Ownership
     }
 }
 
+/// Whether the occurrence at `start` follows `.`, `->` or `::`, whatever
+/// stands before that.
+fn after_access(source: &str, start: usize) -> bool {
+    let before = source[..start].trim_end_matches([' ', '\t']);
+    before.ends_with('.') || before.ends_with("->") || before.ends_with("::")
+}
+
 fn is_call(source: &str, end: usize) -> bool {
     let rest = source[end..].trim_start_matches([' ', '\t']);
     rest.starts_with('(') || rest.starts_with("::<")
@@ -210,6 +217,11 @@ pub fn find_references(
                     Some(s) if def_kind.is_some() && s.name == name => s.parent.clone(),
                     other => other.map(|s| s.qualified_name()),
                 };
+                let found = owner_of(&file.source, o.start_byte);
+                let ruby = file.parsed.lang == Lang::Ruby;
+                // Ruby calls a method on `self` by its bare name, and has no
+                // fields: `x.name` is always a call, parentheses or not.
+                let bare = found == Owner::Unknown && !after_access(&file.source, o.start_byte);
                 let ownership = match owner {
                     None => Ownership::Unknown,
                     Some(owner) if def_kind.is_some() => match &enclosing {
@@ -217,12 +229,12 @@ pub fn find_references(
                         Some(_) if in_scope(enclosing.as_deref(), owner) => Ownership::Owner,
                         Some(_) => Ownership::Foreign,
                     },
-                    Some(owner) => classify(
-                        owner_of(&file.source, o.start_byte),
-                        owner,
-                        enclosing.as_deref(),
-                    ),
+                    Some(owner) if ruby && bare && in_scope(enclosing.as_deref(), owner) => {
+                        Ownership::Owner
+                    }
+                    Some(owner) => classify(found, owner, enclosing.as_deref()),
                 };
+                let call = is_call(&file.source, o.start_byte + name.len()) || (ruby && !bare);
                 if ownership == Ownership::Foreign {
                     return None;
                 }
@@ -236,7 +248,7 @@ pub fn find_references(
                         is_definition: def_kind.is_some(),
                     },
                     ownership,
-                    call: is_call(&file.source, o.start_byte + name.len()),
+                    call,
                     def_kind,
                 })
             })
@@ -366,6 +378,26 @@ mod tests {
         // and the field `x.new` are not calls, so they cannot be the method.
         assert_eq!(lines("A::new"), [4, 5, 11, 13]);
         assert_eq!(lines("B::new"), [8, 12, 13]);
+    }
+
+    #[test]
+    fn a_ruby_method_is_called_without_parentheses() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("cart.rb"),
+            "class Cart\n  def total\n    1\n  end\n\n  def show\n    total\n  end\nend\n\nclass User\n  def total\n    2\n  end\nend\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("co.rb"),
+            "def checkout(cart)\n  cart.total\nend\n",
+        )
+        .unwrap();
+        let cache = ParseCache::default();
+        let hits = find_references(root, root, &cache, "Cart::total", &RefOptions::default());
+        let found: Vec<_> = hits.iter().map(|h| (h.path.as_str(), h.line)).collect();
+        assert_eq!(found, [("cart.rb", 7), ("co.rb", 2)]);
     }
 
     #[test]

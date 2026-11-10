@@ -718,7 +718,8 @@ fn family(lang: Option<Lang>) -> u32 {
         Some(Lang::Java) => 6,
         Some(Lang::CSharp) => 7,
         Some(Lang::GdScript) => 8,
-        None => 9,
+        Some(Lang::Ruby) => 9,
+        None => 10,
     }
 }
 
@@ -950,6 +951,7 @@ impl Scope {
                 | Lang::Cpp
                 | Lang::Java
                 | Lang::CSharp
+                | Lang::Ruby
                 | Lang::JavaScript
                 | Lang::TypeScript
                 | Lang::Tsx,

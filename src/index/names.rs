@@ -563,6 +563,7 @@ impl<'a> JsExports<'a> {
 ///   including it, for a header).
 /// - Java and C#: a `private` member, seen only in its class; in C# also a
 ///   member of a class or struct with no access modifier.
+/// - JavaScript, TypeScript and Ruby: nothing.
 fn is_private(lang: Lang, sym: &Symbol, enclosing: Option<&Symbol>) -> bool {
     use SymbolKind::*;
     if matches!(sym.kind, Impl | Module) {
@@ -607,7 +608,9 @@ fn is_private(lang: Lang, sym: &Symbol, enclosing: Option<&Symbol>) -> bool {
             let explicit = sym.signature.contains(&format!(".{}", sym.name));
             modifiers().any(|w| w == "private") || (member && !explicit && !modifiers().any(access))
         }
-        Lang::JavaScript | Lang::TypeScript | Lang::Tsx => false,
+        // A Ruby method is made private by a `private` call before it or
+        // around it, which its signature does not show.
+        Lang::JavaScript | Lang::TypeScript | Lang::Tsx | Lang::Ruby => false,
     }
 }
 
