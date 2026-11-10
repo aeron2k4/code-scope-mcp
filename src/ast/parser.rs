@@ -310,27 +310,17 @@ const GO_QUERY: &str = r#"
 "#;
 
 /// C functions and prototypes, shared with C++. The name sits inside the
-/// declarator, under one pointer declarator for each `*` of a returned
-/// pointer: up to two are looked through, `char **names(void)`.
+/// declarator. A function returning a pointer has it under one pointer
+/// declarator for each `*`, `char **names(void)`, which a query cannot follow
+/// to any depth: `@declarator` hands those to [`declared_function`], which
+/// finds the name or tells that a variable is declared, `char *p;`.
 const C_FUNCTION_QUERY: &str = r#"
 (function_definition
   declarator: (function_declarator declarator: (identifier) @name)) @function
-(function_definition
-  declarator: (pointer_declarator
-    declarator: (function_declarator declarator: (identifier) @name))) @function
-(function_definition
-  declarator: (pointer_declarator
-    declarator: (pointer_declarator
-      declarator: (function_declarator declarator: (identifier) @name)))) @function
 (declaration
   declarator: (function_declarator declarator: (identifier) @name)) @function
-(declaration
-  declarator: (pointer_declarator
-    declarator: (function_declarator declarator: (identifier) @name))) @function
-(declaration
-  declarator: (pointer_declarator
-    declarator: (pointer_declarator
-      declarator: (function_declarator declarator: (identifier) @name)))) @function
+(function_definition declarator: (pointer_declarator) @declarator) @function
+(declaration declarator: (pointer_declarator) @declarator) @function
 "#;
 
 const C_TYPE_QUERY: &str = r#"
@@ -350,48 +340,14 @@ const CPP_QUERY: &str = r#"
 (function_definition
   declarator: (function_declarator
     declarator: (qualified_identifier name: (_) @name))) @function
-(function_definition
-  declarator: (pointer_declarator
-    declarator: (function_declarator
-      declarator: (qualified_identifier name: (_) @name)))) @function
-(function_definition
-  declarator: (reference_declarator
-    (function_declarator declarator: [(identifier) (field_identifier)] @name))) @function
-(function_definition
-  declarator: (reference_declarator
-    (function_declarator
-      declarator: (qualified_identifier name: (_) @name)))) @function
 (field_declaration
   declarator: (function_declarator declarator: (_) @name)) @function
-; Members returning a pointer or a reference, defined in the class or only
-; declared there, and prototypes returning a reference.
-(function_definition
-  declarator: (pointer_declarator
-    declarator: (function_declarator
-      declarator: [(field_identifier) (operator_name)] @name))) @function
-(function_definition
-  declarator: (pointer_declarator
-    declarator: (pointer_declarator
-      declarator: (function_declarator
-        declarator: [(field_identifier) (operator_name)] @name)))) @function
-(function_definition
-  declarator: (pointer_declarator
-    declarator: (pointer_declarator
-      declarator: (function_declarator
-        declarator: (qualified_identifier name: (_) @name))))) @function
+; What returns a reference, and the members returning a pointer: see
+; `declared_function`.
+(function_definition declarator: (reference_declarator) @declarator) @function
+(declaration declarator: (reference_declarator) @declarator) @function
 (field_declaration
-  declarator: (pointer_declarator
-    declarator: (function_declarator declarator: (_) @name))) @function
-(field_declaration
-  declarator: (pointer_declarator
-    declarator: (pointer_declarator
-      declarator: (function_declarator declarator: (_) @name)))) @function
-(field_declaration
-  declarator: (reference_declarator
-    (function_declarator declarator: (_) @name))) @function
-(declaration
-  declarator: (reference_declarator
-    (function_declarator declarator: (identifier) @name))) @function
+  declarator: [(pointer_declarator) (reference_declarator)] @declarator) @function
 (class_specifier name: (_) @name body: (_)) @class
 (namespace_definition name: (_) @name) @module
 (alias_declaration name: (_) @name) @type
@@ -792,6 +748,8 @@ fn extract_symbols(
             let cap_name = names[cap.index as usize];
             if cap_name == "name" {
                 name_node = Some(cap.node);
+            } else if cap_name == "declarator" {
+                name_node = declared_function(cap.node);
             } else if let Some(kind) = SymbolKind::from_capture(cap_name) {
                 def = Some((cap.node, kind));
             }
@@ -805,6 +763,7 @@ fn extract_symbols(
         if name.is_empty()
             || is_require(name_node, source)
             || name_node.kind() == "parenthesized_declarator"
+            || is_local_declaration(lang, node)
         {
             continue;
         }
@@ -873,6 +832,50 @@ fn definition_end(node: Node<'_>) -> usize {
         Some(next) if is_field && next.kind() == ";" => next.end_byte(),
         _ => node.end_byte(),
     }
+}
+
+/// The name of the function that a C or C++ `declarator` declares under the
+/// `*` and `&` of what it returns, however many: `f` in `char **f(void)` and
+/// `Buf::f` in `char *&Buf::f()`. None when it declares anything else, such as
+/// a variable, `char *p;`, or a pointer to a function, `char *(*f)(int);`.
+fn declared_function(mut declarator: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        declarator = match declarator.kind() {
+            "pointer_declarator" => declarator.child_by_field_name("declarator")?,
+            // The declarator follows the `&`, in no field.
+            "reference_declarator" => {
+                let last = u32::try_from(declarator.named_child_count()).ok()?;
+                declarator.named_child(last.checked_sub(1)?)?
+            }
+            "function_declarator" => break,
+            _ => return None,
+        };
+    }
+    let mut name = declarator.child_by_field_name("declarator")?;
+    while name.kind() == "qualified_identifier" {
+        name = name.child_by_field_name("name")?;
+    }
+    (name.kind() != "parenthesized_declarator").then_some(name)
+}
+
+/// Whether `node` is a C or C++ declaration inside a function body. One
+/// shaped like a prototype there is nearly always a variable built from
+/// arguments, `Buf b(s);`, which the grammar cannot tell from a function.
+fn is_local_declaration(lang: Lang, node: Node<'_>) -> bool {
+    if !matches!(lang, Lang::C | Lang::Cpp) || node.kind() != "declaration" {
+        return false;
+    }
+    let mut parent = node.parent();
+    while let Some(outer) = parent {
+        match outer.kind() {
+            "compound_statement" => return true,
+            // A member of a class defined in a function body is no local.
+            "field_declaration_list" => return false,
+            _ => {}
+        }
+        parent = outer.parent();
+    }
+    false
 }
 
 /// `const fs = require("fs")` is an import, not a definition of the file.
@@ -1661,19 +1664,25 @@ macro_rules! m { () => {} }
             listed(Lang::C, c),
             ["function dup", "function split", "function names"]
         );
-        let cpp = "class Buf {\npublic:\n    char* data() { return p; }\n    const char** names() { return q; }\n    char* decl();\n    Buf& decl2();\n    void (*cb)(int);\n    char* (*alloc)(int);\n    char* p; const char** q;\n};\nBuf& make();\nconst char** Buf::all() { return q; }\n";
+        let cpp = "class Buf {\npublic:\n    char* data() { return p; }\n    const char** names() { return q; }\n    char*& ref() { return p; }\n    char* decl();\n    Buf& decl2();\n    void (*cb)(int);\n    char* (*alloc)(int);\n    char* p; const char** q;\n};\nBuf& make();\nconst char** Buf::all() { return q; }\nchar*** deep();\nchar*& ns::Buf::far() { return p; }\n";
         assert_eq!(
             listed(Lang::Cpp, cpp),
             [
                 "class Buf",
                 "method Buf::data",
                 "method Buf::names",
+                "method Buf::ref",
                 "method Buf::decl",
                 "method Buf::decl2",
                 "function make",
                 "function all",
+                "function deep",
+                "function far",
             ]
         );
+        // A variable built from arguments in a function body is no prototype.
+        let cpp = "int f();\nint main() { char *s = g(); Buf b(s); char *t(s); return 0; }\n";
+        assert_eq!(listed(Lang::Cpp, cpp), ["function f", "function main"]);
     }
 
     #[test]
