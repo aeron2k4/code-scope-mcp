@@ -40,9 +40,6 @@ Each entry ends with the commits that made it.
   modifier as private (dc7007f).
 - `find_references` never reports the name in a Go `package` clause, where it
   did only for a file that used the name elsewhere too (4c7d562).
-- `install.sh` says that a new release may still be building the macOS or
-  Windows binary when it is missing, instead of only that the download failed
-  (7f7650f).
 - `codebase_map` no longer ranks a module by a name that a file uses from
   other modules defining it too, and treats `.H` and `.HPP` files as headers
   (aef9542).
@@ -55,6 +52,10 @@ Each entry ends with the commits that made it.
 
 - `replace_symbol`, `replace_text`, `replace_lines` and `insert_symbol` refuse
   a source file over 2 MB, the size the other tools parse (df64fd3).
+- A release is published only once it has the Linux, macOS and Windows
+  binaries, so `install.sh` no longer fails on macOS and Windows while a new
+  release is being built. Each binary has a build provenance, checked with
+  `gh attestation verify` (7e60da3).
 
 ## 0.5.2 (2026-11-10)
 
