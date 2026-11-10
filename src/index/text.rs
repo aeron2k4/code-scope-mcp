@@ -166,7 +166,8 @@ fn context_lines(source: &str, byte: usize, line: usize, n: usize) -> Vec<(usize
     let start = source[..byte].rfind('\n').map_or(0, |i| i + 1);
     let mut first = start;
     let mut first_line = line;
-    while first_line > 1 && line - first_line < n {
+    // `first > 0` only fails when the file changed since `line` was counted.
+    while first_line > 1 && first > 0 && line - first_line < n {
         first = source[..first - 1].rfind('\n').map_or(0, |i| i + 1);
         first_line -= 1;
     }
