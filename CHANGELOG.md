@@ -25,6 +25,13 @@ Each entry ends with the commits that made it.
   during the search (401151b).
 - An edit keeps the other names of a hard-linked file up to date instead of
   leaving them with the old contents (1a25775).
+- Functions the tools did not see are symbols now: in C and C++, a prototype
+  returning a pointer, a function returning a pointer to a pointer, and a
+  member returning a pointer or a reference; in JavaScript and TypeScript, a
+  class field holding a function (`handle = () => {}`) and a function assigned
+  to a member at the top level (`exports.f = function () {}`); in C#,
+  properties. A C++ member that is a pointer to a function is no longer listed
+  as a function named `(*cb)` (a0b400d).
 - Two versions of astlens running at once no longer remove each other's stored
   parse results. Each version keeps them in its own directory of the cache
   directory, removed after 14 days without a write once another version
