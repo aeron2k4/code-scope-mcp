@@ -3,6 +3,14 @@
 All notable changes to astlens. Versions follow [Semantic Versioning](https://semver.org/).
 Each entry ends with the commits that made it.
 
+## Unreleased
+
+### Security
+
+- Updated `rmcp` to 3.9.0, which fixes RUSTSEC-2026-0462 (unbounded response
+  body buffering in its Streamable HTTP clients; astlens serves over stdio
+  only) (2b25093).
+
 ## 0.5.3 (2026-11-10)
 
 ### Fixed
