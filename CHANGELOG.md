@@ -3,6 +3,15 @@
 All notable changes to astlens. Versions follow [Semantic Versioning](https://semver.org/).
 Each entry ends with the commits that made it.
 
+## Unreleased
+
+### Fixed
+
+- `read_symbol`, `replace_symbol` and `insert_symbol` no longer take code above
+  a nested symbol for part of it: a line ending in `)` or `]` below a decorated
+  class or function, or a line starting with `*` or `[`. Replacing a method
+  could delete its class's decorator, header and fields (1371285).
+
 ## 0.5.2 (2026-11-10)
 
 ### Changed
