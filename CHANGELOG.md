@@ -17,6 +17,18 @@ Each entry ends with the commits that made it.
 - `read_lines` keeps only the lines it returns in memory, and reads a range of
   a file that is not UTF-8 elsewhere. `read_file_pruned` reads only the start
   of a plain file far over its budget (df64fd3).
+- In a file that mixes `\r\n` and `\n`, `replace_text` finds `old_text` over
+  either line break, and new text takes the break of what it replaces instead
+  of `\r\n` everywhere. `list_files` no longer reports its limit reached for a
+  tree of exactly that many files (4c83b10).
+- `search_text` with `context` no longer fails on a file that is rewritten
+  during the search (401151b).
+- An edit keeps the other names of a hard-linked file up to date instead of
+  leaving them with the old contents (1a25775).
+- Two versions of astlens running at once no longer remove each other's stored
+  parse results. Each version keeps them in its own directory of the cache
+  directory, removed after 14 days without a write once another version
+  starts (5352ea2).
 
 ### Changed
 
