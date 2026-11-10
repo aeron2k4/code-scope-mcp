@@ -355,7 +355,7 @@ fn write_hook(hook: &Path) -> Result<()> {
     if let Some(dir) = hook.parent() {
         fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
     }
-    fs::write(hook, GUARD).with_context(|| format!("cannot write {}", hook.display()))?;
+    write_atomic(hook, GUARD).with_context(|| format!("cannot write {}", hook.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
