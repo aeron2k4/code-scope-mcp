@@ -32,6 +32,17 @@ Each entry ends with the commits that made it.
   to a member at the top level (`exports.f = function () {}`); in C#,
   properties. A C++ member that is a pointer to a function is no longer listed
   as a function named `(*cb)` (a0b400d).
+- A C or C++ function is found under any number of `*` and `&` of what it
+  returns, `char*& f()` included, and a variable built from arguments in a
+  function body, `Buf b(s);`, is no longer listed as a function (1600b4b).
+- `codebase_map` ranks an exported JavaScript name that is part of the word
+  `export`, such as `e` or `port`, as exported, and a C# member with no access
+  modifier as private (dc7007f).
+- `find_references` never reports the name in a Go `package` clause, where it
+  did only for a file that used the name elsewhere too (4c7d562).
+- `install.sh` says that a new release may still be building the macOS or
+  Windows binary when it is missing, instead of only that the download failed
+  (7f7650f).
 - Two versions of astlens running at once no longer remove each other's stored
   parse results. Each version keeps them in its own directory of the cache
   directory, removed after 14 days without a write once another version
