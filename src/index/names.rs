@@ -531,9 +531,16 @@ impl<'a> JsExports<'a> {
         let line_end = source[start..]
             .find('\n')
             .map_or(source.len(), |i| start + i);
+        // The name as a whole word: `e` is not the one in `export const e`.
+        let name = sym.name.as_str();
         let name_at = source
             .get(start..line_end)
-            .and_then(|line| line.find(sym.name.as_str()))
+            .and_then(|line| {
+                line.match_indices(name).map(|(i, _)| i).find(|&i| {
+                    !line[..i].ends_with(is_ident_char)
+                        && !line[i + name.len()..].starts_with(is_ident_char)
+                })
+            })
             .map_or(start, |i| start + i);
         source.get(line_start..name_at).is_some_and(|before| {
             before
@@ -554,7 +561,8 @@ impl<'a> JsExports<'a> {
 /// - C and C++: a `static` function or variable outside any type, and any
 ///   macro or type outside one, seen only in its file (or the files
 ///   including it, for a header).
-/// - Java and C#: a `private` member, seen only in its class.
+/// - Java and C#: a `private` member, seen only in its class; in C# also a
+///   member of a class or struct with no access modifier.
 fn is_private(lang: Lang, sym: &Symbol, enclosing: Option<&Symbol>) -> bool {
     use SymbolKind::*;
     if matches!(sym.kind, Impl | Module) {
@@ -589,7 +597,16 @@ fn is_private(lang: Lang, sym: &Symbol, enclosing: Option<&Symbol>) -> bool {
                     || (matches!(sym.kind, Function | Variable | Constant)
                         && modifiers().any(|w| w == "static")))
         }
-        Lang::Java | Lang::CSharp => modifiers().any(|w| w == "private"),
+        Lang::Java => modifiers().any(|w| w == "private"),
+        Lang::CSharp => {
+            // A member of a class or struct with no access modifier is
+            // private, unless it implements an interface's member by its
+            // full name, `void IDisposable.Dispose()`.
+            let access = |w: &str| matches!(w, "public" | "private" | "protected" | "internal");
+            let member = enclosing.is_some_and(|e| matches!(e.kind, Class | Struct));
+            let explicit = sym.signature.contains(&format!(".{}", sym.name));
+            modifiers().any(|w| w == "private") || (member && !explicit && !modifiers().any(access))
+        }
         Lang::JavaScript | Lang::TypeScript | Lang::Tsx => false,
     }
 }
@@ -673,6 +690,12 @@ mod tests {
         let java =
             "class A {\n    private int f() { return 1; }\n    public int g() { return 2; }\n}\n";
         assert_eq!(private("A.java", java), ["f"]);
+        // A C# member is private unless it says otherwise; a type outside
+        // any other is not.
+        let cs = "class A : IDisposable {\n    void M() {}\n    public void P() {}\n    internal int I { get; }\n    \
+                  private int F() { return 1; }\n    void IDisposable.Dispose() {}\n}\n\
+                  interface I2 {\n    void N();\n}\n";
+        assert_eq!(private("A.cs", cs), ["M", "F"]);
     }
 
     #[test]
@@ -680,6 +703,10 @@ mod tests {
         let module = "import { x } from './x';\nfunction f() {}\nexport function g() {}\n\
                       const h = 1;\nclass K {\n    m() {}\n}\nexport { h };\nexport default K;\n";
         assert_eq!(private("a.ts", module), ["f"]);
+        // A name that is part of the word `export` is still found after it.
+        let short =
+            "import { x } from './x';\nexport const e = 1;\nexport const port = 2;\nconst t = 3;\n";
+        assert_eq!(private("a.ts", short), ["t"]);
         // A script's declarations are global.
         assert!(private("a.js", "function f() {}\nvar v = 1;\n").is_empty());
         assert!(
