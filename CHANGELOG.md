@@ -43,6 +43,9 @@ Each entry ends with the commits that made it.
 - `install.sh` says that a new release may still be building the macOS or
   Windows binary when it is missing, instead of only that the download failed
   (7f7650f).
+- `codebase_map` no longer ranks a module by a name that a file uses from
+  other modules defining it too, and treats `.H` and `.HPP` files as headers
+  (aef9542).
 - Two versions of astlens running at once no longer remove each other's stored
   parse results. Each version keeps them in its own directory of the cache
   directory, removed after 14 days without a write once another version
