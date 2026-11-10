@@ -3,7 +3,8 @@
 //! 1. In memory: files are parsed on first request and served from memory
 //!    while their modification time and size are unchanged.
 //! 2. On disk (optional): a [`PersistentStore`] backed by LMDB (memory-mapped
-//!    via `heed`) keeps parse results across restarts, keyed by absolute path
+//!    via `heed`), in a directory of its own per version of the stored
+//!    format, keeps parse results across restarts, keyed by absolute path
 //!    and validated by the file's git blob hash, so an unchanged file is never
 //!    re-parsed even after the server restarts or the mtime is touched.
 //!
@@ -18,9 +19,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
-use heed::types::{Bytes, DecodeIgnore, Str};
+use heed::types::Bytes;
 use heed::{Database, Env, EnvOpenOptions};
 use serde::Serialize;
 
@@ -33,8 +34,12 @@ use crate::index::store_format;
 /// leak into results. Bump the `-s` suffix whenever [`ParsedFile`]'s stored
 /// format or a symbol query changes between releases.
 const DB_NAME: &str = concat!("parsed-v", env!("CARGO_PKG_VERSION"), "-s17");
-/// Every database this store has ever created starts with this prefix.
+/// Every store directory starts with this prefix.
 const DB_PREFIX: &str = "parsed-v";
+/// The files of an LMDB environment.
+const ENV_FILES: [&str; 2] = ["data.mdb", "lock.mdb"];
+/// How long the store of another version goes unwritten before it is removed.
+const STALE_AFTER: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 const MAP_SIZE: usize = 1 << 30;
 /// Pending writes that trigger an automatic flush.
 const FLUSH_THRESHOLD: usize = 512;
@@ -129,47 +134,63 @@ impl PersistentStore {
     }
 
     fn open_sized(dir: &Path, map_size: usize) -> Result<Self, StoreError> {
-        std::fs::create_dir_all(dir).map_err(|source| StoreError::Dir {
-            path: dir.to_path_buf(),
+        let own = dir.join(DB_NAME);
+        std::fs::create_dir_all(&own).map_err(|source| StoreError::Dir {
+            path: own.clone(),
             source,
         })?;
+        Self::remove_stale(dir, SystemTime::now());
         // SAFETY: the map is only accessed through heed transactions and the
         // files are never modified other than through LMDB, which handles
         // multi-process locking itself. Opening the same path more than once
         // per process is supported by heed.
-        let env = unsafe {
-            EnvOpenOptions::new()
-                .map_size(map_size)
-                .max_dbs(4)
-                .open(dir)?
-        };
+        let env = unsafe { EnvOpenOptions::new().map_size(map_size).open(&own)? };
         let mut wtxn = env.write_txn()?;
-        let db = env.create_database(&mut wtxn, Some(DB_NAME))?;
-        Self::drop_stale(&env, &mut wtxn)?;
+        let db = env.create_database(&mut wtxn, None)?;
         wtxn.commit()?;
         Ok(PersistentStore { env, db })
     }
 
-    /// Remove databases written by other versions, so they neither use up
-    /// `max_dbs` slots nor space in the map.
-    fn drop_stale(env: &Env, wtxn: &mut heed::RwTxn) -> Result<(), StoreError> {
-        let names: Database<Str, DecodeIgnore> = env
-            .open_database(wtxn, None)?
-            .ok_or(heed::Error::Mdb(heed::MdbError::NotFound))?;
-        let stale: Vec<String> = names
-            .iter(wtxn)?
-            .filter_map(|item| item.ok().map(|(name, ())| name.to_owned()))
-            .filter(|name| name.starts_with(DB_PREFIX) && name != DB_NAME)
-            .collect();
-        for name in stale {
-            if let Some(db) = env.open_database::<Bytes, Bytes>(wtxn, Some(&name))? {
+    /// Remove the stores other versions left in `dir`, so they do not take
+    /// up disk for good. Each version keeps its own environment, in a
+    /// directory named after it, and a server of another version may be
+    /// running on one right now: it is removed only once nothing was written
+    /// to it for [`STALE_AFTER`] before `now`. Two versions used side by side
+    /// therefore never remove each other's results. What cannot be removed is
+    /// left for the next start.
+    fn remove_stale(dir: &Path, now: SystemTime) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let path = entry.path();
+            // Up to 0.5.2 one environment in `dir` itself held a database
+            // per version, each start dropping those of the others.
+            if ENV_FILES.contains(&&*name) {
+                if path.is_file() {
+                    tracing::info!(path = %path.display(), "removing parse store of an earlier layout");
+                    let _ = std::fs::remove_file(&path);
+                }
+                continue;
+            }
+            if !name.starts_with(DB_PREFIX) || name == DB_NAME || !path.is_dir() {
+                continue;
+            }
+            let written = ENV_FILES
+                .iter()
+                .filter_map(|file| std::fs::metadata(path.join(file)).ok()?.modified().ok())
+                .max();
+            let idle = written.is_none_or(|at| {
+                now.duration_since(at)
+                    .is_ok_and(|unused| unused > STALE_AFTER)
+            });
+            if idle {
                 tracing::info!(%name, "removing parse store from another version");
-                // SAFETY: the database was opened just now in this transaction
-                // and nothing in this process has modified it.
-                unsafe { db.remove(wtxn)? };
+                let _ = std::fs::remove_dir_all(&path);
             }
         }
-        Ok(())
     }
 
     fn key(path: &Path) -> &[u8] {
@@ -775,29 +796,39 @@ mod tests {
     }
 
     #[test]
-    fn opening_removes_databases_of_other_versions() {
+    fn opening_removes_only_the_unused_stores_of_other_versions() {
         let dir = tempfile::tempdir().unwrap();
-        let store = PersistentStore::open(dir.path()).unwrap();
-        let mut wtxn = store.env.write_txn().unwrap();
-        for name in ["parsed-v0.0.1", "parsed-v0.1.0-s1", "unrelated"] {
-            let db: Database<Bytes, Bytes> =
-                store.env.create_database(&mut wtxn, Some(name)).unwrap();
-            db.put(&mut wtxn, b"k", b"v").unwrap();
+        let root = dir.path();
+        // The layout up to 0.5.2, another version's store and someone else's
+        // directory.
+        for file in ENV_FILES {
+            fs::write(root.join(file), "old").unwrap();
         }
-        wtxn.commit().unwrap();
-        drop(store);
+        for name in ["parsed-v0.0.1-s1", "unrelated"] {
+            fs::create_dir(root.join(name)).unwrap();
+            fs::write(root.join(name).join("data.mdb"), "x").unwrap();
+        }
+        fs::create_dir(root.join("parsed-v0.0.2-s1")).unwrap();
 
-        let store = PersistentStore::open(dir.path()).unwrap();
-        let rtxn = store.env.read_txn().unwrap();
-        let names: Database<Str, DecodeIgnore> =
-            store.env.open_database(&rtxn, None).unwrap().unwrap();
-        let mut left: Vec<_> = names
-            .iter(&rtxn)
-            .unwrap()
-            .map(|item| item.unwrap().0.to_owned())
-            .collect();
-        left.sort();
-        assert_eq!(left, [DB_NAME, "unrelated"]);
+        let store = PersistentStore::open(root).unwrap();
+        let left = |root: &Path| {
+            let mut names: Vec<String> = fs::read_dir(root)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+        // Written a moment ago, so a server of that version may be running;
+        // the empty one holds nothing to keep.
+        assert_eq!(left(root), ["parsed-v0.0.1-s1", DB_NAME, "unrelated"]);
+
+        let later = SystemTime::now() + STALE_AFTER + Duration::from_secs(60);
+        PersistentStore::remove_stale(root, later);
+        assert_eq!(left(root), [DB_NAME, "unrelated"]);
+        // This version's own store is never removed, however long unused.
+        drop(store);
+        assert!(PersistentStore::open(root).is_ok());
     }
 
     #[test]
