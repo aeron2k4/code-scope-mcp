@@ -4,6 +4,9 @@ name: Release
 # "astlens 0.1.0" && git push origin v0.1.0`. To release a tag that
 # already exists, run this workflow by hand with that tag. The tag must be on
 # main.
+#
+# The release is a draft until every binary is in it, so that
+# releases/latest/download never names a release that lacks one.
 on:
   push:
     tags: ["v*"]
@@ -16,6 +19,12 @@ on:
 permissions:
   contents: read
 
+# Two runs for one tag, a push and one by hand, would each rewrite SHA256SUMS
+# from the copy it downloaded and lose the other's lines.
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
@@ -24,11 +33,13 @@ env:
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ env.TAG }}
           fetch-depth: 0 # the history of main, for the check below
+          persist-credentials: false
       - name: Tag is on main
         run: |
           if ! git merge-base --is-ancestor "$TAG" origin/main; then
@@ -56,17 +67,20 @@ jobs:
           path: release-notes.md
           if-no-files-found: error
 
-  # Linux decides the release: once its tests and build pass, the release goes
-  # out without waiting for the Windows and macOS runners.
+  # Linux decides the release: once its tests and build pass, the draft is
+  # made, and the Windows and macOS runners only build. No build cache here or
+  # below: a released binary is built from the tag alone, not from what an
+  # earlier run left behind.
   linux:
     needs: check
     runs-on: ubuntu-22.04 # older glibc, so the binary runs on more distros
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ env.TAG }}
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo test --locked
       - run: scripts/test-guard.sh
       - run: cargo build --release --locked
@@ -83,8 +97,12 @@ jobs:
   release:
     needs: linux
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
+      # For the build provenance below.
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
@@ -93,30 +111,49 @@ jobs:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: notes
-      # One checksum file for all binaries: `sha256sum -c SHA256SUMS`.
-      - name: Checksums
-        run: cd dist && sha256sum astlens-* > SHA256SUMS
       # A release that already exists is left as it is, so running this
       # workflow by hand for an old tag only adds or replaces the binaries
       # built below.
-      - name: Publish GitHub Release
+      - name: Look for the release
+        id: existing
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "release $TAG exists; keeping its Linux binary"
-            exit 0
+            echo "found=true" >> "$GITHUB_OUTPUT"
           fi
+      # SHA256SUMS sits beside the binaries, so it only tells a damaged
+      # download. The provenance says which workflow run built a binary from
+      # which commit: `gh attestation verify astlens-linux --repo <this repo>`.
+      - if: steps.existing.outputs.found != 'true'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/astlens-*
+      # One checksum file for all binaries: `sha256sum -c SHA256SUMS`.
+      - name: Checksums
+        run: cd dist && sha256sum astlens-* > SHA256SUMS
+      # A draft, which `others-publish` publishes once the other binaries are
+      # in it.
+      - name: Draft GitHub Release
+        if: steps.existing.outputs.found != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
           gh release create "$TAG" dist/* \
             --title "astlens $TAG" \
             --notes-file release-notes.md \
-            --verify-tag
+            --verify-tag \
+            --draft
 
-  # Added to the published release when they finish. A failure leaves the
-  # release without that binary, and the other one is still added.
+  # Added to the draft when they finish. A failure leaves the release a draft
+  # with the binaries that were built; a run by hand with the tag adds the
+  # missing one and publishes.
   others:
     needs: release
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -134,7 +171,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: ${{ runner.os == 'macOS' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - if: runner.os == 'Windows'
         run: |
           cargo build --release --locked
@@ -163,8 +199,11 @@ jobs:
     needs: [release, others]
     if: ${{ !cancelled() && needs.release.result == 'success' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
@@ -191,3 +230,20 @@ jobs:
             mv sums.new SHA256SUMS
           done
           gh release upload "$TAG" SHA256SUMS --clobber
+      # After the step above, which says so when nothing was built.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/astlens-*
+      # Only a release with every binary is published. An old tag released by
+      # hand is published already, and stays so.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          COMPLETE: ${{ needs.others.result == 'success' }}
+        run: |
+          if [ "$COMPLETE" != true ]; then
+            echo "::error::release $TAG is not published by this run: a binary is missing. Fix its build, then run this workflow by hand with the tag"
+            exit 1
+          fi
+          gh release edit "$TAG" --draft=false

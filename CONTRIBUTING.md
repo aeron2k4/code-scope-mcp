@@ -33,9 +33,12 @@ git push origin v0.1.0
 ```
 
 The release workflow checks that the tag matches `Cargo.toml` and that
-`CHANGELOG.md` has a section for it, runs the tests on Linux and publishes a
+`CHANGELOG.md` has a section for it, runs the tests on Linux and drafts a
 GitHub Release with the Linux binary, `SHA256SUMS` and that section as its
-notes (`scripts/release-notes.sh vX.Y.Z` prints them), without waiting for the
-Windows and macOS runners. Those binaries are then built and added to that
-release, so they appear later. Until then,
-downloading it fails, including through `scripts/install.sh`.
+notes (`scripts/release-notes.sh vX.Y.Z` prints them). The Windows and macOS
+binaries are then built and added to the draft, and only a release with all
+three is published, so `scripts/install.sh` never finds the latest release
+without the binary it needs. When one of those builds fails the release stays a
+draft: fix the build, then run the workflow by hand with the tag. Each binary
+has a build provenance, checked with
+`gh attestation verify astlens-linux --repo aeron2k4/code-scope-mcp`.
