@@ -11,6 +11,17 @@ Each entry ends with the commits that made it.
   a nested symbol for part of it: a line ending in `)` or `]` below a decorated
   class or function, or a line starting with `*` or `[`. Replacing a method
   could delete its class's decorator, header and fields (1371285).
+- `changed_symbols` counts the lines of an untracked file in pieces instead of
+  reading it whole, so a large untracked data file no longer takes its size in
+  memory (3e7a9d9).
+- `read_lines` keeps only the lines it returns in memory, and reads a range of
+  a file that is not UTF-8 elsewhere. `read_file_pruned` reads only the start
+  of a plain file far over its budget (df64fd3).
+
+### Changed
+
+- `replace_symbol`, `replace_text`, `replace_lines` and `insert_symbol` refuse
+  a source file over 2 MB, the size the other tools parse (df64fd3).
 
 ## 0.5.2 (2026-11-10)
 
