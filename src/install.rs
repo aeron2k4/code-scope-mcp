@@ -212,9 +212,12 @@ pub fn install(enforce: bool, client: Client) -> Result<()> {
     if opencode_target {
         install_opencode(&paths, enforce)?;
     }
-    log(
-        "Done. Restart Claude Code, or start a new OpenCode session, then check the MCP server list",
-    );
+    let next = match (claude_target, opencode_target) {
+        (true, true) => "Restart Claude Code, or start a new OpenCode session",
+        (true, false) => "Restart Claude Code",
+        _ => "Start a new OpenCode session",
+    };
+    log(format_args!("Done. {next}, then check the MCP server list"));
     Ok(())
 }
 
