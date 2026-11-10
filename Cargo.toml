@@ -18,7 +18,7 @@ ignore = "0.4.34"
 jsonc-parser = { version = "0.34.0", features = ["cst"] }
 memchr = "2.8.3"
 regex = "1.13.1"
-rmcp = { version = "3.8.0", features = ["server", "transport-io", "macros"] }
+rmcp = { version = "3.9.0", features = ["server", "transport-io", "macros"] }
 schemars = "1.2.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
