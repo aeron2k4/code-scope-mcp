@@ -657,14 +657,12 @@ const PUBLIC_END: u32 = 16;
 /// The scope key of definitions no other file can mention.
 const FILE_ONLY: u32 = u32::MAX;
 
-/// Whether the slash-separated `path` is that of a C or C++ header.
+/// Whether the slash-separated `path` is that of a C or C++ header, whatever
+/// the case of its extension, as `Lang::from_path` reads it.
 fn is_header(path: &str) -> bool {
-    path.rsplit_once('.').is_some_and(|(_, ext)| {
-        matches!(
-            ext,
-            "h" | "hh" | "hpp" | "hxx" | "h++" | "inl" | "ipp" | "tcc" | "tpp"
-        )
-    })
+    const EXTENSIONS: [&str; 9] = ["h", "hh", "hpp", "hxx", "h++", "inl", "ipp", "tcc", "tpp"];
+    path.rsplit_once('.')
+        .is_some_and(|(_, ext)| EXTENSIONS.iter().any(|e| ext.eq_ignore_ascii_case(e)))
 }
 
 /// The slash-terminated prefix of the files that may include the headers in
@@ -1083,6 +1081,9 @@ impl Graph {
                     defined.sort_unstable();
                     let mut out = Vec::new();
                     let mut found_here = Vec::new();
+                    // The definers of the current ident the file uses, as
+                    // indices into them.
+                    let mut used: Vec<u32> = Vec::new();
                     for (h, count) in mentions.iter() {
                         // (A saturated count may hide uses, so it stays.)
                         let saturated = count == u8::MAX;
@@ -1116,8 +1117,7 @@ impl Graph {
                                 defs
                             };
                             let mut found = (0, 1.0);
-                            let mut used = 0;
-                            let mut only = ALL;
+                            used.clear();
                             for (k, &d) in (0u32..).zip(checked) {
                                 let unit = &units[d as usize];
                                 if !is_public(scope)
@@ -1136,11 +1136,10 @@ impl Graph {
                                     uses,
                                 );
                                 if got.0 > 0 {
-                                    if used == 0 {
+                                    if used.is_empty() {
                                         found = got;
                                     }
-                                    used += 1;
-                                    only = k;
+                                    used.push(k);
                                 }
                             }
                             if defs.len() > NEAREST_OF
@@ -1155,13 +1154,33 @@ impl Graph {
                             if uses == 0 {
                                 continue;
                             }
-                            // The one definer the file uses, else the nearest.
-                            let near = if used == 1 && defs.len() > 1 && checked.len() > 1 {
-                                only
-                            } else {
-                                nearest(defs, paths, path, has_alternates(first.lang))
-                            };
                             let w = term_weight(uses) * multiplier[id] * factor;
+                            let alternates = has_alternates(first.lang);
+                            // Every definer was checked, and the file uses
+                            // only some: the others take nothing from it.
+                            let some = checked.len() == defs.len() && used.len() < defs.len();
+                            let near =
+                                match used[..] {
+                                    // The one definer the file uses.
+                                    [only] if some => only,
+                                    // The nearest of those it uses, or all of
+                                    // them alike, each by an edge of its own.
+                                    [_, _, ..] if some => {
+                                        let among: Vec<u32> =
+                                            used.iter().map(|&k| defs[k as usize]).collect();
+                                        match nearest(&among, paths, path, alternates) {
+                                            ALL => {
+                                                let share = (w / used.len() as f64) as f32;
+                                                found_here.extend(used.iter().map(|&k| {
+                                                    ((id as u32, share, k), factor == 1.0)
+                                                }));
+                                                continue;
+                                            }
+                                            k => used[k as usize],
+                                        }
+                                    }
+                                    _ => nearest(defs, paths, path, alternates),
+                                };
                             found_here.push(((id as u32, w as f32, near), factor == 1.0));
                         }
                         // A name the file imports, or otherwise names the
@@ -1179,10 +1198,18 @@ impl Graph {
                 .collect()
         });
 
+        // A file may send several edges to one ident, one for each definer
+        // it uses; they follow each other, and count as one file below.
         let mut ref_count = vec![0u32; idents + 1];
+        let mut mentioning = vec![0u32; idents];
         for out in &edges {
+            let mut last = None;
             for &(id, ..) in out {
                 ref_count[id as usize + 1] += 1;
+                if last != Some(id) {
+                    mentioning[id as usize] += 1;
+                    last = Some(id);
+                }
             }
         }
         // Inverse document frequency: a name nearly every file mentions,
@@ -1191,7 +1218,7 @@ impl Graph {
         let files = names.len() as f64;
         let idf: Vec<f32> = (0..idents)
             .map(|i| {
-                let mentioned_by = f64::from(ref_count[i + 1]) + definers(i).len() as f64;
+                let mentioned_by = f64::from(mentioning[i]) + definers(i).len() as f64;
                 ((files + 1.0) / mentioned_by).ln() as f32
             })
             .collect();
@@ -2339,6 +2366,49 @@ mod tests {
         assert_eq!(import_path("p/v1/user.ts", "p/v2/state.ts"), "../v2/state");
         assert_eq!(import_path("p/user.ts", "p/a/index.ts"), "./a");
         assert_eq!(import_path("user.ts", "state.ts"), "./state");
+    }
+
+    #[test]
+    fn a_name_used_from_some_modules_means_only_those() {
+        let dir = tempfile::tempdir().unwrap();
+        let export = "export function load() {}\n";
+        let user = |from: [&str; 2]| {
+            format!(
+                "import {{ load }} from '{}';\nimport {{ load as other }} from '{}';\nload();\n",
+                from[0], from[1]
+            )
+        };
+        // `c/utils.ts` is the nearest of the three to `c/x/main.ts`, which
+        // imports the other two, as far from it as each other.
+        let tied = user(["../../a/utils", "../../b/utils"]);
+        // Of the two `c/x/near.ts` imports, `c/utils.ts` is the nearer.
+        let near = user(["../../a/utils", "../utils"]);
+        let files = [
+            ("a/utils.ts", export),
+            ("b/utils.ts", export),
+            ("c/utils.ts", export),
+            ("c/x/main.ts", tied.as_str()),
+            ("c/x/near.ts", near.as_str()),
+        ];
+        let (graph, ranks) = graph_of(dir.path(), &files);
+        let set = |paths: &[&str]| paths.iter().map(|p| p.to_string()).collect::<BTreeSet<_>>();
+        assert_eq!(
+            targets(&graph, &files, 3),
+            set(&["a/utils.ts", "b/utils.ts"])
+        );
+        assert_eq!(targets(&graph, &files, 4), set(&["c/utils.ts"]));
+        // The two it uses alike take as much from it.
+        assert!((ranks[0] - ranks[1]).abs() < 1e-9, "{ranks:?}");
+    }
+
+    #[test]
+    fn a_header_is_one_whatever_the_case_of_its_extension() {
+        for path in ["a/x.h", "a/x.H", "a/x.HPP", "x.Hxx"] {
+            assert!(is_header(path), "{path}");
+        }
+        for path in ["a/x.c", "a/x.CPP", "a/h", "x"] {
+            assert!(!is_header(path), "{path}");
+        }
     }
 
     #[test]
