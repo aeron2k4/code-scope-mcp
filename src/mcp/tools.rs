@@ -500,21 +500,60 @@ impl Workspace {
     }
 
     /// Lines `start..=end` of a file, numbered: at most [`MAX_READ_LINES`],
-    /// which is also how many come when `end` is not given.
+    /// which is also how many come when `end` is not given. The file is read
+    /// line by line, so only the lines returned are held in memory, whatever
+    /// its size.
     pub fn read_lines(&self, rel: &str, start: usize, end: Option<usize>) -> Result<String> {
+        use std::io::BufRead as _;
+
         let path = self.resolve_read(rel)?;
         if !path.is_file() {
             bail!("{} is not a regular file", self.display(&path));
         }
-        let source = std::fs::read_to_string(&path)
-            .with_context(|| format!("cannot read {}", self.display(&path)))?;
         if start == 0 || end.is_some_and(|end| end < start) {
             bail!(
                 "{start}-{} is not a range of lines; they start at 1",
                 end.unwrap_or(start)
             );
         }
-        let total = source.lines().count();
+        let cannot_read = || format!("cannot read {}", self.display(&path));
+        let file = std::fs::File::open(&path).with_context(cannot_read)?;
+        let mut reader = std::io::BufReader::new(file);
+        // The last line kept; `total` may turn out lower.
+        let kept_until = end
+            .unwrap_or(usize::MAX)
+            .min(start.saturating_add(MAX_READ_LINES - 1));
+        let mut kept: Vec<String> = Vec::new();
+        let mut buf = Vec::new();
+        let mut total = 0;
+        loop {
+            if total + 1 < start || total >= kept_until {
+                if reader.skip_until(b'\n').with_context(cannot_read)? == 0 {
+                    break;
+                }
+                total += 1;
+                continue;
+            }
+            buf.clear();
+            if reader
+                .read_until(b'\n', &mut buf)
+                .with_context(cannot_read)?
+                == 0
+            {
+                break;
+            }
+            total += 1;
+            if buf.ends_with(b"\n") {
+                buf.pop();
+                if buf.ends_with(b"\r") {
+                    buf.pop();
+                }
+            }
+            let Ok(line) = std::str::from_utf8(&buf) else {
+                bail!("{} line {total} is not valid UTF-8", self.display(&path));
+            };
+            kept.push(line.to_string());
+        }
         if start > total {
             bail!(
                 "{} has {total} lines; asked for line {start}",
@@ -522,13 +561,13 @@ impl Workspace {
             );
         }
         let wanted = end.unwrap_or(usize::MAX).min(total);
-        let last = wanted.min(start + MAX_READ_LINES - 1);
+        let last = wanted.min(kept_until);
         let mut out = format!(
             "// {}:{start}-{last} of {total} lines\n",
             self.display(&path)
         );
-        for (i, line) in source.lines().enumerate().take(last).skip(start - 1) {
-            let _ = writeln!(out, "{}\t{line}", i + 1);
+        for (i, line) in kept.iter().enumerate() {
+            let _ = writeln!(out, "{}\t{line}", start + i);
         }
         if last < wanted {
             let _ = writeln!(
@@ -630,10 +669,22 @@ impl Workspace {
     }
 
     /// Read and parse a file from disk, bypassing the cache, before a write.
-    /// A file in no supported language comes back unparsed.
+    /// A file in no supported language comes back unparsed. A source file
+    /// over the size the other tools parse is refused, as parsing it twice
+    /// for the syntax check costs too much.
     fn read_fresh(&self, path: &Path) -> Result<(String, Option<ParsedFile>)> {
-        if !path.is_file() {
+        let meta = std::fs::metadata(path)
+            .with_context(|| format!("cannot read {}", self.display(path)))?;
+        if !meta.is_file() {
             bail!("{} is not a regular file", self.display(path));
+        }
+        if meta.len() > text::MAX_FILE_BYTES && parser::Lang::from_path(path).is_some() {
+            bail!(
+                "not written: {} is {} bytes, above the {} byte limit for edits to source files",
+                self.display(path),
+                meta.len(),
+                text::MAX_FILE_BYTES
+            );
         }
         let source = std::fs::read_to_string(path)
             .with_context(|| format!("cannot read {}", self.display(path)))?;
@@ -651,8 +702,10 @@ impl Workspace {
         parsed.ok_or_else(|| ParseError::UnsupportedLanguage(self.display(path)).into())
     }
 
-    /// Write `updated` unless it has syntax errors the original did not. A
-    /// file in no supported language (`original` None) is not checked.
+    /// Write `updated` unless it has syntax errors and the original had none.
+    /// A file that already has syntax errors is not checked, since tree-sitter
+    /// cannot tell an edit that repairs it from one that breaks it further;
+    /// neither is a file in no supported language (`original` None).
     fn write_checked(
         &self,
         path: &Path,
@@ -693,7 +746,7 @@ impl Workspace {
             if !path.is_file() {
                 bail!("{} is not a regular file", self.display(&path));
             }
-            let source = std::fs::read_to_string(&path)
+            let source = read_start(&path, max_tokens)
                 .with_context(|| format!("cannot read {}", self.display(&path)))?;
             pruner::prune_plain(&source, max_tokens)
         };
@@ -953,6 +1006,31 @@ impl Workspace {
             }
         }
         Ok(out)
+    }
+}
+
+/// The text of `path` for a read within `max_tokens`: all of it, or only its
+/// start when it holds well over what the budget can show, so a huge log or
+/// data file is not read whole to be cut down to a page.
+fn read_start(path: &Path, max_tokens: usize) -> std::io::Result<String> {
+    use std::io::Read as _;
+
+    // More than the budget shows, so the cut text still reads as too long.
+    let limit = (max_tokens as u64).saturating_mul(4).saturating_add(4096);
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take(limit).read_to_end(&mut bytes)?;
+    match String::from_utf8(bytes) {
+        Ok(text) => Ok(text),
+        // The cut fell inside a character: drop its first bytes.
+        Err(err) if err.utf8_error().error_len().is_none() => {
+            let valid = err.utf8_error().valid_up_to();
+            let mut bytes = err.into_bytes();
+            bytes.truncate(valid);
+            String::from_utf8(bytes)
+                .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+        }
+        Err(err) => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, err)),
     }
 }
 
@@ -2246,6 +2324,70 @@ mod tests {
         );
         let out = ws.read_lines("long.py", 990, Some(1000)).unwrap();
         assert!(out.ends_with("1000\tx1000 = 1000\n"), "{out}");
+    }
+
+    #[test]
+    fn read_lines_holds_only_the_lines_it_returns() {
+        let (dir, ws) = workspace();
+        // Bytes that are not UTF-8 outside the range do not matter, and
+        // neither does a last line without a line break.
+        fs::write(dir.path().join("log.txt"), b"a\r\n\xff\xfe\nc\n\nlast").unwrap();
+        assert_eq!(
+            ws.read_lines("log.txt", 3, None).unwrap(),
+            "// log.txt:3-5 of 5 lines\n3\tc\n4\t\n5\tlast\n"
+        );
+        assert_eq!(
+            ws.read_lines("log.txt", 1, Some(1)).unwrap(),
+            "// log.txt:1-1 of 5 lines\n1\ta\n"
+        );
+        let err = ws.read_lines("log.txt", 2, Some(2)).unwrap_err();
+        assert!(
+            err.to_string().contains("line 2 is not valid UTF-8"),
+            "{err}"
+        );
+
+        let long = "x\n".repeat(MAX_READ_LINES + 10);
+        fs::write(dir.path().join("long.txt"), long).unwrap();
+        let out = ws.read_lines("long.txt", 5, None).unwrap();
+        assert!(
+            out.starts_with("// long.txt:5-404 of 410 lines\n5\tx\n"),
+            "{out}"
+        );
+        assert!(out.ends_with("… 6 more lines; at most 400 per call, continue from line 405\n"));
+    }
+
+    #[test]
+    fn read_pruned_reads_only_the_start_of_a_huge_plain_file() {
+        let (dir, ws) = workspace();
+        // The cut falls inside a three-byte character.
+        fs::write(dir.path().join("data.txt"), "€uro\n".repeat(100_000)).unwrap();
+        let out = ws.read_pruned("data.txt", 100, Vec::new()).unwrap();
+        assert!(out.contains("strategy=truncated"), "{out}");
+        assert!(out.len() < 1000, "{}", out.len());
+        assert_eq!(
+            read_start(&dir.path().join("data.txt"), 100).unwrap().len() % 7,
+            0
+        );
+        // A file within the budget comes whole.
+        fs::write(dir.path().join("small.txt"), "a\nb\n").unwrap();
+        let out = ws.read_pruned("small.txt", 100, Vec::new()).unwrap();
+        assert!(out.ends_with("\na\nb\n"), "{out}");
+    }
+
+    #[test]
+    fn edits_refuse_a_source_file_over_the_size_limit() {
+        let (dir, ws) = workspace();
+        let big = format!("fn a() {{}}\n{}", "// x\n".repeat(500_000));
+        fs::write(dir.path().join("big.rs"), &big).unwrap();
+        let err = ws
+            .replace_text("big.rs", &[text_edit("fn a() {}", "fn b() {}")])
+            .unwrap_err();
+        assert!(err.to_string().contains("byte limit for edits"), "{err}");
+        assert_eq!(fs::read_to_string(dir.path().join("big.rs")).unwrap(), big);
+        // Plain text has no syntax check, so its size does not matter.
+        fs::write(dir.path().join("big.txt"), &big).unwrap();
+        ws.replace_text("big.txt", &[text_edit("fn a() {}", "fn b() {}")])
+            .unwrap();
     }
 
     #[test]
