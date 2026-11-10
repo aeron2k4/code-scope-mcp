@@ -392,7 +392,7 @@ impl Workspace {
         // Only the final break is dropped, so "\n" is one blank line and
         // trailing blank lines stay.
         let body = without_final_break(new_source);
-        let eol = line_ending(&source);
+        let eol = first_break(current).unwrap_or_else(|| line_ending(&source));
         let mut replacement = with_line_ending(body, eol);
         // A break is needed before the next line, and kept at the end of a
         // file that already ended with one.
@@ -431,8 +431,9 @@ impl Workspace {
         let mut placed: Vec<usize> = Vec::with_capacity(edits.len());
         for (i, edit) in edits.iter().enumerate() {
             let n = i + 1;
-            let old = with_line_ending(&edit.old_text, eol);
-            let new = with_line_ending(&edit.new_text, eol);
+            // Compared with `\n` breaks: `find_text` matches either kind.
+            let old = with_line_ending(&edit.old_text, "\n");
+            let new = with_line_ending(&edit.new_text, "\n");
             if old.is_empty() {
                 bail!(
                     "not written: edit {n} has an empty old_text; add code with insert_symbol \
@@ -442,9 +443,9 @@ impl Workspace {
             if old == new {
                 bail!("not written: edit {n} has the same old_text and new_text");
             }
-            let found: Vec<usize> = updated.match_indices(&old).map(|(at, _)| at).collect();
-            let at = match found[..] {
-                [at] => at,
+            let found = find_text(&updated, &old);
+            let (at, len) = match found[..] {
+                [found] => found,
                 [] => bail!(
                     "not written: edit {n}: old_text is not in {}{}",
                     self.display(&path),
@@ -454,7 +455,7 @@ impl Workspace {
                     let lines: Vec<String> = found
                         .iter()
                         .take(MAX_SYMBOL_MATCHES)
-                        .map(|&at| line_number(&updated, at).to_string())
+                        .map(|&(at, _)| line_number(&updated, at).to_string())
                         .collect();
                     let more = if found.len() > MAX_SYMBOL_MATCHES {
                         ", …"
@@ -470,11 +471,14 @@ impl Workspace {
                     )
                 }
             };
-            updated.replace_range(at..at + old.len(), &new);
+            // The new text takes the breaks of the text it replaces, which in
+            // a file that mixes them may not be the file's usual ones.
+            let new = with_line_ending(&new, first_break(&updated[at..at + len]).unwrap_or(eol));
+            updated.replace_range(at..at + len, &new);
             for start in &mut placed {
                 if *start > at {
                     // An edit inside an earlier one's text moves it to `at`.
-                    *start = (*start + new.len()).saturating_sub(old.len()).max(at);
+                    *start = (*start + new.len()).saturating_sub(len).max(at);
                 }
             }
             placed.push(at);
@@ -926,12 +930,16 @@ impl Workspace {
         if base.is_file() {
             return Ok(format!("{}\n", self.display(&base)));
         }
-        let files = git::list_files(&base, limit);
+        // One more than asked for, to tell a tree of exactly `limit` files
+        // from a longer one.
+        let mut files = git::list_files(&base, limit.saturating_add(1));
+        let more = files.len() > limit;
+        files.truncate(limit);
         let mut out = String::new();
         for f in &files {
             let _ = writeln!(out, "{}", self.display(&base.join(f)));
         }
-        if files.len() == limit {
+        if more {
             let _ = writeln!(out, "… limit of {limit} files reached");
         }
         if out.is_empty() {
@@ -1117,13 +1125,86 @@ fn unique_symbol<'p>(
     }
 }
 
-/// `\r\n` when the file already uses it, so edits keep its line endings.
+/// The line break most lines of the file end with, so edits keep its line
+/// endings: `\r\n` only when it ends more lines than a bare `\n` does.
 fn line_ending(source: &str) -> &'static str {
-    if source.contains("\r\n") {
+    let crlf = source.matches("\r\n").count();
+    let lf = source.matches('\n').count() - crlf;
+    if crlf > lf { "\r\n" } else { "\n" }
+}
+
+/// The first line break in `text`, if it has one.
+fn first_break(text: &str) -> Option<&'static str> {
+    let at = text.find('\n')?;
+    Some(if text[..at].ends_with('\r') {
         "\r\n"
     } else {
         "\n"
+    })
+}
+
+/// Where `old`, written with `\n` line breaks, occurs in `hay`: the start and
+/// length of each occurrence, none overlapping another. A line break of `old`
+/// matches `\n` and `\r\n` alike, so text is found whatever breaks the file
+/// uses there, also in a file that mixes them.
+fn find_text(hay: &str, old: &str) -> Vec<(usize, usize)> {
+    let mut parts = old.split('\n');
+    let first = parts.next().unwrap_or_default();
+    let rest: Vec<&str> = parts.collect();
+    if rest.is_empty() {
+        return hay
+            .match_indices(first)
+            .map(|(at, found)| (at, found.len()))
+            .collect();
     }
+    // The end of `old` in `hay` when it starts at `at`, after its first line.
+    let end_from = |at: usize| {
+        let mut pos = at + first.len();
+        for part in &rest {
+            let after = &hay[pos..];
+            pos += if after.starts_with("\r\n") {
+                2
+            } else if after.starts_with('\n') {
+                1
+            } else {
+                return None;
+            };
+            if !hay[pos..].starts_with(part) {
+                return None;
+            }
+            pos += part.len();
+        }
+        Some(pos)
+    };
+    // `old` starting with a break starts wherever a break does.
+    let starts: Vec<usize> = if first.is_empty() {
+        hay.match_indices('\n')
+            .map(|(at, _)| at - usize::from(hay[..at].ends_with('\r')))
+            .collect()
+    } else {
+        // Every start of the first line, overlapping ones too: in `aaa\nb`,
+        // `aa\nb` starts at the second `a`.
+        let step = first.chars().next().map_or(1, char::len_utf8);
+        let mut starts = Vec::new();
+        let mut from = 0;
+        while let Some(at) = hay[from..].find(first).map(|i| from + i) {
+            starts.push(at);
+            from = at + step;
+        }
+        starts
+    };
+    let mut found = Vec::new();
+    let mut free = 0;
+    for at in starts {
+        if at < free {
+            continue;
+        }
+        if let Some(end) = end_from(at) {
+            found.push((at, end - at));
+            free = end;
+        }
+    }
+    found
 }
 
 /// Byte offset where each 1-based line starts. An empty file has none.
@@ -2291,6 +2372,38 @@ mod tests {
             fs::read_to_string(dir.path().join("a.py")).unwrap(),
             "a = 1\r\nb = 20\r\n"
         );
+    }
+
+    #[test]
+    fn edits_keep_the_breaks_of_a_file_that_mixes_them() {
+        let (dir, ws) = workspace();
+        let file = dir.path().join("mixed.txt");
+        let read = || fs::read_to_string(&file).unwrap();
+        // Mostly `\n`, with two `\r\n` lines.
+        fs::write(&file, "a\nb\nc\r\nd\r\ne\nf\n").unwrap();
+        // Text over `\n` breaks is found, and stays `\n`.
+        ws.replace_text("mixed.txt", &[text_edit("a\nb\n", "a\nB\n")])
+            .unwrap();
+        assert_eq!(read(), "a\nB\nc\r\nd\r\ne\nf\n");
+        // Text over both kinds is found; the new text takes the first.
+        ws.replace_text("mixed.txt", &[text_edit("c\nd\ne\n", "c\nD\ne\n")])
+            .unwrap();
+        assert_eq!(read(), "a\nB\nc\r\nD\r\ne\r\nf\n");
+        // New lines take the break of the lines they replace.
+        ws.replace_lines("mixed.txt", 3, 3, "c", "c\nc2").unwrap();
+        assert_eq!(read(), "a\nB\nc\r\nc2\r\nD\r\ne\r\nf\n");
+        ws.replace_lines("mixed.txt", 1, 1, "a", "a\na2").unwrap();
+        assert_eq!(read(), "a\na2\nB\nc\r\nc2\r\nD\r\ne\r\nf\n");
+    }
+
+    #[test]
+    fn find_text_matches_either_line_break() {
+        assert_eq!(find_text("a\r\nb\na\nb", "a\nb"), [(0, 4), (5, 3)]);
+        assert_eq!(find_text("aaa\nb", "aa\nb"), [(1, 4)]);
+        // A leading break is one break, whichever bytes it takes.
+        assert_eq!(find_text("x\r\ny\nz", "\n"), [(1, 2), (4, 1)]);
+        assert_eq!(find_text("abab", "ab"), [(0, 2), (2, 2)]);
+        assert!(find_text("a\rb", "a\nb").is_empty());
     }
 
     #[test]
