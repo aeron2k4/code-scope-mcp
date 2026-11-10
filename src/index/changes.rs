@@ -66,7 +66,7 @@ pub fn changed_symbols(root: &Path, spec: DiffSpec<'_>) -> Result<Vec<FileChange
     let mut diffs = git::diff(root, spec.base, spec.staged)?;
     if !spec.staged {
         for path in git::untracked(root)? {
-            let lines = std::fs::read_to_string(root.join(&path)).map_or(0, |s| s.lines().count());
+            let lines = count_lines(&root.join(&path));
             diffs.push(git::FileDiff {
                 path,
                 old: Vec::new(),
@@ -82,6 +82,36 @@ pub fn changed_symbols(root: &Path, spec: DiffSpec<'_>) -> Result<Vec<FileChange
         .collect::<Result<_>>()?;
     out.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(out)
+}
+
+/// The lines of the file at `path`, counted in pieces so that a large
+/// untracked file, such as a data set, is never held in memory. 0 for a file
+/// that cannot be read or is binary.
+fn count_lines(path: &Path) -> usize {
+    use std::io::Read as _;
+
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return 0;
+    };
+    let mut buf = vec![0u8; 64 * 1024];
+    let (mut lines, mut first, mut ends_in_break) = (0, true, true);
+    loop {
+        let n = match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return 0,
+        };
+        let chunk = &buf[..n];
+        // The same sniff as a text search: a NUL near the start is a binary.
+        if std::mem::take(&mut first) && chunk[..n.min(text::BINARY_SNIFF_BYTES)].contains(&0) {
+            return 0;
+        }
+        lines += memchr::memchr_iter(b'\n', chunk).count();
+        ends_in_break = chunk.ends_with(b"\n");
+    }
+    // A last line without a line break is a line too.
+    lines + usize::from(!ends_in_break)
 }
 
 fn file_changes(root: &Path, spec: DiffSpec<'_>, diff: &git::FileDiff) -> Result<FileChanges> {
@@ -269,6 +299,21 @@ mod tests {
             .status
             .success();
         assert!(ok, "git {args:?}");
+    }
+
+    #[test]
+    fn count_lines_matches_str_lines_and_skips_binaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        // More than one piece, so a count across their boundary is covered.
+        let long = "line\n".repeat(40_000);
+        for text in ["", "a", "a\n", "a\n\nb", "a\r\nb\r\n", long.as_str()] {
+            fs::write(&path, text).unwrap();
+            assert_eq!(count_lines(&path), text.lines().count(), "{text:?}");
+        }
+        fs::write(&path, b"\x7fELF\0\0\n\n\n").unwrap();
+        assert_eq!(count_lines(&path), 0);
+        assert_eq!(count_lines(&dir.path().join("missing")), 0);
     }
 
     fn summary(files: &[FileChanges]) -> Vec<(String, String, String, usize)> {

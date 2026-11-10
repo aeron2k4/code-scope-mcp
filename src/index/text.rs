@@ -15,9 +15,9 @@ use super::{
 use crate::ast::parser::Lang;
 
 /// Files larger than this are skipped (same bound as the parse cache).
-pub(super) const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+pub(crate) const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 /// Bytes inspected for a NUL to detect binary files.
-const BINARY_SNIFF_BYTES: usize = 8 * 1024;
+pub(super) const BINARY_SNIFF_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TextHit {
