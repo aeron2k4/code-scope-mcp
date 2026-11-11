@@ -718,7 +718,8 @@ fn family(lang: Option<Lang>) -> u32 {
         Some(Lang::Java) => 6,
         Some(Lang::CSharp) => 7,
         Some(Lang::GdScript) => 8,
-        None => 9,
+        Some(Lang::Ruby) => 9,
+        None => 10,
     }
 }
 
@@ -899,7 +900,8 @@ impl Unit {
 /// [`Reach::Private`]), by its language.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Scope {
-    /// Every file: the language has no private definitions.
+    /// Every file: the language has no private definitions, or, as Ruby's,
+    /// ones a subclass or reopened class in another file still calls.
     Public,
     /// Only the file itself: C and C++ `static`, Java and C# `private`, what
     /// a JavaScript module does not export.
@@ -954,7 +956,7 @@ impl Scope {
                 | Lang::TypeScript
                 | Lang::Tsx,
             ) => Scope::File,
-            None => Scope::Public,
+            Some(Lang::Ruby) | None => Scope::Public,
         }
     }
 

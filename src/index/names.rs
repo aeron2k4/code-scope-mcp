@@ -83,6 +83,10 @@ impl SymbolNames {
             Some(Lang::JavaScript | Lang::TypeScript | Lang::Tsx) => JsExports::of(source),
             _ => None,
         };
+        let ruby_private = match lang {
+            Some(Lang::Ruby) => ruby_private(symbols, source),
+            _ => Vec::new(),
+        };
         // The symbols enclosing the current one, innermost last.
         let mut open: Vec<&Symbol> = Vec::new();
         let mut traits = Vec::new();
@@ -97,6 +101,7 @@ impl SymbolNames {
                 let reach = if open.iter().any(|o| o.kind.is_callable()) {
                     Reach::Local
                 } else if lang.is_some_and(|lang| is_private(lang, s, enclosing))
+                    || ruby_private.get(i).copied().unwrap_or(false)
                     || (enclosing.is_none()
                         && exports.as_ref().is_some_and(|e| !e.exports(source, s)))
                 {
@@ -563,6 +568,8 @@ impl<'a> JsExports<'a> {
 ///   including it, for a header).
 /// - Java and C#: a `private` member, seen only in its class; in C# also a
 ///   member of a class or struct with no access modifier.
+/// - Ruby: see [`ruby_private`].
+/// - JavaScript and TypeScript: nothing here, a module's exports decide.
 fn is_private(lang: Lang, sym: &Symbol, enclosing: Option<&Symbol>) -> bool {
     use SymbolKind::*;
     if matches!(sym.kind, Impl | Module) {
@@ -607,8 +614,94 @@ fn is_private(lang: Lang, sym: &Symbol, enclosing: Option<&Symbol>) -> bool {
             let explicit = sym.signature.contains(&format!(".{}", sym.name));
             modifiers().any(|w| w == "private") || (member && !explicit && !modifiers().any(access))
         }
-        Lang::JavaScript | Lang::TypeScript | Lang::Tsx => false,
+        // A Ruby method is made private by a `private` call before it or
+        // around it, which its signature does not show: `ruby_private`.
+        Lang::JavaScript | Lang::TypeScript | Lang::Tsx | Lang::Ruby => false,
     }
+}
+
+/// Which of `symbols` a Ruby file makes private or protected, read from the
+/// text: a bare `private` or `protected` line above a method at the same
+/// indentation, `private def f`, `private :f, :g`, `private_class_method
+/// :f` and `private_constant :F`. A later bare `public` ends it.
+fn ruby_private(symbols: &[Symbol], source: &str) -> Vec<bool> {
+    let indent_of = |line: &str| line.len() - line.trim_start().len();
+    let mut open: Vec<usize> = Vec::new();
+    symbols
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            while open.last().is_some_and(|&o| symbols[o].depth >= s.depth) {
+                open.pop();
+            }
+            let enclosing = open.last().map(|&o| &symbols[o]);
+            open.push(i);
+            let Some(enclosing) = enclosing else {
+                return false;
+            };
+            if !matches!(
+                s.kind,
+                SymbolKind::Function | SymbolKind::Method | SymbolKind::Constant
+            ) {
+                return false;
+            }
+            let (Some(own_line), Some(body)) = (
+                source
+                    .get(..s.start_byte)
+                    .map(|b| b.rfind('\n').map_or(0, |n| n + 1)),
+                source.get(enclosing.start_byte..enclosing.end_byte),
+            ) else {
+                return false;
+            };
+            let first = source[own_line..].lines().next().unwrap_or("");
+            let indent = indent_of(first);
+            let trimmed = first.trim_start();
+            let hidden = ["private ", "protected ", "private_class_method "];
+            if hidden.iter().any(|k| trimmed.starts_with(k)) {
+                return true;
+            }
+            // Names given to `private :a, :b` or `private_constant :A`.
+            let named = body.lines().any(|l| {
+                let l = l.trim_start();
+                [
+                    "private",
+                    "protected",
+                    "private_class_method",
+                    "private_constant",
+                ]
+                .iter()
+                .any(|k| {
+                    l.strip_prefix(k).is_some_and(|rest| {
+                        rest.starts_with([' ', '('])
+                            && rest
+                                .split(|c: char| !(c.is_alphanumeric() || "_?!=".contains(c)))
+                                .any(|w| w == s.name)
+                            && (rest.contains(&format!(":{}", s.name))
+                                || rest.contains(&format!("\"{}\"", s.name))
+                                || rest.contains(&format!("'{}'", s.name)))
+                    })
+                })
+            });
+            if named {
+                return true;
+            }
+            // The last bare visibility line above it, at its indentation,
+            // in the enclosing symbol.
+            let above = source.get(enclosing.start_byte..own_line).unwrap_or("");
+            let mut visibility = false;
+            for line in above.lines() {
+                if indent_of(line) != indent {
+                    continue;
+                }
+                match line.trim() {
+                    "private" | "protected" => visibility = true,
+                    "public" | "module_function" => visibility = false,
+                    _ => {}
+                }
+            }
+            visibility && s.kind != SymbolKind::Constant
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -696,6 +789,12 @@ mod tests {
                   private int F() { return 1; }\n    void IDisposable.Dispose() {}\n}\n\
                   interface I2 {\n    void N();\n}\n";
         assert_eq!(private("A.cs", cs), ["M", "F"]);
+    }
+
+    #[test]
+    fn ruby_visibility_is_read_from_the_text() {
+        let rb = "class A\n  X = 1\n  Y = 2\n  private_constant :Y\n\n  def pub; end\n\n  private def one; end\n\n  def two; end\n  private :two\n\n  protected\n\n  def three; end\n\n  public\n\n  def four; end\n\n  private\n\n  def five\n    1\n  end\nend\n";
+        assert_eq!(private("a.rb", rb), ["Y", "one", "two", "three", "five"]);
     }
 
     #[test]

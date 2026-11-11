@@ -52,7 +52,7 @@ enum Owner<'a> {
 }
 
 fn owner_of(source: &str, start: usize) -> Owner<'_> {
-    let before = source[..start].trim_end_matches([' ', '\t']);
+    let before = source[..start].trim_end();
     let (rest, is_path) = if let Some(r) = before.strip_suffix("::") {
         (r, true)
     } else if let Some(r) = before
@@ -113,6 +113,59 @@ fn classify(found: Owner<'_>, owner: &str, enclosing: Option<&str>) -> Ownership
     }
 }
 
+/// Whether the occurrence at `start` follows `.`, `->` or `::`, whatever
+/// stands before that.
+fn after_access(source: &str, start: usize) -> bool {
+    let before = source[..start].trim_end();
+    before.ends_with('.') || before.ends_with("->") || before.ends_with("::")
+}
+
+/// Whether a Ruby occurrence of `name` at `start` is a method call: anything
+/// after `.` or `&.`, but after `::` only a lowercase name, since `Foo::Bar`
+/// reaches a constant.
+fn ruby_access_call(source: &str, start: usize, name: &str) -> bool {
+    let before = source[..start].trim_end();
+    if before.ends_with("::") {
+        name.starts_with(|c: char| c.is_lowercase() || c == '_')
+    } else {
+        before.ends_with('.')
+    }
+}
+
+/// Whether the occurrence at `at` binds `name` as a Ruby local: an assignment,
+/// a parameter of the `def` on that line, or a block parameter.
+fn ruby_binds(source: &str, at: usize, name: &str) -> bool {
+    let rest = source[at + name.len()..].trim_start_matches([' ', '\t']);
+    let assigned = !["==", "=~", "=>"].iter().any(|p| rest.starts_with(p))
+        && (rest.starts_with('=')
+            || ["||=", "&&=", "+=", "-=", "*=", "/="]
+                .iter()
+                .any(|p| rest.starts_with(p)));
+    if assigned {
+        return true;
+    }
+    let line_start = source[..at].rfind('\n').map_or(0, |i| i + 1);
+    let head = &source[line_start..at];
+    head.trim_start().starts_with("def ")
+        || head.trim_start().starts_with("define_method")
+        || head.matches('|').count() % 2 == 1
+}
+
+/// Whether a bare Ruby `name` at `at` is a local variable or parameter: it
+/// or an earlier occurrence inside the same symbol binds it.
+fn ruby_local(
+    source: &str,
+    occurrences: &[parser::Occurrence],
+    scope_start: usize,
+    at: usize,
+    name: &str,
+) -> bool {
+    occurrences
+        .iter()
+        .filter(|o| o.start_byte >= scope_start && o.start_byte <= at)
+        .any(|o| ruby_binds(source, o.start_byte, name))
+}
+
 fn is_call(source: &str, end: usize) -> bool {
     let rest = source[end..].trim_start_matches([' ', '\t']);
     rest.starts_with('(') || rest.starts_with("::<")
@@ -145,6 +198,11 @@ pub fn find_references(
             incomplete: 0,
         };
     }
+    // A Ruby setter `total=` is spelled `total` at its call sites.
+    let word = name
+        .strip_suffix('=')
+        .filter(|w| w.ends_with(parser::is_ident_char))
+        .unwrap_or(name);
     let (files, truncated) = files_under(root, dir, opts.max_files);
     let files: Vec<_> = files
         .into_iter()
@@ -154,7 +212,7 @@ pub fn find_references(
     // A file whose tokens lack the name's hash holds no occurrence of it, so
     // the names kept in memory spare reading it. A name with other characters
     // (`r#type`) is never one whole token and is looked for in every file.
-    let token = mentions::is_token(name).then(|| mentions::hash(name));
+    let token = mentions::is_token(word).then(|| mentions::hash(word));
     let candidates = par_flat_map(&files, |rel| {
         let abs = root.join(rel);
         if let Some(h) = token
@@ -170,7 +228,9 @@ pub fn find_references(
                 return Vec::new();
             }
         };
-        let occurrences = parser::identifier_occurrences(&file.parsed, &file.source, name);
+        let occurrences = parser::identifier_occurrences(&file.parsed, &file.source, word);
+        let ruby = file.parsed.lang == Lang::Ruby;
+        let same = |n: &str| n == name || (ruby && n.strip_suffix('=') == Some(name));
         if occurrences.is_empty() {
             return Vec::new();
         }
@@ -180,7 +240,7 @@ pub fn find_references(
         let symbols = &file.parsed.symbols;
         let definitions: Vec<(usize, SymbolKind)> = symbols
             .iter()
-            .filter(|s| s.name == name && s.kind != SymbolKind::Impl)
+            .filter(|s| same(&s.name) && s.kind != SymbolKind::Impl)
             .filter_map(|s| {
                 occurrences
                     .iter()
@@ -207,9 +267,25 @@ pub fn find_references(
                 // A definition is enclosed by its own symbol; report the parent.
                 let innermost = enclosing_symbol(symbols, o.start_byte);
                 let enclosing = match innermost {
-                    Some(s) if def_kind.is_some() && s.name == name => s.parent.clone(),
+                    Some(s) if def_kind.is_some() && same(&s.name) => s.parent.clone(),
                     other => other.map(|s| s.qualified_name()),
                 };
+                let found = owner_of(&file.source, o.start_byte);
+                // Ruby calls a method on `self` by its bare name, and has no
+                // fields: `x.name` is always a call, parentheses or not.
+                let bare = found == Owner::Unknown && !after_access(&file.source, o.start_byte);
+                // A bare Ruby name may be a local or parameter, which no
+                // syntax tells from a call but its own binding does.
+                let local = ruby
+                    && bare
+                    && def_kind.is_none()
+                    && ruby_local(
+                        &file.source,
+                        &occurrences,
+                        innermost.map_or(0, |s| s.start_byte),
+                        o.start_byte,
+                        word,
+                    );
                 let ownership = match owner {
                     None => Ownership::Unknown,
                     Some(owner) if def_kind.is_some() => match &enclosing {
@@ -217,12 +293,15 @@ pub fn find_references(
                         Some(_) if in_scope(enclosing.as_deref(), owner) => Ownership::Owner,
                         Some(_) => Ownership::Foreign,
                     },
-                    Some(owner) => classify(
-                        owner_of(&file.source, o.start_byte),
-                        owner,
-                        enclosing.as_deref(),
-                    ),
+                    Some(owner)
+                        if ruby && bare && !local && in_scope(enclosing.as_deref(), owner) =>
+                    {
+                        Ownership::Owner
+                    }
+                    Some(owner) => classify(found, owner, enclosing.as_deref()),
                 };
+                let call = is_call(&file.source, o.start_byte + word.len())
+                    || (ruby && ruby_access_call(&file.source, o.start_byte, word));
                 if ownership == Ownership::Foreign {
                     return None;
                 }
@@ -236,7 +315,7 @@ pub fn find_references(
                         is_definition: def_kind.is_some(),
                     },
                     ownership,
-                    call: is_call(&file.source, o.start_byte + name.len()),
+                    call,
                     def_kind,
                 })
             })
@@ -366,6 +445,66 @@ mod tests {
         // and the field `x.new` are not calls, so they cannot be the method.
         assert_eq!(lines("A::new"), [4, 5, 11, 13]);
         assert_eq!(lines("B::new"), [8, 12, 13]);
+    }
+
+    #[test]
+    fn a_ruby_method_is_called_without_parentheses() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("cart.rb"),
+            "class Cart\n  def total\n    1\n  end\n\n  def show\n    total\n  end\nend\n\nclass User\n  def total\n    2\n  end\nend\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("co.rb"),
+            "def checkout(cart)\n  cart.total\nend\n",
+        )
+        .unwrap();
+        let cache = ParseCache::default();
+        let hits = find_references(root, root, &cache, "Cart::total", &RefOptions::default());
+        let found: Vec<_> = hits.iter().map(|h| (h.path.as_str(), h.line)).collect();
+        assert_eq!(found, [("cart.rb", 7), ("co.rb", 2)]);
+    }
+
+    #[test]
+    fn ruby_locals_constants_chains_and_setters() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("cart.rb"),
+            "class Cart\n  def total\n    1\n  end\n\n  def total=(v)\n    @t = v\n  end\n\n  def foo(total)\n    total + 1\n  end\n\n  def bar\n    total = 3\n    total\n  end\n\n  def baz\n    total\n  end\nend\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("co.rb"),
+            "def checkout(cart)\n  cart\n    .total\nend\n\ndef rename(cart)\n  cart.total = 5\n  Shop::total\n  Shop::Total\nend\n",
+        )
+        .unwrap();
+        let cache = ParseCache::default();
+        let lines = |q: &str| -> Vec<(String, usize)> {
+            find_references(root, root, &cache, q, &RefOptions::default())
+                .hits
+                .iter()
+                .map(|h| (h.path.clone(), h.line))
+                .collect()
+        };
+        // Parameter and local named `total` are no calls; the bare use in
+        // `baz`, and the calls through another receiver, are.
+        let got = lines("Cart::total");
+        assert!(got.contains(&("cart.rb".into(), 20)), "{got:?}");
+        assert!(got.contains(&("co.rb".into(), 3)), "{got:?}");
+        assert!(
+            !got.iter()
+                .any(|(p, l)| p == "cart.rb" && (10..=16).contains(l)),
+            "{got:?}"
+        );
+        // A setter is spelled without `=` where it is used.
+        let got = lines("Cart::total=");
+        assert!(got.contains(&("co.rb".into(), 7)), "{got:?}");
+        // A constant path is not a call.
+        let got = lines("Shop::Total");
+        assert!(got.contains(&("co.rb".into(), 9)), "{got:?}");
     }
 
     #[test]
