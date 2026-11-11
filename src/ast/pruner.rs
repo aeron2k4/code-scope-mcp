@@ -131,7 +131,7 @@ fn elide_bodies(
         };
         covered_until = end;
         let body = &source[start..end];
-        let placeholder = placeholder(lang, body);
+        let placeholder = placeholder(lang, body, &source[end..]);
         let saved = estimate_tokens(body).saturating_sub(estimate_tokens(&placeholder));
         if saved > 0 {
             candidates.push(Candidate {
@@ -178,13 +178,20 @@ fn elide_bodies(
     (result.estimated_tokens <= opts.max_tokens).then_some(result)
 }
 
-fn placeholder(lang: Lang, body: &str) -> String {
+/// `after` is the source following the body.
+fn placeholder(lang: Lang, body: &str, after: &str) -> String {
     let lines = body.lines().count().max(1);
     match lang {
         Lang::Python => format!("...  # {lines} lines elided"),
         Lang::GdScript => format!("pass  # {lines} lines elided"),
-        // A comment would also hide the `end` of `def f; x; end`.
-        Lang::Ruby if !body.contains('\n') => "nil".to_string(),
+        // A comment would also hide the `end` of `def f; x; end` and of
+        // `a\n  b; end`: it is written only when the line ends with the body.
+        Lang::Ruby
+            if !body.contains('\n')
+                || !after.split('\n').next().unwrap_or("").trim().is_empty() =>
+        {
+            "nil".to_string()
+        }
         Lang::Ruby => format!("nil  # {lines} lines elided"),
         _ => format!("{{ /* {lines} lines elided */ }}"),
     }
@@ -428,5 +435,23 @@ fn other() {
         assert_eq!(r.strategy, Strategy::ElidedBodies, "{}", r.text);
         assert_eq!(r.text, expected);
         assert!(!parse_source(Lang::Ruby, &r.text).unwrap().has_errors);
+    }
+
+    #[test]
+    fn ruby_placeholder_keeps_an_end_on_the_last_line_of_the_body() {
+        let src = "def f\n  a = 1\n  b = 2\n  c = 3\n  b; end\ndef g\n  x\nend\n";
+        let parsed = parse_source(Lang::Ruby, src).unwrap();
+        let opts = PruneOptions {
+            max_tokens: 6,
+            keep: vec![],
+        };
+        let r = prune(Lang::Ruby, src, &parsed.symbols, &opts);
+        if r.strategy == Strategy::ElidedBodies {
+            assert!(
+                !parse_source(Lang::Ruby, &r.text).unwrap().has_errors,
+                "{}",
+                r.text
+            );
+        }
     }
 }

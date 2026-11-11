@@ -32,8 +32,8 @@ done < <(jq -j '[.tool_name, .cwd] + (.tool_input | [.command, .workdir, .file_p
 
 # Same list as Lang::from_path, which ignores case: rs becomes [rR][sS]. Not
 # nocasematch, which would also make GREP count as grep.
-EXTS='rs|py|pyi|js|jsx|mjs|cjs|ts|mts|cts|tsx|go|c|h|cc|cpp|cxx|c\+\+|hh|hpp|hxx|h\+\+|ipp|tpp|java|cs|gd|rb|rake|gemspec'
-for pair in aA bB cC dD eE gG hH iI jJ kK mM oO pP rR sS tT vV xX yY; do
+EXTS='rs|py|pyi|js|jsx|mjs|cjs|ts|mts|cts|tsx|go|c|h|cc|cpp|cxx|c\+\+|hh|hpp|hxx|h\+\+|ipp|tpp|java|cs|gd|rb|rbw|rake|gemspec|ru|jbuilder|thor'
+for pair in aA bB cC dD eE gG hH iI jJ kK lL mM oO pP rR sS tT uU vV wW xX yY; do
   EXTS=${EXTS//${pair:0:1}/[$pair]}
 done
 CODE_EXT="\\.($EXTS)\$"
