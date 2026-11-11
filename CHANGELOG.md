@@ -8,7 +8,14 @@ Each entry ends with the commits that made it.
 ### Added
 
 - Ruby support: methods, singleton methods, classes, modules and constants
-  in `.rb`, `.rake` and `.gemspec` files (5920650).
+  in `.rb`, `.rbw`, `.rake`, `.gemspec`, `.ru`, `.jbuilder` and `.thor` files.
+  `find_references` treats a bare name inside the owner and `x.name` as calls,
+  except a local variable or parameter, a constant path and a `name=` setter
+  matched through `name`; `private`, `protected`, `private_constant` and
+  `private_class_method` lower a symbol's weight in `codebase_map`; `class
+  A::B` is qualified `A::B`; `=begin`/`=end` comments and one-line Sorbet
+  `sig { }` stay attached to their definition. Extensionless files such as
+  `Rakefile` and `Gemfile` are still plain text (5920650, 6c0823d, 6dcc5ca).
 
 ### Security
 
